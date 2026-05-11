@@ -1,0 +1,119 @@
+{
+  "hooks": {
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "command": "/Users/hankholcomb/.csm/csm-hook.sh Notification",
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "/Users/hankholcomb/.csm/csm-hook.sh PostToolUse",
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "command": "/Users/hankholcomb/.csm/csm-hook.sh PreCompact",
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "/Users/hankholcomb/.csm/csm-hook.sh PreToolUse",
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "command": "/Users/hankholcomb/.csm/csm-hook.sh SessionEnd",
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "/Users/hankholcomb/.csm/csm-hook.sh SessionStart",
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "Setup": [
+      {
+        "hooks": [
+          {
+            "command": "/Users/hankholcomb/.csm/csm-hook.sh Setup",
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "command": "/Users/hankholcomb/.csm/csm-hook.sh Stop",
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "command": "/Users/hankholcomb/.csm/csm-hook.sh SubagentStop",
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "command": "/Users/hankholcomb/.csm/csm-hook.sh UserPromptSubmit",
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ]
+  },
+  "theme": "auto",
+  "statusLine": {
+    "type": "command",
+    "command": "/Users/hankholcomb/.claude/statusline.sh"
+  }
+}

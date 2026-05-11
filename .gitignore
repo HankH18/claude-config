@@ -1,0 +1,20 @@
+# claude-config repo — conservative-by-default
+#
+# Everything is ignored, then we re-add ONLY the files that are safe to
+# version (settings + custom scripts). Transcripts, sessions, history,
+# policy-limits, auth caches, paste-cache, telemetry, downloads, and
+# backups all stay out — they may contain conversation content, file
+# contents from your edits, rate-limit state, and other sensitive data.
+
+# Default: ignore everything in this dir.
+/*
+
+# Allowlist: explicit re-includes go below.
+!/.gitignore
+!/settings.json
+!/statusline.sh
+
+# If you start versioning custom agents/commands/hooks, uncomment:
+# !/agents/
+# !/commands/
+# !/hooks/
