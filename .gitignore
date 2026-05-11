@@ -11,6 +11,7 @@
 
 # Allowlist: explicit re-includes go below.
 !/.gitignore
+!/README.md
 !/settings.json
 !/statusline.sh
 
