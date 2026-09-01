@@ -4,12 +4,32 @@ A subagent's entire world is its prompt. It has no access to the conversation, t
 
 Underspecification is the dominant failure mode. When a packet is vague, the subagent doesn't stop — it guesses, and its guess conflicts with another agent's guess at merge time. When in doubt, include the extra paragraph of context; packet tokens are cheap compared to a rejected branch.
 
+## The packet is two files: an invariant preamble plus a per-ticket half
+
+Measured: wave 1's five packets were **~73 KB of orchestrator output over 3m43s**, written one at a time, and the first worker was three minutes into its task before the last one started. Every one of those packets repeated the same preamble verbatim. The preamble is not per-ticket text, and writing it five times buys nothing but latency and orchestrator context.
+
+**Split it.**
+
+- **`.swarm-loop/worker-preamble.md` — the invariant half, written ONCE per run.** Everything true of every worker in this run regardless of ticket: the isolation contract and the whole **Working method** section (prove-the-environment-is-yours, worktree-relative commands, never commit a provisioned directory), the **Your discretion** tiers, the entire **Boundaries** block including the repo-global git prohibitions and TESTS ARE APPEND-ONLY, the commit/merge protocol as the worker sees it (commit in coherent increments; the orchestrator merges branches and runs all measurement, you do neither), the **Report format**, and the standing ruling that **your ticket's own `verify` is vacuous until proven otherwise — the frozen acceptance suite is the grader, not your green.** Plus the standing rulings this run has minted: conform-or-replace decisions, shared-surface conventions, a design ruling carried over from an earlier batch.
+- **The packet — the per-ticket half, minted per dispatch.** ID and epoch; Objective; Done-means with this ticket's frozen test commands; the worktree path and branch; **Files you own**; the ticket's public-surface extract; its dependencies' **landed** API (what actually merged, not what was planned); the map excerpt and only the learnings relevant to *this* area; the prior-attempt notes if it is a retry; and the CURRENT baseline number as measured at dispatch.
+- **The packet's first line points at the preamble by path**, as an instruction and not a citation: *"Read `.swarm-loop/worker-preamble.md` in full before you touch anything — it is the contract this packet is written against. Read it; never edit it."*
+
+**Who writes it and when: the orchestrator, once, at first dispatch (Phase 4) — and it must be COMMITTED to `main` before the first `git worktree add`.** A worktree carries only tracked files at the commit it branched from, so an uncommitted preamble is a preamble that does not exist for any worker; it is the same trap that otherwise leaves a worker without its acceptance tests. Put it at `.swarm-loop/worker-preamble.md`, at the top level of `.swarm-loop/` and **never inside `.swarm-loop/acceptance/`** — that directory is a protected path whose ADDED scan reports any unhashed file as an INTEGRITY VIOLATION and voids the cycle's scores. It is orchestrator-owned state like everything else under `.swarm-loop/`, so a worker branch that edits it is vetoed by `check-branch` before it is read; say that in the preamble itself, because a rule with its enforcement stated is the one that holds.
+
+**A standing ruling that changes mid-run:** edit the preamble in the primary checkout, commit it to `main`, and stamp the change at the top under a dated `## Changelog` line naming the epoch it took effect. Every packet dispatched after that commit picks it up for free — that is the whole point of the split. **Workers already in flight do not**: their worktree is pinned to an older commit and their context already holds the old text, so a ruling that must reach them is sent to each running subagent directly, in the same turn as the edit, quoting only the delta; a ruling that can wait goes in the retry packet or the next dispatch. Never edit the preamble to retroactively legitimize a branch already rejected under the old rule — the changelog stamp is what lets a later reader tell which version a report was written against.
+
 ## Template
+
+What follows is the **union of both halves** — the split above says which sections are minted per ticket and which are lifted into `.swarm-loop/worker-preamble.md` once per run. Either way every section reaches the worker exactly once.
 
 ```
 You are implementing one atomic task inside an orchestrated build loop. Work ONLY
 inside your worktree; commit your work; report in the format specified. The
 orchestrator merges branches and runs all measurement — you do neither.
+
+Read `.swarm-loop/worker-preamble.md` in full before you touch anything — it is
+the contract this packet is written against, and it is mandatory reading, not
+background. Read it; never edit it.
 
 ## Task
 - ID: <task-id>   (epoch <N>)
@@ -88,12 +108,25 @@ permission to change its own route has misread this packet.
   need a clean tree, that is the orchestrator's job in fresh isolation: STOP and
   report it, do not stash. (A `PreToolUse` git-guard blocks these ops; if you hit
   a block, the guard is working — switch to the read-only form, do not route
-  around it.) The guard blocks every spelling of "restore this from git," which
-  means there is no worker-side restore at all: if the frozen harness or any
-  tracked file looks damaged, the repair is the orchestrator's
-  `swarmloop.py restore-harness` — an orchestrator-only command you never run.
-  Report the damage; the sanctioned things you may do yourself are the read-only
-  `git show HEAD:<file>` and `git diff HEAD -- <file>`, and nothing else.
+  around it.) What the guard blocks is every git verb that WRITES the working
+  tree from a commit or the index, and it blocks them no matter how narrow the
+  pathspec looks: `git restore <one file>` and `git checkout HEAD -- <one file>`
+  are refused exactly like `git checkout .`. It does NOT block READING from git.
+  So there is exactly one worker-side restore, and it is the redirect form:
+
+      git show HEAD:<file> > <file>       # ALLOW (verified) — restores ONE path
+
+  Three sanctioned git-vs-tree operations, and there are no others:
+  `git show HEAD:<file>` reads the baseline, `git diff HEAD -- <file>` reads your
+  diff, and `git show HEAD:<file> > <file>` restores that one file. That restore
+  is a blind overwrite — no merge, no conflict markers — so it silently discards
+  your uncommitted work on that path; use it only on a file YOU OWN, only inside
+  your worktree, and only when you know what you are throwing away. It is never
+  the repair for anything under `.swarm-loop/`: a frozen test, `goals.json` or
+  manifest that looks damaged is the orchestrator's
+  `swarmloop.py restore-harness` — an orchestrator-only command you never run —
+  and a branch that writes under `.swarm-loop/` is vetoed by `check-branch`
+  before anyone reads it. Report the damage.
 - TESTS ARE APPEND-ONLY. Adding tests/assertions: free, encouraged. Modifying or
   deleting an EXISTING assertion requires the `justify-test-edit` ritual — and
   that includes every disguise: changing an expected value, widening a tolerance,
@@ -207,10 +240,25 @@ nearly every significant defect on record was found by an agent that did NOT wri
 the code), and every batch gets a FRESH verifier — never a carried-over context
 that has already concluded the batch is fine.
 
-**The orchestrator pastes in:** the batch's ticket packets; the doers' completion
-reports, labeled explicitly as CLAIMS TO TEST, not facts; the integrated diff range
-(`git diff <pre-batch-main>..main`); current metric values; the learnings relevant
-to the batch's area.
+**The orchestrator pastes in:** the batch's ticket packets (once packets are split,
+the preamble path plus each ticket's per-ticket half); the doers' completion reports,
+labeled explicitly as CLAIMS TO TEST, not facts; the integrated diff — **`--stat`
+first, always**; current metric values; the learnings relevant to the batch's area.
+
+```bash
+git diff --stat <pre-batch-main>..main      # size it BEFORE pasting anything
+git diff <pre-batch-main>..main -- <path>   # then per-file, for what the stat says matters
+```
+
+A five-ticket batch diff is routinely 10k+ lines. Pasting one whole is the largest
+single context sink in the loop, and it truncates — and a truncated tail is exactly
+where an unjustified assertion deletion hides. **Cap it:** paste the full text only
+under ~1,500 lines; past that, paste the `--stat` plus per-file diffs for what it
+flags (every test file, every shared surface, everything outside the batch's
+ownership map), and hand the verifier the range so it can pull the rest itself.
+Keep the **two-dot** form — both endpoints sit on `main`'s first-parent line, which
+is what makes `..` the correct operator here; it has been verified twice, do not
+"fix" it to three-dot.
 
 **Duties:**
 

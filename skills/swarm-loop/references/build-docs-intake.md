@@ -49,7 +49,7 @@ trust them blindly either — the intake procedure below is the trust boundary.
 | T-0 bootstrap ticket | The cycle-1 scaffold task (greenfield Phase 1) | — |
 | EXECUTION.md | Orchestration cross-check | This skill's protocol governs |
 
-## Intake procedure (runs inside Phases 0–2)
+## Intake procedure (runs inside Phases 0–3)
 
 1. **Read every tier.** If SPEC's *Open questions* section is non-empty, stop and put
    the questions to the user before `init` — the planning skill left them open on
@@ -86,7 +86,8 @@ trust them blindly either — the intake procedure below is the trust boundary.
    root. Do not re-decompose tickets that satisfy the atomicity check; split only a
    ticket that genuinely fails it, and record the split (T-014 → T-014a/b) in the
    backlog and the cycle report.
-6. **Derive the INITIAL frontier — not a wave plan.** `depends_on` plus the
+6. **Derive the INITIAL frontier — not a wave plan** (this step is the Phase-3 half
+   of intake; steps 1–5 and 7 are Phases 0–2). `depends_on` plus the
    scheduling constraints from step 2 give the readiness scheduler its starting
    set; later "rounds" are never planned, because waves are emergent batches.
    Worked example: six tickets where 2 waits on 1, 4 waits on 3, and 6 waits on 5
