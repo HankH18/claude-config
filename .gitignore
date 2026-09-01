@@ -19,3 +19,17 @@
 # !/agents/
 # !/commands/
 # !/hooks/
+
+# --- skills -------------------------------------------------------------
+# Conservative: re-include the skills dir itself, re-ignore its contents,
+# then allowlist individual skills. Marketplace/plugin skills stay out.
+!/skills/
+/skills/*
+!/skills/swarm-loop/
+
+# ...but never bytecode or tool caches from inside a versioned skill.
+/skills/swarm-loop/**/__pycache__/
+/skills/swarm-loop/**/*.py[co]
+/skills/swarm-loop/**/.pytest_cache/
+
+# To version another skill, add:  !/skills/<name>/
