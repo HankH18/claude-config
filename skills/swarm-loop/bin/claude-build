@@ -1,0 +1,534 @@
+#!/usr/bin/env bash
+# claude-build — open a Claude Code session preconfigured for a swarm-loop run.
+#
+# Solves the failure that makes every other guard-fix moot: Claude Code reads
+# .claude/settings.local.json at SESSION START. A settings file created mid-session
+# is never picked up (measured on 2.1.252), so a run that installs its own git-guard
+# after launching has no guard at all for the first mutating wave. This script writes
+# the file, PROVES the hook is live, and only then launches the session.
+#
+# Everything it writes is recorded in .claude/.claude-build.json, so --uninstall
+# removes exactly what was added and nothing you added yourself.
+#
+# Usage:  claude-build [DIR] [options]        Run with --help for options.
+
+set -euo pipefail
+
+SKILL="$HOME/.claude/skills/swarm-loop"
+GUARD="$SKILL/hooks/git-guard.py"
+HARNESS="$SKILL/scripts/swarmloop.py"
+SELF="${BASH_SOURCE[0]}"
+
+DIR="" ; SPEC="" ; AUDIT_LOOPS="" ; MAX_CYCLES=""
+LAUNCH=1 ; IN_TREE=0 ; DRY=0 ; QUIET=0 ; MODE=install ; PURGE=0
+
+die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+ok()   { [ "$QUIET" = 1 ] || printf '  \033[32m✓\033[0m %s\n' "$*"; }
+warn() { printf '  \033[33m!\033[0m %s\n' "$*" >&2; }
+step() { [ "$QUIET" = 1 ] || printf '\n\033[1m%s\033[0m\n' "$*"; }
+
+# macOS ships bash 3.2, whose parser scans a heredoc body for quotes when the
+# heredoc sits inside $( ... ) — one apostrophe in a Python comment then breaks
+# the whole script. Define these at top level and pass them with -c instead.
+read -r -d '' PY_MERGE <<'PY_MERGE_EOF' || true
+import json, os, sys
+
+path, wt, dry = os.environ["SETTINGS"], os.environ["WT"], os.environ["DRY"] == "1"
+manifest_p = os.environ["MANIFEST"]
+cmd = 'python3 "$HOME/.claude/skills/swarm-loop/hooks/git-guard.py"'
+
+data, note = {}, []
+if os.path.exists(path):
+    try:
+        with open(path) as f:
+            data = json.load(f) or {}
+        note.append("merged into existing settings.local.json")
+    except Exception as e:
+        print(f"FATAL:existing {path} is not valid JSON ({e}) — fix or move it first")
+        sys.exit(3)
+else:
+    note.append("created settings.local.json")
+
+man = {"worktree_dir": wt, "permissions_added": [],
+       "additional_directories_added": [], "gitignore_added": [],
+       "set_disable_all_hooks": False}
+
+# Hook entries MERGE across settings levels, so this never removes a user-level
+# hook. disableAllHooks is the one switch that turns the guard off; pin it false.
+if "disableAllHooks" not in data:
+    man["set_disable_all_hooks"] = True
+elif data.get("disableAllHooks") is True:
+    note.append("flipped disableAllHooks true -> false")
+data["disableAllHooks"] = False
+
+hooks = data.setdefault("hooks", {})
+pre = hooks.setdefault("PreToolUse", [])
+if not isinstance(pre, list):
+    print("FATAL:hooks.PreToolUse is not a list — fix settings.local.json by hand")
+    sys.exit(3)
+
+def has_guard(entries):
+    for e in entries:
+        if isinstance(e, dict):
+            for h in e.get("hooks") or []:
+                if isinstance(h, dict) and "git-guard.py" in str(h.get("command", "")):
+                    return True
+    return False
+
+if has_guard(pre):
+    note.append("git-guard hook already present (left as-is)")
+else:
+    pre.append({"matcher": "Bash", "hooks": [{"type": "command", "command": cmd}]})
+    note.append("added git-guard PreToolUse hook")
+
+perms = data.setdefault("permissions", {})
+adds = perms.get("additionalDirectories")
+if not isinstance(adds, list):
+    adds = []
+if wt not in adds and not wt.startswith(os.path.dirname(os.path.dirname(path))+os.sep+".claude"):
+    adds.append(wt); man["additional_directories_added"].append(wt)
+    note.append("granted worktree directory")
+perms["additionalDirectories"] = adds
+
+# Baseline allowlist: capability the swarm needs to not hang on a prompt, and
+# nothing deploy-adjacent. Add project-specific Bash patterns yourself — a
+# permission entry never widens a task packet's boundary.
+baseline = [
+    "Bash(git worktree add:*)", "Bash(git worktree list:*)", "Bash(git worktree prune:*)",
+    "Bash(git merge:*)", "Bash(git branch:*)", "Bash(git commit:*)", "Bash(git add:*)",
+    "Read(.env)", "Read(.env.*)", "Edit(.env)", "Edit(.env.*)",
+]
+allow = perms.get("allow")
+if not isinstance(allow, list):
+    allow = []
+added = [p for p in baseline if p not in allow]
+allow.extend(added); man["permissions_added"] = added
+perms["allow"] = allow
+if added:
+    note.append(f"added {len(added)} baseline permission(s)")
+
+if not dry:
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2); f.write("\n")
+    os.replace(tmp, path)
+    with open(manifest_p, "w") as f:
+        json.dump(man, f, indent=2); f.write("\n")
+
+print("OK:" + "; ".join(note))
+PY_MERGE_EOF
+
+read -r -d '' PY_UNINSTALL <<'PY_UNINSTALL_EOF' || true
+import json, os, sys
+
+settings, manifest_p, root = os.environ["SETTINGS"], os.environ["MANIFEST"], os.environ["DIR"]
+dry = os.environ["DRY"] == "1"
+notes, wt = [], None
+
+man = {}
+if os.path.exists(manifest_p):
+    try:
+        with open(manifest_p) as f:
+            man = json.load(f) or {}
+        notes.append("read manifest")
+    except Exception:
+        notes.append("manifest unreadable — falling back to signature matching")
+else:
+    notes.append("no manifest — falling back to signature matching")
+
+wt = man.get("worktree_dir")
+added_perms = set(man.get("permissions_added") or [])
+added_dirs  = set(man.get("additional_directories_added") or ([wt] if wt else []))
+added_gi    = man.get("gitignore_added") or []
+
+if os.path.exists(settings):
+    try:
+        with open(settings) as f:
+            data = json.load(f) or {}
+    except Exception as e:
+        print(f"FATAL:{settings} is not valid JSON ({e}) — remove entries by hand")
+        sys.exit(3)
+
+    # Hook: always signature-matched. Only entries pointing at OUR guard go.
+    hooks = data.get("hooks") or {}
+    pre = hooks.get("PreToolUse")
+    if isinstance(pre, list):
+        kept = []
+        removed = 0
+        for e in pre:
+            if isinstance(e, dict):
+                inner = [h for h in (e.get("hooks") or [])
+                         if not (isinstance(h, dict) and "git-guard.py" in str(h.get("command", "")))]
+                if len(inner) != len(e.get("hooks") or []):
+                    removed += 1
+                    if inner:
+                        e = dict(e, hooks=inner); kept.append(e)
+                    continue
+            kept.append(e)
+        if removed:
+            notes.append(f"removed {removed} git-guard hook entr" + ("y" if removed == 1 else "ies"))
+        if kept:
+            hooks["PreToolUse"] = kept
+        else:
+            hooks.pop("PreToolUse", None)
+        if hooks:
+            data["hooks"] = hooks
+        else:
+            data.pop("hooks", None)
+
+    # disableAllHooks: we set it False. Remove only if still exactly False.
+    if data.get("disableAllHooks") is False and man.get("set_disable_all_hooks"):
+        data.pop("disableAllHooks", None)
+        notes.append("removed disableAllHooks pin")
+
+    perms = data.get("permissions") or {}
+    ad = perms.get("additionalDirectories")
+    if isinstance(ad, list) and added_dirs:
+        before = len(ad)
+        ad = [d for d in ad if d not in added_dirs]
+        if len(ad) != before:
+            notes.append(f"removed {before - len(ad)} worktree grant(s)")
+        if ad: perms["additionalDirectories"] = ad
+        else:  perms.pop("additionalDirectories", None)
+
+    allow = perms.get("allow")
+    if isinstance(allow, list) and added_perms:
+        before = len(allow)
+        allow = [p for p in allow if p not in added_perms]
+        if len(allow) != before:
+            notes.append(f"removed {before - len(allow)} baseline permission(s)")
+        if allow: perms["allow"] = allow
+        else:     perms.pop("allow", None)
+
+    if perms: data["permissions"] = perms
+    else:     data.pop("permissions", None)
+
+    if not dry:
+        if data:
+            tmp = settings + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f, indent=2); f.write("\n")
+            os.replace(tmp, settings)
+        else:
+            os.remove(settings)
+            notes.append("settings.local.json was left empty — deleted")
+else:
+    notes.append("no settings.local.json found")
+
+# .gitignore: remove only lines we added, and only if still present verbatim.
+gi = os.path.join(root, ".gitignore")
+if added_gi and os.path.exists(gi):
+    with open(gi) as f:
+        lines = f.read().splitlines()
+    keep = []
+    dropped = 0
+    for ln in lines:
+        if ln in added_gi and dropped < len(added_gi):
+            dropped += 1
+            continue
+        keep.append(ln)
+    if dropped and not dry:
+        with open(gi, "w") as f:
+            f.write("\n".join(keep).rstrip("\n") + ("\n" if keep else ""))
+    if dropped:
+        notes.append(f"removed {dropped} .gitignore line(s)")
+
+if not dry and os.path.exists(manifest_p):
+    os.remove(manifest_p)
+    notes.append("removed manifest")
+
+print("OK:" + (wt or "") + "|" + "; ".join(notes))
+PY_UNINSTALL_EOF
+
+usage() {
+  cat <<'HELP_TEXT'
+claude-build — open a Claude Code session preconfigured for a swarm-loop run.
+
+USAGE
+  claude-build [DIR] [options]
+  claude-build [DIR] --uninstall
+  claude-build --uninstall-self
+
+ARGUMENTS
+  DIR                  Project directory. Default: current directory.
+                       Created, and git-initialized, if it does not exist.
+
+OPTIONS
+  --spec FILE          Spec / PRD / build-doc to hand the skill on open.
+  --audit-loops N      Audit-fix loops after the build converges (default: ask).
+  --max-cycles N       Runaway safety ceiling (default: ask).
+  --in-tree            Force worktrees to .swarm-loop/worktrees/ instead of a
+                       sibling directory. Costs you the metric-contamination
+                       protection; see references/run-permissions.md.
+  --no-launch          Configure and probe, but do not start Claude Code.
+  --dry-run            Show what would change. Writes nothing.
+  -q, --quiet          Only warnings and errors.
+  -h, --help           This text.
+
+UNINSTALL
+  --uninstall          Remove from DIR exactly what claude-build added: the
+                       git-guard hook, the worktree grant, the baseline
+                       permissions, and its .gitignore lines. Anything you
+                       added yourself is left alone. Reads the manifest at
+                       .claude/.claude-build.json; falls back to signature
+                       matching if that file is gone.
+  --purge              With --uninstall: also delete the worktree directory
+                       and prune stale worktree registrations. Refuses if any
+                       worktree still holds uncommitted work.
+  --uninstall-self     Delete the claude-build script itself. Does not touch
+                       any project; run --uninstall in each project first.
+
+WHAT INSTALL DOES
+  1. Creates / git-initializes the project directory.
+  2. Picks a worktree location outside the repo (so root-walking metric
+     commands cannot count in-flight workers' checkouts).
+  3. Merges the git-guard hook + permission grants into
+     .claude/settings.local.json, non-destructively and idempotently.
+  4. PROBES the guard and the worktree grant, and refuses to launch if either
+     fails. A guard you did not prove is a guard you do not have.
+  5. Launches Claude Code with the worktree directory already granted.
+HELP_TEXT
+  exit 0
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help)        usage ;;
+    --spec)           SPEC="${2:-}"; shift 2 ;;
+    --audit-loops)    AUDIT_LOOPS="${2:-}"; shift 2 ;;
+    --max-cycles)     MAX_CYCLES="${2:-}"; shift 2 ;;
+    --in-tree)        IN_TREE=1; shift ;;
+    --no-launch)      LAUNCH=0; shift ;;
+    --dry-run)        DRY=1; LAUNCH=0; shift ;;
+    --uninstall)      MODE=uninstall; LAUNCH=0; shift ;;
+    --purge)          PURGE=1; shift ;;
+    --uninstall-self) MODE=uninstall-self; LAUNCH=0; shift ;;
+    -q|--quiet)       QUIET=1; shift ;;
+    -*)               die "unknown option: $1  (claude-build --help)" ;;
+    *)                [ -n "$DIR" ] && die "more than one directory given: $DIR and $1"
+                      DIR="$1"; shift ;;
+  esac
+done
+
+# ------------------------------------------------------------ uninstall-self
+if [ "$MODE" = uninstall-self ]; then
+  TARGET="$(cd "$(dirname "$SELF")" && pwd -P)/$(basename "$SELF")"
+  step "claude-build — uninstall self"
+  warn "this removes the launcher only; per-project config stays until you run"
+  warn "  claude-build <dir> --uninstall   in each project you configured"
+  if [ "$DRY" = 1 ]; then echo "  would delete: $TARGET"; exit 0; fi
+  rm -f "$TARGET" && ok "deleted $TARGET"
+  echo
+  echo "The swarm-loop skill itself is untouched at $SKILL."
+  exit 0
+fi
+
+# ---------------------------------------------------------------- preflight
+[ -f "$GUARD" ]   || die "git-guard not found at $GUARD — is the swarm-loop skill installed?"
+[ -f "$HARNESS" ] || die "swarmloop.py not found at $HARNESS — is the swarm-loop skill installed?"
+command -v python3 >/dev/null || die "python3 not on PATH (the guard and harness need it)"
+command -v git     >/dev/null || die "git not on PATH"
+[ "$MODE" = install ] && { command -v claude >/dev/null || die "claude not on PATH"; }
+
+DIR="${DIR:-$PWD}"
+if [ ! -d "$DIR" ] && [ "$MODE" = install ]; then
+  [ "$DRY" = 1 ] && echo "would create directory: $DIR" || mkdir -p "$DIR"
+fi
+[ -d "$DIR" ] || DIR="$PWD"
+DIR="$(cd "$DIR" && pwd -P)"
+if git -C "$DIR" rev-parse --show-toplevel >/dev/null 2>&1; then
+  ROOT="$(git -C "$DIR" rev-parse --show-toplevel)"
+  [ "$ROOT" != "$DIR" ] && { warn "$DIR is inside the repo at $ROOT — using the repo root"; DIR="$ROOT"; }
+fi
+NAME="$(basename "$DIR")"
+SETTINGS="$DIR/.claude/settings.local.json"
+MANIFEST="$DIR/.claude/.claude-build.json"
+
+# ================================================================ UNINSTALL
+if [ "$MODE" = uninstall ]; then
+  step "claude-build — uninstall from $NAME"
+  [ "$DRY" = 1 ] && warn "DRY RUN — nothing will be removed"
+
+  # Safety first: if --purge could refuse, it must refuse BEFORE anything is
+  # removed. Otherwise a refusal leaves the project half-uninstalled.
+  if [ "$PURGE" = 1 ]; then
+    WT_PRE="$(MANIFEST="$MANIFEST" python3 -c 'import json,os;p=os.environ["MANIFEST"];print((json.load(open(p)).get("worktree_dir") or "") if os.path.exists(p) else "")' 2>/dev/null || true)"
+    WT_PRE="${WT_PRE:-$(dirname "$DIR")/${NAME}-worktrees}"
+    BLOCKED=0
+    while IFS= read -r w; do
+      [ -z "$w" ] && continue
+      if [ -n "$(git -C "$w" status --porcelain 2>/dev/null)" ]; then
+        warn "uncommitted work in $w"; BLOCKED=1
+      fi
+    done < <(git -C "$DIR" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}' | grep -F "$WT_PRE" || true)
+    [ "$BLOCKED" = 1 ] && die "refusing to purge — worktrees hold uncommitted work. Nothing was removed; commit or discard, then rerun."
+  fi
+
+  OUT="$(SETTINGS="$SETTINGS" MANIFEST="$MANIFEST" DIR="$DIR" DRY="$DRY" python3 -c "$PY_UNINSTALL")" || true
+
+  case "$OUT" in
+    FATAL:*) die "${OUT#FATAL:}" ;;
+    OK:*)    BODY="${OUT#OK:}"; WT_REC="${BODY%%|*}"; NOTES="${BODY#*|}"
+             IFS=';' read -ra N <<< "$NOTES"; for n in "${N[@]}"; do ok "${n# }"; done ;;
+    *)       die "uninstall failed: ${OUT:-no output}" ;;
+  esac
+
+  WT_REC="${WT_REC:-$(dirname "$DIR")/${NAME}-worktrees}"
+  if [ "$PURGE" = 1 ]; then
+    step "Purge — worktrees"
+    LIVE=0
+    while IFS= read -r w; do
+      [ -z "$w" ] && continue
+      if [ -n "$(git -C "$w" status --porcelain 2>/dev/null)" ]; then
+        warn "uncommitted work in $w"; LIVE=1
+      fi
+    done < <(git -C "$DIR" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}' | grep -F "$WT_REC" || true)
+    if [ "$LIVE" = 1 ]; then
+      die "refusing to purge — worktrees hold uncommitted work (commit or discard, then rerun)"
+    fi
+    if [ "$DRY" = 1 ]; then echo "  would delete $WT_REC and run git worktree prune"
+    else
+      rm -rf "$WT_REC"; git -C "$DIR" worktree prune 2>/dev/null || true
+      ok "deleted $WT_REC and pruned"
+    fi
+  else
+    [ -d "$WT_REC" ] && warn "worktree dir left in place: $WT_REC  (--purge removes it)"
+  fi
+
+  step "Done"
+  echo "  The swarm-loop skill and any .swarm-loop/ run state are untouched."
+  echo "  Restart Claude Code for the hook removal to take effect."
+  exit 0
+fi
+
+# ================================================================== INSTALL
+step "claude-build — $NAME"
+[ "$DRY" = 1 ] && warn "DRY RUN — nothing will be written"
+
+step "1. Repository"
+GIT_ID=(-c "user.email=$(git config user.email 2>/dev/null || echo build@local)"
+        -c "user.name=$(git config user.name 2>/dev/null || echo claude-build)")
+if git -C "$DIR" rev-parse --git-dir >/dev/null 2>&1; then
+  ok "git repo at $DIR"
+  if ! git -C "$DIR" rev-parse HEAD >/dev/null 2>&1; then
+    if [ "$DRY" = 1 ]; then echo "  would create an initial commit (repo has no HEAD)"
+    else git -C "$DIR" "${GIT_ID[@]}" commit -q --allow-empty -m "initial commit"; ok "created initial commit"; fi
+  fi
+else
+  if [ "$DRY" = 1 ]; then echo "  would run: git init -b main; initial commit"
+  else
+    git -C "$DIR" init -q -b main
+    git -C "$DIR" "${GIT_ID[@]}" commit -q --allow-empty -m "initial commit"
+    ok "git init -b main + initial commit (greenfield)"
+  fi
+fi
+
+step "2. Worktree location"
+PARENT="$(dirname "$DIR")"
+WT="$PARENT/${NAME}-worktrees"; WT_MODE="sibling"
+if [ "$IN_TREE" = 1 ]; then
+  WT="$DIR/.swarm-loop/worktrees"; WT_MODE="in-tree (forced)"
+elif ! ( [ -w "$PARENT" ] && ( [ -d "$WT" ] || mkdir -p "$WT" 2>/dev/null ) ); then
+  WT="$DIR/.swarm-loop/worktrees"; WT_MODE="in-tree (parent not writable)"
+  warn "cannot write to $PARENT — falling back in-tree"
+  warn "metric commands MUST then exclude .swarm-loop/ (see goal-setting.md)"
+fi
+[ "$DRY" = 1 ] || mkdir -p "$WT"
+ok "$WT_MODE → $WT"
+
+step "3. Settings (.claude/settings.local.json)"
+[ "$DRY" = 1 ] || mkdir -p "$DIR/.claude"
+MERGE_OUT="$(WT="$WT" SETTINGS="$SETTINGS" MANIFEST="$MANIFEST" DRY="$DRY" python3 -c "$PY_MERGE")" || true
+case "$MERGE_OUT" in
+  FATAL:*) die "${MERGE_OUT#FATAL:}" ;;
+  OK:*)    ok "${MERGE_OUT#OK:}" ;;
+  *)       die "settings merge failed: ${MERGE_OUT:-no output}" ;;
+esac
+
+step "4. .gitignore"
+GI="$DIR/.gitignore"
+NEEDED='.claude/settings.local.json
+.claude/.claude-build.json
+.swarm-loop/worktrees/
+.swarm-loop/archive/
+__pycache__/
+*.py[co]
+.pytest_cache/
+.mypy_cache/'
+if [ "$DRY" = 1 ]; then
+  echo "  would ensure $(printf '%s\n' "$NEEDED" | wc -l | tr -d ' ') entries in .gitignore"
+else
+  ADDED_LINES=()
+  touch "$GI"
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    grep -qxF "$line" "$GI" 2>/dev/null || { printf '%s\n' "$line" >> "$GI"; ADDED_LINES+=("$line"); }
+  done <<< "$NEEDED"
+  if [ ${#ADDED_LINES[@]} -gt 0 ]; then
+    printf '%s\n' "${ADDED_LINES[@]}" | MANIFEST="$MANIFEST" python3 -c '
+import json,os,sys
+p=os.environ["MANIFEST"]
+m=json.load(open(p)) if os.path.exists(p) else {}
+m["gitignore_added"]=[l.rstrip("\n") for l in sys.stdin if l.strip()]
+json.dump(m,open(p,"w"),indent=2)'
+  fi
+  ok "${#ADDED_LINES[@]} entr$([ ${#ADDED_LINES[@]} = 1 ] && echo y || echo ies) added"
+fi
+
+step "5. Probes — proving the configuration, not assuming it"
+if [ "$DRY" = 1 ]; then
+  echo "  would probe: guard blocks 'git stash' / allows 'git status' / blocks the"
+  echo "               multi-line form; worktree add+write+read+teardown at $WT"
+else
+  probe_guard() {
+    printf '%s' "$1" \
+      | python3 -c 'import json,sys;print(json.dumps({"tool_name":"Bash","tool_input":{"command":sys.stdin.read()}}))' \
+      | python3 "$GUARD" >/dev/null 2>&1
+    echo $?
+  }
+  FAIL=0
+  R="$(cd "$DIR" && probe_guard 'git stash')"
+  [ "$R" = 2 ] && ok "guard BLOCKS 'git stash' (exit 2)" || { warn "guard did NOT block 'git stash' (exit $R)"; FAIL=1; }
+  R="$(cd "$DIR" && probe_guard 'git status --porcelain')"
+  [ "$R" = 0 ] && ok "guard ALLOWS 'git status' (exit 0)" || { warn "guard blocked a read-only command (exit $R)"; FAIL=1; }
+  R="$(cd "$DIR" && probe_guard $'git status\ngit stash')"
+  [ "$R" = 2 ] && ok "guard blocks the multi-line form (exit 2)" || { warn "multi-line bypass is open (exit $R)"; FAIL=1; }
+
+  # A grant covering reads but not writes passes the first half of this and
+  # hangs the wave on the second, so probe all four operations.
+  if ( cd "$DIR" \
+       && git worktree add -q "$WT/_probe" -b _cb_probe >/dev/null 2>&1 \
+       && echo probe > "$WT/_probe/_cb_probe.txt" \
+       && [ "$(cat "$WT/_probe/_cb_probe.txt")" = probe ] ); then
+    ok "worktree add + write + read at $WT"
+  else
+    warn "worktree probe FAILED at $WT"; FAIL=1
+  fi
+  ( cd "$DIR" && rm -rf "$WT/_probe" && git worktree prune && git branch -qD _cb_probe ) >/dev/null 2>&1 || true
+
+  [ "$FAIL" = 1 ] && die "probes failed — refusing to launch. An unproven guard is no guard."
+fi
+
+step "6. Launch"
+PROMPT="Use the swarm-loop skill to run an autonomous build in this directory."
+[ -n "$SPEC" ]        && PROMPT="$PROMPT The spec is at: $SPEC."
+[ -n "$AUDIT_LOOPS" ] && PROMPT="$PROMPT Use $AUDIT_LOOPS audit-fix loops."
+[ -n "$MAX_CYCLES" ]  && PROMPT="$PROMPT Use --max-cycles $MAX_CYCLES."
+PROMPT="$PROMPT Worktrees for this run go in $WT — Phase 0 is already provisioned: .claude/settings.local.json exists, the git-guard hook is live and probed, and that worktree directory is granted. Do not re-install the hook; verify and continue."
+
+if [ "$LAUNCH" = 0 ]; then
+  [ "$DRY" = 1 ] || ok "configured — not launching (--no-launch)"
+  cat <<EOF
+
+Start it yourself with:
+  cd "$DIR" && claude --add-dir "$WT"
+
+Then say:
+  $PROMPT
+EOF
+  exit 0
+fi
+
+ok "starting Claude Code in $DIR"
+cd "$DIR"
+exec claude --add-dir "$WT" "$PROMPT"
