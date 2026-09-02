@@ -1199,6 +1199,26 @@ def check_fetch(rest: list[str]) -> str | None:
     return None
 
 
+def check_pull(rest: list[str]) -> str | None:
+    """`git pull` is fetch + merge, and the FETCH half was judged by no rule.
+
+    Measured: `git fetch origin +main:main` blocked (rc=2) while the identical
+    force-update of the same local branch, spelled `git pull origin +main:main`,
+    ran (rc=0). Nothing dispatched on the `pull` verb at all, so every forced
+    spelling of it was unguarded — the module docstring named only the `fetch`
+    form as the forced-fetch case.
+
+    Delegates to check_fetch deliberately rather than re-implementing the
+    refspec logic: two copies of this rule drifting apart is how the weaker one
+    ends up on the path the loop actually uses. Only the `+<src>:<local branch>`
+    (or --force'd) form blocks, exactly as for fetch — plain `git pull`,
+    `git pull origin main`, `git pull --rebase` and `--ff-only` are ordinary loop
+    operations and stay allowed, because a false block on them is worse than the
+    gap being closed.
+    """
+    return check_fetch(rest)
+
+
 def check_update_ref(rest: list[str]) -> str | None:
     # Every form of update-ref mutates a ref, including the shared refs/stash;
     # nothing in the loop uses this plumbing at all.
@@ -2135,6 +2155,7 @@ CHECKS = {
     "push": check_push,
     "branch": check_branch,
     "fetch": check_fetch,
+    "pull": check_pull,
     "update-ref": check_update_ref,
     "reflog": check_reflog,
     "gc": check_gc,

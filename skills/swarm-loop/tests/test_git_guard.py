@@ -112,6 +112,13 @@ MUST_BLOCK = [
     ("push-plus-refspec",      "git push origin +main:main"),
     ("fetch-force-local-ref",  "git fetch origin +main:main"),
     ("fetch-force-local-full", "git fetch origin +refs/heads/main:refs/heads/main"),
+    # `git pull` is fetch + merge and NOTHING dispatched on the verb, so the
+    # fetch half was judged by no rule: the line above blocked while the
+    # identical force-update spelled as `pull` ran. Same effect, same block.
+    ("pull-force-local-ref",   "git pull origin +main:main"),
+    ("pull-force-local-full",  "git pull origin +refs/heads/main:refs/heads/main"),
+    ("pull-force-flag",        "git pull --force origin main:main"),
+    ("pull-force-short",       "git pull -f origin main:main"),
 
     # A command substitution's interior is scanned at the directory the line
     # STARTED in, not after a `cd` on the same line (see `has_substitution`).
@@ -811,6 +818,13 @@ MUST_ALLOW = [
     ("branch-list",            "git branch -a"),
     ("branch-set-upstream",    "git branch -u origin/main"),
     ("fetch-force-remote-ref", "git fetch origin +refs/heads/*:refs/remotes/origin/*"),
+    # The pull half of the same rule: a false block on ordinary pulls would be
+    # strictly worse than the gap it closes, so these are pinned as ALLOW.
+    ("pull-plain",             "git pull"),
+    ("pull-remote-branch",     "git pull origin main"),
+    ("pull-rebase",            "git pull --rebase origin main"),
+    ("pull-ff-only",           "git pull --ff-only"),
+    ("pull-force-remote-ref",  "git pull origin +refs/heads/*:refs/remotes/origin/*"),
     ("fetch-force-tags",       "git fetch origin +refs/tags/*:refs/tags/*"),
     ("fetch-plain-refspec",    "git fetch origin main:refs/remotes/origin/main"),
     ("fetch-all-prune",        "git fetch --all --prune"),
@@ -1473,7 +1487,12 @@ for _n in ("alias-co-dashdash", "alias-co-dot", "alias-co-file",
            "runbook-5-blocked-2", "runbook-5-blocked-3",
            # `+<src>:<dst>` is only destructive if <dst> is an EXISTING local
            # branch, and only a repository can say. Outside one, allow.
-           "fetch-force-local-ref", "fetch-force-local-full"):
+           # `pull` delegates to the same checker, so it inherits the same
+           # repo-dependence — declared here rather than discovered as 12 red
+           # cells in the derived axes.
+           "fetch-force-local-ref", "fetch-force-local-full",
+           "pull-force-local-ref", "pull-force-local-full",
+           "pull-force-flag", "pull-force-short"):
     CWD_EXPECT[_n] = dict(_NEEDS_REPO_CFG)
 # Cases that NAME an absolute fixture path already, via a placeholder: those
 # resolve identically everywhere and need no entry at all.
