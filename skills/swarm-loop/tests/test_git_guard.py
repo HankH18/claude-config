@@ -33,6 +33,7 @@ Exit:    0 = every case matched, 1 = at least one regression.
 import concurrent.futures
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -66,6 +67,67 @@ MUST_BLOCK = [
     ("nl-indent",             "echo a\n    git stash pop"),
     ("nl-comment",            "# clean up\ngit clean -fdx"),
     ("nl-trailing-and",       "git fetch &&\ngit reset --hard"),
+
+    # -- Patch 3: the cwd hole, and the shapes that used to walk past it -----
+    #    `rm -rf "$WT/$ID"` (fully collapsed) was blocked; leave ONE literal
+    #    component and the same delete was allowed. The guard already knows the
+    #    NAME of every live worktree and the operand states it verbatim.
+    ("var-root-literal-id",    'rm -rf "$WT/T-010"'),
+    # NB: the variable is `${WTREE}`, not `${WT}` — `{WT}` is a fixture
+    # placeholder and would be substituted out from under the test.
+    ("var-root-literal-brace", 'rm -rf "${WTREE}/T-010"'),
+    ("var-root-literal-bare",  "rm -rf $WT/T-010"),
+    ("var-root-literal-tail2", 'rm -rf "$ROOT/worktrees/T-010"'),
+    ("var-root-literal-repo",  'rm -rf "$P/repo/.swarm-loop"'),
+    #    Both of these NAME their target, and both were exit 0 for a file that
+    #    exists only in that worktree — the question was asked from the session
+    #    root, where the file does not exist.
+    ("gitC-worktree-own-file", "git -C {WT} checkout only_in_worktree.py"),
+    ("cd-worktree-own-file",   "cd {WT} && git checkout only_in_worktree.py"),
+    ("cd-worktree-own-file-nl","cd {WT}\ngit checkout only_in_worktree.py"),
+    ("gitC-worktree-dot",      "git -C {WT} checkout ."),
+    ("cd-outside-rm-repo",     "cd {OUTSIDE} && rm -rf {REPO}"),
+    ("cd-outside-rm-worktree", "cd {OUTSIDE} && rm -rf {WT}"),
+    ("cd-outside-rm-glob",     "cd {OUTSIDE} && rm -rf ./*"),
+
+    # -- ref destroyers the guard recognised by SPELLING only. `update-ref`,
+    #    `symbolic-ref` and `push --force` were exit 2 while every line below —
+    #    the same effects, differently spelled — was exit 0.
+    ("branch-force-move",      "git branch -f main HEAD~1"),
+    ("branch-force-long",      "git branch --force main HEAD~1"),
+    ("branch-force-abbrev",    "git branch --for main HEAD~1"),
+    ("checkout-force-branch",  "git checkout -B main HEAD~1"),
+    ("checkout-force-cluster", "git checkout -qB main HEAD~1"),
+    ("switch-force-branch",    "git switch -C main HEAD~1"),
+    ("push-mirror",            "git push --mirror origin"),
+    ("push-mirror-abbrev",     "git push --mir origin"),
+    ("push-delete-refspec",    "git push origin :refs/heads/main"),
+    ("push-delete-long",       "git push origin --delete main"),
+    ("push-delete-short",      "git push -d origin main"),
+    ("push-plus-refspec",      "git push origin +main:main"),
+    ("fetch-force-local-ref",  "git fetch origin +main:main"),
+    ("fetch-force-local-full", "git fetch origin +refs/heads/main:refs/heads/main"),
+
+    # A command substitution's interior is scanned at the directory the line
+    # STARTED in, not after a `cd` on the same line (see `has_substitution`).
+    # Pinned here in the conservative direction so the bound is measured.
+    ("cd-then-subst-scanned-early",
+     "cd {WT} && echo \"cleanup: `rm -rf {WT}`\""),
+
+    # -- ...and the shapes the SAME document records as BLOCKED, probed
+    #    against the live hook when it was written. If one of these starts
+    #    passing, the runbook's prose is wrong and an orchestrator following it
+    #    ends up stuck mid-merge with a conflicted index.
+    ("runbook-5-blocked-ours",   "git checkout --ours src/b.py"),
+    ("runbook-5-blocked-theirs", "git checkout --theirs src/b.py"),
+    ("runbook-5-blocked-2",      "git checkout -2 src/b.py"),
+    ("runbook-5-blocked-3",      "git checkout -3 src/b.py"),
+    ("runbook-5-blocked-dashdash", "git checkout --ours -- src/b.py"),
+    ("runbook-5-blocked-dot",    "git checkout --ours ."),
+    ("runbook-10-blocked-force", "git worktree remove --force {WT}"),
+    ("runbook-10-blocked-move",  "git worktree move {WT} {OUTSIDE}/T-999"),
+    ("runbook-10-blocked-rm",    "rm -rf {OUTSIDE}/T-010"),
+    ("runbook-10-blocked-collapsed", 'rm -rf "$WT/$ID"'),
 
     # -- shell keywords / compound commands ----------------------------------
     ("kw-if",                 "if true; then git stash; fi"),
@@ -698,6 +760,81 @@ MUST_ALLOW = [
     ("git-mv",                "git mv a.txt c.txt"),
     ("update-index-refresh",  "git update-index --refresh"),
 
+    # -- Patch 3 controls. Every one of these is a shape the widened rules
+    #    could plausibly have swallowed, and the widening is only worth having
+    #    if they stay allowed.
+    ("gitC-worktree-branch",   "git -C {WT} checkout main"),
+    ("gitC-worktree-status",   "git -C {WT} status"),
+    ("cd-worktree-branch",     "cd {WT} && git checkout main"),
+    ("cd-worktree-commit",     "cd {WT} && git add -A && git commit -m 'feat: x'"),
+    ("cd-worktree-build-junk", "cd {WT} && rm -rf build"),
+    ("cd-outside-teardown",    "cd {OUTSIDE} && git worktree remove {WT}"),
+    ("cd-elsewhere-scratch",   "cd {ELSEWHERE} && rm -rf scratch"),
+    ("rm-rf-elsewhere",        "rm -rf {ELSEWHERE}"),
+    #    A vendored checkout under node_modules has a `.git` DIRECTORY, not the
+    #    `.git` FILE a linked worktree has. The child scan that sees
+    #    `rm -rf ../worktrees` must not see this one.
+    ("rm-rf-vendored-clone",   "rm -rf {REPO}/node_modules"),
+    ("rm-rf-vendored-glob",    "rm -rf {REPO}/node_modules/*"),
+    ("rm-rf-wt-build",         "rm -rf {WT}/build"),
+    ("rm-rf-wt-build-glob",    "rm -rf {WT}/build/*"),
+    ("var-root-unprotected",   'rm -rf "$BUILD/dist"'),
+    ("var-root-tail-nomatch",  'rm -rf "$WT/T-999"'),
+    #    `-D` is `--delete --force`; the force test must run AFTER the delete
+    #    test or `git branch -D task/<id>` — the documented teardown — breaks.
+    ("branch-delete-force",    "git branch -D task/t1"),
+    ("branch-delete-long",     "git branch --delete task/t1"),
+    ("branch-rename",          "git branch -m old new"),
+    ("branch-list",            "git branch -a"),
+    ("branch-set-upstream",    "git branch -u origin/main"),
+    ("fetch-force-remote-ref", "git fetch origin +refs/heads/*:refs/remotes/origin/*"),
+    ("fetch-force-tags",       "git fetch origin +refs/tags/*:refs/tags/*"),
+    ("fetch-plain-refspec",    "git fetch origin main:refs/remotes/origin/main"),
+    ("fetch-all-prune",        "git fetch --all --prune"),
+    ("push-plain-refspec",     "git push origin main:main"),
+    ("push-dry-run",           "git push --dry-run origin main"),
+    ("push-lease",             "git push --force-with-lease origin main"),
+    ("checkout-create-branch", "git checkout -b task/T-011 main"),
+    ("switch-create-branch",   "git switch -c task/T-012"),
+    ("checkout-create-cluster","git checkout -qb task/T-013 main"),
+    #    `-Bar` is a BRANCH NAME attached to -b, not the -B force flag.
+    ("checkout-b-attached",    "git checkout -bBranchName main"),
+    ("switch-c-attached-caps", "git switch -cCoolBranch"),
+
+    # ...and the same shape with nothing destructive inside stays allowed, so
+    # the line above is a real classification and not "substitutions block".
+    ("cd-then-subst-harmless",
+     "cd {WT} && echo \"branch: `git rev-parse --abbrev-ref HEAD`\""),
+
+    # -- THE RUNBOOK. Every command `references/merge-protocol.md` PRESCRIBES
+    #    in steps 5-10, verbatim from the document with the fixture's own
+    #    values substituted for its placeholders. (The document has steps 0-10;
+    #    there is no step 11-15 and there never were "19 lines" — 7 logical
+    #    commands live in its fenced blocks and the rest are inline in prose.)
+    #    If the guard blocks one of these, the merge protocol has no path
+    #    through it and the run stalls at integration, so these are the load-
+    #    bearing allow cases in this file.
+    ("runbook-5-show-ours",    "git show :2:src/b.py > src/b.py"),
+    ("runbook-5-show-theirs",  "git show :3:src/b.py > src/b.py"),
+    ("runbook-5-add",          "git add src/b.py"),
+    ("runbook-7-merge-abort",  "git merge --abort"),
+    ("runbook-8-uv-sync",      "uv sync --locked"),
+    ("runbook-8-assert-effect",
+     ".venv/bin/python -c \"import somepkg, importlib.metadata as m; \\\n"
+     "    print(somepkg.__file__, m.version('somepkg'))\""),
+    ("runbook-9-land",         "git checkout main && git merge --ff-only integration/e3-b2"),
+    ("runbook-9-tripwire",     "git ls-tree -r HEAD --name-only | wc -l"),
+    ("runbook-10-remove",      "git worktree remove {WT}"),
+    ("runbook-10-salvage",     "git -C {WT} status"),
+    ("runbook-10-list",        "git worktree list"),
+    ("runbook-10-du",          "du -sh {OUTSIDE}"),
+    ("runbook-10-branch-del",  "git branch -D task/t1"),
+    ("runbook-10-teardown-chain",
+     "git worktree remove {WT} && git worktree prune && git branch -D wt/t010"),
+    ("runbook-10-escalate",
+     "swarmloop.py escalate --kind harness --subject \"{WT}\" --reason \"uncommitted\""),
+    ("runbook-10-background",  "(git worktree remove {WT} &) ; git worktree list"),
+
     # -- prose and inert quoting around the new tokenizer paths --------------
     # `bt-inside-dq-prose` used to live here asserting ALLOW for
     # `echo "do not run `git stash` here"`. That was a wrong claim about bash,
@@ -767,6 +904,66 @@ PAYLOAD_CASES = [
     ("cwd-not-a-string", BLOCK,
      {"tool_name": "Bash", "cwd": 17,
       "tool_input": {"command": "git stash"}}),
+
+    # -- THE SHAPE THE OLD `cwd` SECTION DID NOT HAVE. All four of its cases
+    #    resolved to a git repository — a worktree, the repo, a nonexistent dir
+    #    UNDER the repo (git's parent walk still finds it), and a malformed
+    #    `cwd: 17` (which falls back to the process cwd, the repo). An EXISTING
+    #    DIRECTORY OUTSIDE ANY REPO had no case at all, and it is the one that
+    #    made `repo_root()` None and `worktree_roots()` [] and fell every path
+    #    rule through to "no reason to block". The run's worktree PARENT is
+    #    exactly that directory, it is granted by `--add-dir`, and it is the
+    #    natural place to stand for a teardown loop.
+    ("cwd-outside-rm-repo-root", BLOCK,
+     {"tool_name": "Bash", "cwd": "{OUTSIDE}",
+      "tool_input": {"command": "rm -rf {REPO}"}}),
+    ("cwd-outside-rm-worktree", BLOCK,
+     {"tool_name": "Bash", "cwd": "{OUTSIDE}",
+      "tool_input": {"command": "rm -rf {WT}"}}),
+    ("cwd-outside-rm-worktrees-glob", BLOCK,
+     {"tool_name": "Bash", "cwd": "{OUTSIDE}",
+      "tool_input": {"command": "rm -rf {OUTSIDE}/*"}}),
+    ("cwd-outside-rm-swarm-dir", BLOCK,
+     {"tool_name": "Bash", "cwd": "{OUTSIDE}",
+      "tool_input": {"command": "rm -rf {REPO}/.swarm-loop"}}),
+    ("cwd-outside-truncate-ledger", BLOCK,
+     {"tool_name": "Bash", "cwd": "{OUTSIDE}",
+      "tool_input": {"command": "> {REPO}/.swarm-loop/state.json"}}),
+    ("cwd-nowhere-rm-repo-root", BLOCK,
+     {"tool_name": "Bash", "cwd": "{ELSEWHERE}",
+      "tool_input": {"command": "rm -rf {REPO}"}}),
+    # ...and it must not become a blanket refusal: an ordinary delete issued
+    # from that same directory stays allowed.
+    ("cwd-outside-teardown-ok", ALLOW,
+     {"tool_name": "Bash", "cwd": "{OUTSIDE}",
+      "tool_input": {"command": "git worktree remove {WT}"}}),
+    ("cwd-outside-scratch-ok", ALLOW,
+     {"tool_name": "Bash", "cwd": "{OUTSIDE}",
+      "tool_input": {"command": "rm -rf {ELSEWHERE}"}}),
+    ("cwd-outside-node-modules-ok", ALLOW,
+     {"tool_name": "Bash", "cwd": "{OUTSIDE}",
+      "tool_input": {"command": "rm -rf node_modules"}}),
+
+    # -- SECOND undiscovered shape, and the likelier one: a worker's OWN
+    #    worktree. Every dispatched worker runs there, and `swarm_dir()`
+    #    resolved to `<worktree>/.swarm-loop` — which does not exist — so the
+    #    ledger rules were disarmed for absolute paths from the one cwd the
+    #    swarm uses most. Measured before the fix: all four exit 0.
+    ("cwd-worktree-rm-swarm-dir", BLOCK,
+     {"tool_name": "Bash", "cwd": "{WT}",
+      "tool_input": {"command": "rm -rf {REPO}/.swarm-loop"}}),
+    ("cwd-worktree-truncate-ledger", BLOCK,
+     {"tool_name": "Bash", "cwd": "{WT}",
+      "tool_input": {"command": "> {REPO}/.swarm-loop/state.json"}}),
+    ("cwd-worktree-sed-goals", BLOCK,
+     {"tool_name": "Bash", "cwd": "{WT}",
+      "tool_input": {"command": "sed -i '' 's/1/0/' {REPO}/.swarm-loop/goals.json"}}),
+    ("cwd-worktree-mv-swarm", BLOCK,
+     {"tool_name": "Bash", "cwd": "{WT}",
+      "tool_input": {"command": "mv {REPO}/.swarm-loop /tmp/"}}),
+    ("cwd-worktree-edit-ledger", BLOCK,
+     {"tool_name": "Edit", "cwd": "{WT}",
+      "tool_input": {"file_path": "{REPO}/.swarm-loop/state.json"}}),
 
     # -- non-Bash tools. The registration matcher is `Bash`-only today, so the
     #    guard ALSO self-exempted: widening the matcher alone would have changed
@@ -939,6 +1136,24 @@ def build_repo(root):
     # way to prove the catch-all glob rule keys on the directory, not the glob.
     os.makedirs(os.path.join(root, "worktrees", "T-010", "build"))
 
+    # An EXISTING DIRECTORY OUTSIDE ANY REPOSITORY, holding nothing. `{OUTSIDE}`
+    # (the worktrees parent) is outside every repo too, but it CONTAINS live
+    # worktrees, which is itself a protected shape — so it cannot on its own
+    # show that a barren outside directory behaves. This one can.
+    os.makedirs(os.path.join(root, "elsewhere", "scratch"))
+
+    # A VENDORED CHECKOUT: a real git repository whose `.git` is a DIRECTORY,
+    # sitting where build junk sits. The rule that finds worktrees BELOW an
+    # operand is restricted to the LINKED shape (`.git` is a FILE) precisely so
+    # this stays deletable; without a fixture for it that restriction is a
+    # comment, not a tested property.
+    vend = os.path.join(repo, "node_modules", "vendored-pkg")
+    os.makedirs(vend)
+    p = subprocess.run(["git", "init", "-q", vend], env=git_env(root),
+                       capture_output=True, text=True)
+    if p.returncode != 0 or not os.path.isdir(os.path.join(vend, ".git")):
+        raise SystemExit("test setup failed: vendored clone\n%s%s" % (p.stdout, p.stderr))
+
     # The run-state directory. Left UNTRACKED so no existing verdict shifts.
     os.makedirs(os.path.join(repo, SWARM_DIR, "acceptance"))
     os.makedirs(os.path.join(repo, SWARM_DIR, "worktrees"))
@@ -968,13 +1183,183 @@ def git_env(root):
 
 
 # ---------------------------------------------------------------------------
+# THE CROSS-PRODUCT — the axis the battery used to hold fixed
+# ---------------------------------------------------------------------------
+#
+# 482 green cases coexisted with four reproducible bypasses because every case
+# ran from ONE cwd. The old `cwd` section had four shapes and all four resolved
+# to a git repository; the shape that disarms every path rule — an EXISTING
+# DIRECTORY OUTSIDE ANY REPO — had no case, `git -C` appeared in 2 of 482, and
+# the variable-root `rm -rf "$WT/T-010"` form in none. The suite was evidence
+# that the guard behaved as its authors imagined, not that it was sound.
+#
+# So the whole battery now runs across three cwds and three command prefixes.
+# Three of the four axes below need NO hand-written expectations at all, which
+# is the point — an expectation table I author by running the guard and writing
+# down what it did would encode the bug as the spec.
+#
+#   1. CWD MATRIX. Every string case at cwd in {repo, worktree, outside}.
+#      Expected = the case's own declared verdict, unless `CWD_EXPECT` says
+#      otherwise. Every entry there is a case naming a RELATIVE path, which
+#      genuinely means a different file from a different directory; each one
+#      carries the reason.
+#
+#   2. ABSOLUTE-PATH INVARIANCE (derived — no expectations). Rewrite the
+#      fixture-relative paths in a case to absolute ones. An absolute path
+#      names the same file from everywhere, so the verdict MUST equal the
+#      case's declared verdict at ALL THREE cwds. This is the axis that
+#      catches the bug: measured against the unpatched guard, 29 of these 49
+#      were wrong at one cwd or both.
+#
+#   3. `cd D && …` EQUIVALENCE (derived). `cd D && cmd` issued anywhere must
+#      give the same verdict as `cmd` issued from D. bash's cd is not a
+#      suggestion.
+#
+#   4. `git -C D …` EQUIVALENCE (derived). Same, for the git-only subset.
+#
+# Cost control, stated exactly: axes 1 and 2 run over EVERY case. Axes 3 and 4
+# run over every PATH-RELEVANT case (`path_relevant()` below — anything naming
+# a path or reaching a path-keyed rule) against all three targets, and over a
+# representative pair for the rest. That keeps the battery near a minute rather
+# than several.
+
+CWDS = ("repo", "worktree", "outside")
+
+# Cases whose verdict legitimately DEPENDS on where the command runs. Every one
+# names a RELATIVE path: `../worktrees/T-010` is the live worktree from the
+# repo, a directory that does not exist from inside that worktree, and the
+# worktrees parent itself from the worktrees parent. `.swarm-loop` is the run's
+# state directory from the repo and names nothing from outside it.
+#
+# These are expectations, not observations: each says what the path ACTUALLY
+# RESOLVES TO from that directory, which is checkable by hand from the fixture.
+_REL_SWARM = {"worktree": BLOCK, "outside": ALLOW}
+_REL_WORKTREES = {"worktree": ALLOW, "outside": BLOCK}
+_NEEDS_REPO_CFG = {"worktree": BLOCK, "outside": ALLOW}
+
+CWD_EXPECT = {}
+# `.swarm-loop` relative to the cwd. From the repo it is the run's state
+# directory. From a worktree it is `<worktree>/.swarm-loop` — which does not
+# exist, and is blocked anyway because that worktree IS a git root and the rule
+# is "the run-state directory of the repository you are standing in". From
+# outside any repo there is no repository, so the name is protected by nothing
+# and deleting it destroys nothing.
+for _n in ("append-manifest", "dd-state", "find-swarm-delete", "mv-swarm-dir",
+           "redirect-echo-history", "redirect-state", "rm-d-swarm",
+           "rm-r-swarm-no-f", "rm-rf-brace-swarm", "rm-rf-glob-dotfiles",
+           "rm-rf-glob-swarm", "rm-rf-swarm-bash-c", "rm-rf-swarm-dir",
+           "rm-rf-swarm-nl", "rm-rf-swarm-sudo", "rm-swarm-state",
+           "sed-i-goals", "tee-manifest", "truncate-state"):
+    CWD_EXPECT[_n] = dict(_REL_SWARM)
+# `../worktrees…` relative to the cwd. From the repo: the live worktree tree.
+# From INSIDE the worktree `../worktrees` is `<worktrees>/worktrees`, which
+# does not exist and protects nothing. From the worktrees parent itself, `..`
+# is its parent, so `../worktrees` is the worktrees directory — still live,
+# still blocked, and on the unpatched guard it was allowed.
+for _n in ("bt-in-dq-rm-worktree", "rm-rf-brace-worktrees", "rm-rf-empty-var",
+           "rm-rf-glob-after-and", "rm-rf-glob-bash-c", "rm-rf-glob-bracket",
+           "rm-rf-glob-mid", "rm-rf-glob-parent-name", "rm-rf-glob-question",
+           "rm-rf-glob-star-prefix", "rm-rf-glob-worktrees",
+           "rm-rf-worktree-parent", "rm-rf-worktree-root"):
+    CWD_EXPECT[_n] = dict(_REL_WORKTREES)
+# Aliases live in the repository's own config, and a one-operand `git checkout`
+# is classified by ASKING git. Outside a repository git answers neither, and the
+# guard's documented contract for an unanswerable question is ALLOW — which is
+# also what git itself does with the command: it errors out.
+# The four conflict-stage spellings are the same family: the flags are stripped
+# as options, so the file arrives as a LONE non-ref operand and the verdict is
+# whatever git says about it. Outside a repository git says nothing — and the
+# command itself errors there, so there is no working tree to overwrite.
+for _n in ("alias-co-dashdash", "alias-co-dot", "alias-co-file",
+           "alias-in-bash-c", "alias-shell-body", "co-file", "co-nested-file",
+           "runbook-5-blocked-ours", "runbook-5-blocked-theirs",
+           "runbook-5-blocked-2", "runbook-5-blocked-3"):
+    CWD_EXPECT[_n] = dict(_NEEDS_REPO_CFG)
+# Cases that NAME an absolute fixture path already, via a placeholder: those
+# resolve identically everywhere and need no entry at all.
+
+
+def cwd_want(name, base):
+    """The verdict this case must produce at each cwd."""
+    over = CWD_EXPECT.get(name, {})
+    return dict((c, over.get(c, base)) for c in CWDS)
+
+
+_ABS_WORKTREES = re.compile(r"\.\./worktrees")
+_ABS_SWARM = re.compile(r"(?<![\w/.\-]).swarm-loop")
+
+
+def absolutize(cmd, repo, root):
+    """The same command with its fixture-relative paths made ABSOLUTE.
+
+    An absolute path names one file from every directory on the machine, so
+    every verdict about it must be cwd-invariant. That removes "the path means
+    something else there" as an explanation and leaves only one: the guard
+    asked git from the wrong place. Returns None when nothing was rewritten."""
+    out = _ABS_WORKTREES.sub(os.path.join(root, "worktrees"), cmd)
+    out = _ABS_SWARM.sub(os.path.join(repo, SWARM_DIR), out)
+    return out if out != cmd else None
+
+
+_PATH_HINTS = ("rm ", "mv ", "sed", "truncate", "dd ", "tee", "find ", ">",
+               "checkout", "restore", "switch", "clean", "worktree", "co ",
+               "wipe", SWARM_DIR, "/", ".")
+
+
+def path_relevant(cmd):
+    """Does this case reach a rule that is keyed on a PATH? Deliberately
+    over-inclusive: a case wrongly called path-relevant costs runtime, one
+    wrongly called irrelevant costs coverage."""
+    return any(h in cmd for h in _PATH_HINTS)
+
+
+def has_substitution(cmd):
+    """Does this command contain a `$(...)` or backtick body that the guard
+    scans as a command of its own?
+
+    Those bodies are scanned off the RAW STRING — that is deliberate and load
+    bearing, because single quotes decide whether bash executes them and posix
+    tokenization erases quotes. The cost is that a substitution's interior is
+    evaluated at the directory the line STARTED in, while the rest of the line
+    is evaluated after any `cd` on it. So `cd <wt> && echo "`rm -rf
+    ../worktrees/T-010`"` is judged from the pre-cd directory and blocks, where
+    the same string run from the worktree is inert and allowed.
+
+    That is a real bound, not a rounding error, and it is EXEMPTED from the cd
+    axis rather than papered over with an expectation fitted to it. It errs
+    toward BLOCK, which is the survivable direction, and it narrows — it does
+    not remove — the guard's long-standing "anything reached after a `cd`
+    WITHIN the command" limitation. The two cases below pin the behaviour so it
+    stays known rather than merely unmeasured."""
+    return "$(" in cmd or "`" in cmd
+
+
+def with_cd(cmd, target):
+    """`cd <target>` in front of the command, spelled so the result is always
+    valid bash: `&&` for a plain single line, a newline for anything with its
+    own structure (a function definition, a leading comment, more lines)."""
+    if "\n" in cmd or "(" in cmd or cmd.lstrip().startswith("#"):
+        return "cd %s\n%s" % (target, cmd)
+    return "cd %s && %s" % (target, cmd)
+
+
+_GIT_C_SAFE = re.compile(r"^git\s")
+
+
+def with_git_c(cmd, target):
+    """`git -C <target>` for a command that is exactly one git invocation.
+    Returns None when the command is anything else — `-C` redirects git, not
+    the shell, so it is only equivalent for a lone git call."""
+    if not _GIT_C_SAFE.match(cmd):
+        return None
+    if any(ch in cmd for ch in "\n|;`") or "&&" in cmd or "$(" in cmd:
+        return None
+    return "git -C %s %s" % (target, cmd[4:])
+
+
+# ---------------------------------------------------------------------------
 # runner
 # ---------------------------------------------------------------------------
-
-def run_case(repo, env, command):
-    payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
-    return run_payload(repo, env, payload)
-
 
 def run_payload(repo, env, payload):
     """The hook process ALWAYS starts in the primary checkout. For the cwd cases
@@ -984,11 +1369,138 @@ def run_payload(repo, env, payload):
     return p.returncode, p.stderr
 
 
+def bash_payload(command, cwd=None):
+    d = {"tool_name": "Bash", "tool_input": {"command": command}}
+    if cwd is not None:
+        d["cwd"] = cwd
+    return json.dumps(d)
+
+
+# ---------------------------------------------------------------------------
+# ENVIRONMENT cases — the contract that cannot be expressed as a command string
+# ---------------------------------------------------------------------------
+#
+# An empty protected set used to mean two different things: "nothing is
+# protected here" and "I could not find out". A recursive delete is the one
+# operation where guessing the second is unrecoverable, so it now fails CLOSED
+# — and that is the ONLY rule in the hook that does. The rest of this list is
+# the proof that it did not leak into the global fail-OPEN contract, which is
+# the more important half: a guard that blocks all bash when it hits a bug
+# wedges an unattended run.
+#
+# `nogit` runs the hook with a PATH containing no git binary at all.
+
+ENV_CASES = [
+    ("nogit-rm-r-fails-closed",   BLOCK, True,  "rm -rf node_modules"),
+    ("nogit-rm-r-abs-closed",     BLOCK, True,  "rm -rf {ELSEWHERE}/scratch"),
+    ("nogit-rm-r-brace-closed",   BLOCK, True,  "rm -rf {ELSEWHERE}/{a,b}"),
+    # ...and no further than that. A non-recursive rm cannot take a directory.
+    ("nogit-rm-plain-allows",     ALLOW, True,  "rm -f somefile"),
+    # Rules that need no git at all keep working.
+    ("nogit-stash-still-blocks",  BLOCK, True,  "git stash"),
+    ("nogit-reset-still-blocks",  BLOCK, True,  "git reset --hard"),
+    # ...and every FAIL-OPEN path stays open.
+    ("nogit-checkout-fails-open", ALLOW, True,  "git checkout a.txt"),
+    ("nogit-status-allows",       ALLOW, True,  "git status"),
+    ("nogit-ordinary-allows",     ALLOW, True,  "ls -la && echo hi"),
+    ("nogit-unbalanced-quote",    ALLOW, True,  "echo 'unterminated"),
+    ("nogit-heredoc-packet",      ALLOW, True,
+     "cat > p.md <<'EOF'\n- never run git stash\nEOF"),
+    # The control: with git present the same delete is allowed, so the block
+    # above is the missing ANSWER and not the command.
+    ("git-present-rm-r-allows",   ALLOW, False, "rm -rf node_modules"),
+]
+
+MALFORMED_PAYLOADS = [
+    ("payload-not-json",      ALLOW, "{not json"),
+    ("payload-json-list",     ALLOW, "[1, 2, 3]"),
+    ("payload-json-null",     ALLOW, "null"),
+    ("payload-json-string",   ALLOW, '"just a string"'),
+    ("payload-json-number",   ALLOW, "17"),
+    ("payload-empty",         ALLOW, ""),
+    ("payload-no-tool-input", ALLOW, '{"tool_name": "Bash"}'),
+]
+
+
+def build_matrix(repo, root):
+    """Every case, at every cwd, under every prefix. Returns (name, payload,
+    want, kind) tuples. Three of the four axes derive their expectation instead
+    of declaring one."""
+    dirs = {"repo": repo,
+            "worktree": os.path.join(root, "worktrees", "T-010"),
+            "outside": os.path.join(root, "worktrees")}
+    string_cases = ([(n, fill_paths(c, repo, root), BLOCK) for n, c in MUST_BLOCK]
+                    + [(n, fill_paths(c, repo, root), ALLOW) for n, c in MUST_ALLOW])
+    jobs = []
+
+    # 1. cwd matrix — declared expectations, with CWD_EXPECT overrides.
+    for name, cmd, want in string_cases:
+        wants = cwd_want(name, want)
+        for c in CWDS:
+            jobs.append(("%s@%s" % (name, c), bash_payload(cmd, dirs[c]),
+                         wants[c], "cwd"))
+
+    # 2. absolute-path invariance — DERIVED: an absolute path names the same
+    #    file everywhere, so the declared verdict must hold at every cwd.
+    for name, cmd, want in string_cases:
+        acmd = absolutize(cmd, repo, root)
+        if acmd is None:
+            continue
+        for c in CWDS:
+            jobs.append(("%s@abs:%s" % (name, c), bash_payload(acmd, dirs[c]),
+                         want, "abs"))
+
+    # 3/4. prefix equivalence — DERIVED: `cd D && cmd` and `git -C D cmd` must
+    #      equal `cmd` run from D. Path-relevant cases get all three targets;
+    #      the rest get one representative target, which is the runtime trade
+    #      and it is stated here rather than hidden.
+    #      THE RUNTIME TRADE, STATED: a case whose verdict actually VARIES with
+    #      the directory (it has a CWD_EXPECT entry) gets all three targets,
+    #      because that is where a prefix bug can hide. Everything else gets one
+    #      representative target — `outside`, the directory that used to disarm
+    #      every path rule. Running all three for all of them costs ~35s more
+    #      and found nothing the one target did not: the redirect-ordering
+    #      defect this axis exists to catch reddens at `outside` alone.
+    for name, cmd, want in string_cases:
+        wants = cwd_want(name, want)
+        targets = CWDS if name in CWD_EXPECT else ("outside",)
+        for t in targets:
+            start = dirs["repo"] if t != "repo" else dirs["outside"]
+            if not has_substitution(cmd):
+                jobs.append(("%s@cd:%s" % (name, t),
+                             bash_payload(with_cd(cmd, dirs[t]), start),
+                             wants[t], "cd"))
+            gc = with_git_c(cmd, dirs[t])
+            if gc is not None:
+                jobs.append(("%s@gitC:%s" % (name, t), bash_payload(gc, start),
+                             wants[t], "gitC"))
+
+    # 5. payload-shaped cases: cwd and tool_name, which no command string says.
+    for name, want, d in PAYLOAD_CASES:
+        jobs.append((name, json.dumps(fill_paths(d, repo, root)), want, "payload"))
+
+    # 6. malformed payloads: the fail-open contract at the outermost layer.
+    for name, want, raw in MALFORMED_PAYLOADS:
+        jobs.append((name, raw, want, "payload"))
+
+    return jobs
+
+
 def fill_paths(obj, repo, root):
-    """Substitute {REPO}/{WT} in a payload case, at any depth."""
+    """Substitute the fixture placeholders in a case, at any depth.
+
+    {REPO}      the primary checkout
+    {WT}        a live linked worktree of it
+    {OUTSIDE}   the worktrees PARENT — an existing directory outside any
+                repository that CONTAINS live worktrees. The live layout.
+    {ELSEWHERE} an existing directory outside any repository that contains
+                nothing. The control for {OUTSIDE}.
+    """
     if isinstance(obj, str):
-        return obj.replace("{REPO}", repo).replace(
-            "{WT}", os.path.join(root, "worktrees", "T-010"))
+        return (obj.replace("{REPO}", repo)
+                   .replace("{WT}", os.path.join(root, "worktrees", "T-010"))
+                   .replace("{OUTSIDE}", os.path.join(root, "worktrees"))
+                   .replace("{ELSEWHERE}", os.path.join(root, "elsewhere")))
     if isinstance(obj, dict):
         return dict((k, fill_paths(v, repo, root)) for k, v in obj.items())
     return obj
@@ -1003,59 +1515,70 @@ def main():
 
     root = tempfile.mkdtemp(prefix="swarmloop-guard-tests-")
     os.makedirs(os.path.join(root, "home"))
+    nogit_dir = os.path.join(root, "nogit-bin")
+    os.makedirs(nogit_dir)
     try:
         repo = build_repo(root)
         env = git_env(root)
+        nogit_env = dict(env)
+        nogit_env["PATH"] = nogit_dir           # a PATH with no git binary at all
 
-        cases = ([(n, c, BLOCK) for n, c in MUST_BLOCK]
-                 + [(n, c, ALLOW) for n, c in MUST_ALLOW]
-                 # payload cases carry a whole JSON object instead of a command
-                 # string; `descr` keeps the FAIL block readable either way.
-                 + [(n, json.dumps(fill_paths(d, repo, root)), want)
-                    for n, want, d in PAYLOAD_CASES])
-        n_string_cases = len(MUST_BLOCK) + len(MUST_ALLOW)
-
-        dupes = sorted({n for n in [c[0] for c in cases]
-                        if [c[0] for c in cases].count(n) > 1})
+        # Declared names must be unique BEFORE the matrix multiplies them; a
+        # duplicate would otherwise silently become a duplicate in every cell.
+        declared = ([n for n, _ in MUST_BLOCK] + [n for n, _ in MUST_ALLOW]
+                    + [n for n, _, _ in PAYLOAD_CASES]
+                    + [n for n, _, _, _ in ENV_CASES]
+                    + [n for n, _, _ in MALFORMED_PAYLOADS])
+        dupes = sorted({n for n in declared if declared.count(n) > 1})
         if dupes:
             print("TEST_GIT_GUARD: duplicate case names: %s" % ", ".join(dupes))
             return 1
 
-        def run_one(idx_case):
-            idx, c = idx_case
-            if idx < n_string_cases:
-                return run_case(repo, env, c[1])
-            return run_payload(repo, env, c[1])
+        jobs = build_matrix(repo, root)
+        jobs += [(n, bash_payload(fill_paths(c, repo, root), repo), want,
+                  "nogit" if nogit else "env")
+                 for n, want, nogit, c in ENV_CASES]
+        nogit_names = set(n for n, _w, ng, _c in ENV_CASES if ng)
 
-        workers = min(8, (os.cpu_count() or 2) * 2)
+        def run_one(job):
+            name, payload, _want, _kind = job
+            e = nogit_env if name in nogit_names else env
+            return run_payload(repo, e, payload)
+
+        workers = min(16, max(4, (os.cpu_count() or 2) * 2))
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            results = list(pool.map(run_one, enumerate(cases)))
+            results = list(pool.map(run_one, jobs))
 
         passed, failures = 0, []
-        for (name, command, want), (got, stderr) in zip(cases, results):
+        by_kind = {}
+        for (name, payload, want, kind), (got, stderr) in zip(jobs, results):
+            by_kind[kind] = by_kind.get(kind, 0) + 1
             if got == want:
                 passed += 1
                 if verbose:
-                    print("  ok    %-24s %s  %r"
-                          % (name, "BLOCK" if want == BLOCK else "allow", command))
+                    print("  ok    %-40s %s  %s"
+                          % (name, "BLOCK" if want == BLOCK else "allow", payload))
             else:
-                failures.append((name, command, want, got, stderr))
+                failures.append((name, payload, want, got, stderr, kind))
 
         label = {BLOCK: "BLOCK (exit 2)", ALLOW: "ALLOW (exit 0)"}
-        for name, command, want, got, stderr in failures:
-            kind = "MISSED BLOCK" if want == BLOCK else "FALSE BLOCK"
+        for name, payload, want, got, stderr, kind in failures:
+            kindlabel = "MISSED BLOCK" if want == BLOCK else "FALSE BLOCK"
             print("")
-            print("FAIL [%s]  %s" % (kind, name))
+            print("FAIL [%s]  %s   (axis: %s)" % (kindlabel, name, kind))
             print("  expected : %s" % label[want])
             print("  actual   : exit %d" % got)
-            print("  command  : %r" % command)
+            print("  payload  : %s" % payload)
             first = (stderr or "").strip().splitlines()
             if first:
                 print("  guard    : %s" % first[0])
 
         print("")
-        print("  block cases: %d   allow cases: %d   payload cases: %d"
-              % (len(MUST_BLOCK), len(MUST_ALLOW), len(PAYLOAD_CASES)))
+        print("  declared: %d block  %d allow  %d payload  %d env  %d malformed"
+              % (len(MUST_BLOCK), len(MUST_ALLOW), len(PAYLOAD_CASES),
+                 len(ENV_CASES), len(MALFORMED_PAYLOADS)))
+        print("  cells run: " + "  ".join(
+            "%s=%d" % (k, by_kind[k]) for k in sorted(by_kind)))
         print("TEST_GIT_GUARD: PASS=%d FAIL=%d" % (passed, len(failures)))
         return 1 if failures else 0
     finally:
