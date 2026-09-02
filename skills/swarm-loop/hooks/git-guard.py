@@ -529,9 +529,12 @@ def logical_lines(command: str) -> list[str]:
 def token_stream(command: str) -> list[str]:
     """Every token of a command string, operators included.
 
-    Kept separate from `split_segments()` because the redirection rules need to
-    SEE the operators segmentation throws away: `> .swarm-loop/state.json` leaves
-    only the bare path behind once `>` has been consumed as a boundary."""
+    Operators are KEPT, because the redirection rules need to see what a plain
+    segmentation throws away: `> .swarm-loop/state.json` leaves only the bare
+    path behind once `>` has been consumed as a boundary. `_scan_command` walks
+    this stream once, cutting simple commands at the operators and checking
+    redirect targets as it passes them, so a `cd` earlier on the line is
+    already in effect when a later target is judged."""
     toks: list[str] | None = None
     if "\n" in command:
         try:
@@ -551,22 +554,6 @@ def token_stream(command: str) -> list[str]:
     if toks is None:
         toks = tokenize(command)
     return toks
-
-
-def split_segments(toks: list[str]) -> list[list[str]]:
-    """Token stream -> simple-command argv lists, split on shell operators."""
-    segs: list[list[str]] = []
-    cur: list[str] = []
-    for tok in toks:
-        if is_operator(tok):
-            if cur:
-                segs.append(cur)
-                cur = []
-        else:
-            cur.append(tok)
-    if cur:
-        segs.append(cur)
-    return segs
 
 
 def program_index(seg: list[str]) -> int:
@@ -1450,14 +1437,6 @@ def _resolve(ap: str | None, scan_below: bool = False) -> tuple:
             if x not in wts:
                 wts.append(x)
     return roots, wts, determined
-
-
-def repo_roots(ap: str | None = None) -> list[str]:
-    return _resolve(ap)[0]
-
-
-def worktree_roots(ap: str | None = None) -> list[str]:
-    return _resolve(ap, scan_below=True)[1]
 
 
 def _under(path: str, root: str) -> bool:

@@ -1218,10 +1218,11 @@ def git_env(root):
 #   4. `git -C D …` EQUIVALENCE (derived). Same, for the git-only subset.
 #
 # Cost control, stated exactly: axes 1 and 2 run over EVERY case. Axes 3 and 4
-# run over every PATH-RELEVANT case (`path_relevant()` below — anything naming
-# a path or reaching a path-keyed rule) against all three targets, and over a
-# representative pair for the rest. That keeps the battery near a minute rather
-# than several.
+# run every case whose verdict actually VARIES with the directory (it has a
+# CWD_EXPECT entry) against all three targets, and every other case against one
+# representative target — `outside`, the directory that used to disarm every
+# path rule. Running all three for all of them costs ~35s more and found nothing
+# the single target did not.
 
 CWDS = ("repo", "worktree", "outside")
 
@@ -1299,18 +1300,6 @@ def absolutize(cmd, repo, root):
     out = _ABS_WORKTREES.sub(os.path.join(root, "worktrees"), cmd)
     out = _ABS_SWARM.sub(os.path.join(repo, SWARM_DIR), out)
     return out if out != cmd else None
-
-
-_PATH_HINTS = ("rm ", "mv ", "sed", "truncate", "dd ", "tee", "find ", ">",
-               "checkout", "restore", "switch", "clean", "worktree", "co ",
-               "wipe", SWARM_DIR, "/", ".")
-
-
-def path_relevant(cmd):
-    """Does this case reach a rule that is keyed on a PATH? Deliberately
-    over-inclusive: a case wrongly called path-relevant costs runtime, one
-    wrongly called irrelevant costs coverage."""
-    return any(h in cmd for h in _PATH_HINTS)
 
 
 def has_substitution(cmd):
