@@ -1971,6 +1971,371 @@ sl verify
 ck_exit "D4 verify is green after the advisory amend" 0 "$RC"
 
 # ===========================================================================
+# P1 · check-wave PASSED the exact wave it exists to catch
+#
+# A member that declares no ownership (`scope` absent, `[]`, or `null`) was
+# treated by the overlap loops as owning NOTHING, so a MIXED wave — one ticket
+# declaring a scope, one declaring none — passed clean and was dispatched in
+# parallel. The refusal only ever fired when EVERY member declared nothing.
+# The command printed the correct rule ("treat it as owning everything until it
+# says otherwise") and contradicted it on the very next line.
+# ===========================================================================
+section "P1 an undeclared wave member owns EVERYTHING  [repo: rundecl]"
+mk_repo rundecl
+cat > tickets.json <<'EOF'
+{"version": 1, "project": "e2e", "tickets": [
+ {"id": "T-A",  "title": "declares a scope",       "verify": "exit 1",
+  "scope": ["src/**"],     "depends_on": []},
+ {"id": "T-N",  "title": "no scope key at all",    "verify": "exit 1",
+                           "depends_on": []},
+ {"id": "T-E",  "title": "scope is an empty list", "verify": "exit 1",
+  "scope": [],             "depends_on": []},
+ {"id": "T-Z",  "title": "scope is null",          "verify": "exit 1",
+  "scope": null,           "depends_on": []},
+ {"id": "T-B",  "title": "one file inside T-A",    "verify": "exit 1",
+  "scope": ["src/a/b.py"], "depends_on": []},
+ {"id": "T-D1", "title": "disjoint a",             "verify": "exit 1",
+  "scope": ["src/a/**"],   "depends_on": []},
+ {"id": "T-D2", "title": "disjoint b",             "verify": "exit 1",
+  "scope": ["src/b/**"],   "depends_on": []},
+ {"id": "T-O",  "title": "a per-file owns map",    "verify": "exit 1",
+  "owns": ["docs/x.md"],   "depends_on": []}
+]}
+EOF
+
+# --- the three shapes of "declares nothing", each mixed with a real scope
+sl check-wave T-A T-N
+ck_exit "P1 a MIXED wave (one declared, one not) is VETOED — it used to exit 0" 1 "$RC"
+ck_has "P1 the offending pair is named" "T-A <-> T-N"
+ck_has "P1 ...via the declared member's own pattern" "via  src/**"
+ck_has "P1 the rule the command prints is the rule it now enforces" \
+       "treat it as owning everything until it says otherwise"
+ck_has "P1 the undeclared member is still SHOWN as undeclared, not as owning **" \
+       "owns(scope): (NOTHING DECLARED)"
+
+sl check-wave T-A T-E
+ck_exit "P1 'scope': [] means DECLARES nothing, not OWNS nothing" 1 "$RC"
+ck_has "P1 ...and is vetoed against the declared member" "T-A <-> T-E"
+
+sl check-wave T-A T-Z
+ck_exit "P1 'scope': null means DECLARES nothing, not OWNS nothing" 1 "$RC"
+ck_has "P1 ...and is vetoed against the declared member" "T-A <-> T-Z"
+
+# --- the undeclared member is not special-cased by position in the wave
+sl check-wave T-D1 T-N T-D2
+ck_exit "P1 three members, only the MIDDLE one undeclared, is VETOED" 1 "$RC"
+ck_has "P1 ...against the member listed before it" "T-D1 <-> T-N"
+ck_has "P1 ...and against the member listed after it" "T-N <-> T-D2"
+
+# --- the controls named in the finding: none of these behaviours may move
+sl check-wave T-N T-Z
+ck_exit "P1 control: a wave where EVERY member declares nothing is still REFUSED" 1 "$RC"
+ck_has "P1 control: ...with the refusal it always had" \
+       "REFUSED — no ticket in this wave declares any ownership"
+ck_hasnt "P1 control: ...and it is a refusal, not a veto" "VETO:"
+
+sl check-wave T-A T-B
+ck_exit "P1 control: a real overlap is still VETOED" 1 "$RC"
+ck_has "P1 control: ...naming the pair" "T-A <-> T-B"
+
+sl check-wave T-D1 T-D2
+ck_exit "P1 control: a genuinely disjoint wave still passes" 0 "$RC"
+ck_has "P1 control: ...with the OK it always had" "check-wave: OK"
+
+# A ticket that declares a per-file `owns` map HAS declared ownership, even with
+# no `scope` key — the substitution must key off the resolved list, not `scope`.
+sl check-wave T-O T-D1
+ck_exit "P1 a per-file 'owns' map is a declaration and is NOT treated as undeclared" 0 "$RC"
+ck_has "P1 ...and it is read from 'owns', not from 'scope'" "owns(owns): docs/x.md"
+
+# ===========================================================================
+# P2 · red-check scored a gate that ran ZERO tests as "a real gate"
+#
+# _collected_count read what pytest COLLECTED, and pytest prints the collected
+# and deselected counts on the SAME line: `pytest -m ticket_T010` written
+# before that marker exists prints "collected 120 items / 120 deselected /
+# 0 selected", exits non-zero, and was scored "red (120 test(s) collected) — a
+# real gate". Its fallback regex was unanchored and matched `error` inside
+# `errors`, so tsc / ruff / eslint / make handed it a fabricated test count off
+# a run that collected nothing at all.
+#
+# The second half is the exit code, which IS the contract: `if vacuous:` alone
+# meant WEAK, NO GATE and SKIPPED all exited 0 — and the incident named in
+# red-check's own docstring (T-011/T-012 "reported `no tests ran`") is WEAK.
+# ===========================================================================
+section "P2 red-check counts what RAN, not what pytest listed  [repo: rredcheck]"
+mk_repo rredcheck
+
+# --- the parser itself, against the shapes real tools actually print
+cc_() {  # cc_ <name> <expected> <tool output>
+  local got
+  got=$(python3 - "$3" <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["SL_DIR"])
+import swarmloop
+print(swarmloop._collected_count(sys.argv[1]))
+PY
+)
+  ck "$1" "$2" "$got"
+}
+cc_ "P2 pytest: a normal run counts its collected tests" "12" \
+    "collected 12 items
+
+12 passed"
+cc_ "P2 pytest: 120 collected / 120 DESELECTED / 0 selected is ZERO tests (was 120)" "0" \
+    "collected 120 items / 120 deselected / 0 selected"
+cc_ "P2 pytest: a partial deselection counts only what was selected (was 120)" "2" \
+    "collected 120 items / 118 deselected / 2 selected
+
+2 failed"
+cc_ "P2 pytest: with no 'selected' line, collected minus deselected" "2" \
+    "collected 120 items / 118 deselected
+
+2 failed"
+cc_ "P2 pytest: zero collected is still zero" "0" \
+    "collected 0 items
+
+no tests ran"
+cc_ "P2 tsc: 'Found 3 errors in 2 files.' is not 3 tests (was 3)" "None" \
+    "Found 3 errors in 2 files."
+cc_ "P2 ruff: 'Found 12 errors.' is not 12 tests (was 12)" "None" \
+    "Found 12 errors."
+cc_ "P2 eslint: '7 problems (7 errors, 0 warnings)' is not 7 tests (was 7)" "None" \
+    "7 problems (7 errors, 0 warnings)"
+cc_ "P2 make: '*** [test] Error 2' is not 2 tests" "None" \
+    "make: *** [test] Error 2"
+cc_ "P2 an import failure still reports no count at all" "None" \
+    "ModuleNotFoundError: No module named 'x'"
+cc_ "P2 pytest's own summary line is still read when nothing was collected-logged" "1" \
+    "===== 1 failed in 0.20s ====="
+
+# --- and end to end, through the command whose verdict it drives
+cat > tickets.json <<'EOF'
+{"version": 1, "project": "e2e", "tickets": [
+ {"id": "T-100", "title": "marker gate written before the marker exists",
+  "verify": "echo 'collected 120 items / 120 deselected / 0 selected'; exit 1",
+  "scope": ["a/**"], "depends_on": []},
+ {"id": "T-101", "title": "a type checker, not a test run",
+  "verify": "echo 'Found 3 errors in 2 files.'; exit 2",
+  "scope": ["b/**"], "depends_on": []},
+ {"id": "T-102", "title": "no tests ran (the docstring's own incident)",
+  "verify": "echo 'collected 0 items'; echo 'no tests ran'; exit 5",
+  "scope": ["c/**"], "depends_on": []},
+ {"id": "T-103", "title": "declares no verify command at all",
+  "scope": ["d/**"], "depends_on": []},
+ {"id": "T-104", "title": "a genuinely red gate",
+  "verify": "echo 'collected 3 items'; echo '3 failed'; exit 1",
+  "scope": ["e/**"], "depends_on": []}
+]}
+EOF
+gq add -A; gq commit -qm "red-check graph"
+
+sl red-check --ticket T-100
+ck_exit "P2 a gate that DESELECTED every test is not a real gate" 1 "$RC"
+ck_has "P2 ...it is WEAK" "WEAK"
+ck_hasnt "P2 ...NOT 'red (120 test(s) collected) — a real gate'" "a real gate"
+ck_hasnt "P2 ...and the deselected count is never reported as a test count" "120 test(s)"
+
+sl red-check --ticket T-101
+ck_exit "P2 a compiler's error count is not a test count" 1 "$RC"
+ck_hasnt "P2 ...tsc's 'Found 3 errors' does not fabricate a real gate" "a real gate"
+ck_has "P2 ...it is WEAK, which is the honest answer" "WEAK"
+
+sl red-check --ticket T-102
+ck_exit "P2 'no tests ran' now FAILS the gate it motivated (used to exit 0)" 1 "$RC"
+ck_has "P2 ...classified WEAK" "WEAK"
+
+sl red-check --ticket T-103
+ck_exit "P2 a ticket with NO verify command FAILS the gate (used to exit 0)" 1 "$RC"
+ck_has "P2 ...classified NO GATE" "NO GATE"
+
+sl red-check --ticket T-104
+ck_exit "P2 control: a genuinely red gate still PASSES red-check" 0 "$RC"
+ck_has "P2 control: ...and is still called a real gate" "a real gate"
+ck_has "P2 control: ...counting what was SELECTED" "3 test(s) selected"
+
+sl red-check --ticket T-100,T-101,T-102,T-103,T-104
+ck_exit "P2 a mixed set fails on the weak members, not only on a vacuous one" 1 "$RC"
+ck_has "P2 the summary counts every bucket, SKIPPED included" "SKIPPED"
+
+# SKIPPED — a worktree that could not be provisioned — used to land in NO bucket
+# at all: uncounted in the summary and unable to affect the exit code, so a
+# ticket that was never checked read exactly like one that had passed.
+python3 - <<'PY'
+import json
+d = json.load(open("tickets.json"))
+d["tickets"].append({"id": "T-9" + "x" * 400, "title": "worktree cannot be provisioned",
+                     "verify": "exit 1", "scope": ["f/**"], "depends_on": []})
+json.dump(d, open("tickets.json", "w"), indent=2)
+PY
+LONGID="T-9$(python3 -c 'print("x" * 400)')"
+sl red-check --ticket "$LONGID"
+ck_exit "P2 a ticket whose worktree could not be provisioned FAILS the gate" 1 "$RC"
+ck_has "P2 ...and says the gate was NEVER CHECKED" "NEVER CHECKED"
+ck_has "P2 ...and it is counted in the summary (it landed in no bucket at all)" "1 SKIPPED"
+
+# ===========================================================================
+# P4 · ONE appended log record forged the whole frozen harness
+#
+# Replay RESETS the protected map on any record marked `action: "initial"`
+# (_replay_freeze_log, _replay_goals_canon) and nothing validated that a run
+# has only one. The git anchor could not catch it: _log_git_check only required
+# the committed log to be a PREFIX of the disk log, and appending preserves a
+# prefix. So: gut a frozen acceptance test, move a goal 100 -> 0, append ONE
+# `initial` record with the same frozen_at and the recomputed digests, point
+# manifest.json at it — and `verify` said "OK — frozen harness intact", `status`
+# said "goals_frozen": true, `resume` said "harness intact".
+#
+# Two checks close it: one `initial` per frozen_at, and the anchor `initial`
+# must be a MEMBER of the git-committed copy, not merely compatible with it.
+# ===========================================================================
+section "P4 an appended 'initial' record cannot forge the harness  [repo: rforge]"
+
+# The forgery itself, in the shape it was reproduced: append one record, then
+# reconcile manifest.json to it so every cheap byte comparison agrees.
+forge_initial() {  # forge_initial [<frozen_at override; default: the same one>]
+  python3 - "${1:-}" <<'PY'
+import hashlib, json, os, sys
+sys.path.insert(0, os.environ["SL_DIR"])
+import swarmloop
+m = json.load(open(".swarm-loop/manifest.json"))
+fa = sys.argv[1] or m["frozen_at"]
+files = dict((r, hashlib.sha256(open(r, "rb").read()).hexdigest()) for r in m["files"])
+canon = swarmloop._goals_canon_file(".swarm-loop/goals.json")
+rec = {"action": "initial", "amendment": 0, "reason": None, "prev_frozen_at": None,
+       "frozen_at": fa, "seq": 99, "goals_canon": canon, "modified": [], "removed": [],
+       "added": [{"path": r, "new": h} for r, h in sorted(files.items())]}
+open(".swarm-loop/freeze-log.jsonl", "a").write(json.dumps(rec, sort_keys=True) + "\n")
+m["files"] = files
+m["goals_canon"] = canon
+m["log_seq"] = 99
+m["frozen_at"] = fa
+g = json.load(open(".swarm-loop/goals.json"))
+m["targets"] = dict((x["id"], x.get("target")) for x in g.get("metrics", []))
+json.dump(m, open(".swarm-loop/manifest.json", "w"), indent=2)
+PY
+}
+gut_the_harness() {   # the tamper the forgery exists to launder
+  cat > .swarm-loop/acceptance/test_feature.py <<'EOF'
+def test_feature():
+    pass
+EOF
+  python3 -c '
+import json
+p = ".swarm-loop/goals.json"
+g = json.load(open(p))
+g["metrics"][0]["target"] = 0
+json.dump(g, open(p, "w"), indent=2)'
+}
+
+mk_repo rforge
+sl freeze
+ck_exit "P4 control: freeze" 0 "$RC"
+gq add -A; gq commit -qm harness
+sl verify
+ck_exit "P4 control: a normal single-'initial' run verifies GREEN" 0 "$RC"
+ck_has "P4 control: ...reconciled against the append-only log" "manifest reconciled against"
+
+gut_the_harness
+sl verify
+ck_exit "P4 control: the raw tamper is caught before any laundering" 1 "$RC"
+ck_has "P4 control: ...as a modification of the frozen bytes" "[MODIFIED]"
+
+forge_initial
+sl verify
+ck_exit "P4 ONE appended 'initial' record does NOT launder it (verify used to say OK)" 1 "$RC"
+ck_has "P4 the second anchor under one timestamp is named" "share the freeze timestamp"
+ck_has "P4 ...and the anchor is not in the git-COMMITTED log" "is NOT in the copy committed at"
+ck_hasnt "P4 verify no longer calls the forged harness intact" "OK — frozen harness intact"
+sl measure --cycle 0
+ck_exit "P4 measure refuses to score against the forged harness" 1 "$RC"
+sl resume
+ck_hasnt "P4 resume no longer reports 'harness intact'" "harness intact"
+
+# --- the same forgery with a NEW timestamp: the duplicate check cannot see it,
+#     so this is the half the git anchor has to carry.
+section "P4 an appended anchor under a NEW timestamp  [repo: rforge2]"
+mk_repo rforge2
+sl freeze
+gq add -A; gq commit -qm harness
+gut_the_harness
+forge_initial "2099-01-01T00:00:00"
+sl verify
+ck_exit "P4 an appended 'initial' with a DIFFERENT frozen_at is caught too" 1 "$RC"
+ck_has "P4 ...by MEMBERSHIP in the committed log, not by continuation of it" \
+       "APPENDED afterwards"
+ck_hasnt "P4 ...and it is not laundered into an OK" "OK — frozen harness intact"
+
+# --- appended on top of a LEGITIMATE amendment: the amend must stay green and
+#     the forgery on top of it must not.
+section "P4 an anchor appended after a real --amend  [repo: rforge3]"
+mk_repo rforge3
+sl freeze
+gq add -A; gq commit -qm harness
+echo "def test_widened(): assert True" >> .swarm-loop/acceptance/test_feature.py
+sl freeze --amend "user approved widening the acceptance suite"
+ck_exit "P4 control: a legitimate --amend still succeeds" 0 "$RC"
+gq add -A; gq commit -qm "amended harness"
+sl verify
+ck_exit "P4 control: ...and verify is GREEN after it" 0 "$RC"
+ck_hasnt "P4 control: an amendment is not a forgery" "[FORGED]"
+gut_the_harness
+forge_initial "2099-02-02T00:00:00"
+sl verify
+ck_exit "P4 an 'initial' appended AFTER a legitimate --amend record is caught" 1 "$RC"
+ck_has "P4 ...named as an appended anchor" "APPENDED afterwards"
+
+# --- backward compatibility. Neither check may turn a legitimate run red.
+section "P4 BC: uncommitted and pre-change freeze logs  [repo: rforge4]"
+mk_repo rforge4
+sl freeze
+# mk_repo does not commit .swarm-loop/: this is the NORMAL state of every run
+# between `freeze` and the baseline commit, and it must stay a note.
+sl verify
+ck_exit "P4 BC: an uncommitted freeze log still verifies green" 0 "$RC"
+ck_has "P4 BC: ...reported as a note" "never been committed"
+ck_hasnt "P4 BC: ...never as an accusation" "[FORGED]"
+# The duplicate-anchor refusal is independent of git, so it still fires here.
+gut_the_harness
+forge_initial
+sl verify
+ck_exit "P4 the duplicate-anchor refusal needs no commit to anchor against" 1 "$RC"
+ck_has "P4 ...naming the shared timestamp" "share the freeze timestamp"
+
+mk_repo rforge5
+sl freeze
+gq add -A; gq commit -qm harness
+# A run frozen before `action` / `seq` / `goals_canon` existed has no anchor to
+# demand and no sequence to match. It must still verify green — "I cannot check
+# this axis" is a note, never a forgery claim.
+python3 - <<'PY'
+import json
+p = ".swarm-loop/freeze-log.jsonl"
+recs = [json.loads(l) for l in open(p) if l.strip()]
+for r in recs:
+    r.pop("action", None)
+    r.pop("seq", None)
+    r.pop("goals_canon", None)
+open(p, "w").write("".join(json.dumps(r, sort_keys=True) + "\n" for r in recs))
+m = json.load(open(".swarm-loop/manifest.json"))
+m.pop("log_seq", None)
+m.pop("goals_canon", None)
+json.dump(m, open(".swarm-loop/manifest.json", "w"), indent=2)
+PY
+gq add -A; gq commit -qm "pre-change freeze-log shape"
+ck "P4 BC: the fixture really is in the old shape (no action key)" "False" \
+   "$(python3 -c '
+import json
+r = [json.loads(l) for l in open(".swarm-loop/freeze-log.jsonl") if l.strip()]
+print(any("action" in x for x in r))')"
+sl verify
+ck_exit "P4 BC: a log with no 'action'/'seq'/'goals_canon' still verifies green" 0 "$RC"
+ck_hasnt "P4 BC: ...and is never accused of forging an anchor" "[FORGED]"
+sl resume
+ck_exit "P4 BC: resume runs on the pre-change log shape" 0 "$RC"
+ck_has "P4 BC: ...and still reads it as intact" "harness intact"
+
+# ===========================================================================
 cd / 2>/dev/null || true
 ELAPSED=$(( $(date +%s) - START_TS ))
 echo

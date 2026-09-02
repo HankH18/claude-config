@@ -930,18 +930,47 @@ def _replay_goals_canon(recs, upto_index=None):
     return canon
 
 
-def _log_git_check(root, d, recs):
-    """Was freeze-log.jsonl REWRITTEN since it was last committed?
+def _anchor_initial(recs, upto_index=None):
+    """The `initial` record that starts the run the manifest at `upto_index`
+    belongs to, or None if the log has none (a log written before `action`
+    existed — BC, and the caller must skip its checks rather than accuse).
+
+    This is the record every replay resets on, so it is the record that DEFINES
+    what "frozen" means for that manifest. Whoever writes it writes the whole
+    protected map."""
+    end = len(recs) - 1 if upto_index is None else upto_index
+    for i in range(min(end, len(recs) - 1), -1, -1):
+        if recs[i].get("action") == "initial":
+            return recs[i]
+    return None
+
+
+def _log_git_check(root, d, recs, anchor=None):
+    """Was freeze-log.jsonl REWRITTEN since it was last committed — and is the
+    record the whole freeze hangs from actually IN that committed copy?
 
     The log is documented as append-only in five places and nothing enforced it.
     Git does: the newest committed copy must be a PREFIX of the copy on disk.
     Compared as records rather than bytes so a trailing-newline difference is not
     an accusation.
 
+    A prefix rule alone is not enough, and that gap was the whole forgery.
+    APPENDING preserves the prefix, and replay RESETS on `action: "initial"` —
+    so one appended `initial` record, plus a manifest edited to agree with it,
+    redefines every frozen digest and every target while the committed prefix
+    stays untouched. Reproduced end to end: a gutted acceptance test and a goal
+    moved 100 -> 0 both verified as "OK — frozen harness intact". So the anchor
+    `initial` record must be a MEMBER of the committed copy, not merely
+    compatible with it. Continuation says nothing about the record that starts
+    the run; membership does.
+
     Returns (violation | None, note | None). A committed copy that does not even
     START this run — the previous run's log, left behind because `init --force`
     rotates the file aside — is a NOTE, not a violation: there is nothing
-    append-only about two different runs."""
+    append-only about two different runs. A log that has never been committed at
+    all stays a NOTE too (that is the normal state between `freeze` and the
+    baseline commit), so the membership assertion only ever runs where git has
+    something to say."""
     rel = os.path.relpath(os.path.join(d, FREEZE_LOG_FILE), root)
     p = _git(root, "rev-list", "-n", "1", "HEAD", "--", rel)
     if p.returncode != 0 or not p.stdout.split():
@@ -976,6 +1005,16 @@ def _log_git_check(root, d, recs):
                 "committed have been altered or removed; that is the permanent record of "
                 "every moved goalpost. Recover it with "
                 f"`git show {commit[:10]}:{rel}`"), None
+    if anchor is not None:
+        want = json.dumps(anchor, sort_keys=True)
+        if not any(json.dumps(c, sort_keys=True) == want for c in committed):
+            return (f"[FORGED] {rel} — the `initial` record this freeze hangs from is NOT "
+                    f"in the copy committed at {commit[:10]}; it was APPENDED afterwards. "
+                    "Replay resets on `initial`, so that one record redefines every frozen "
+                    "digest and every target — appending it preserves the committed prefix "
+                    "while replacing the entire harness it is supposed to attest to. "
+                    f"Recover the real log with `git show {commit[:10]}:{rel}` and restore "
+                    "the frozen bytes with 'restore-harness'."), None
     return None, None
 
 
@@ -1026,6 +1065,30 @@ def _authenticate_manifest(root, d, manifest, disk_ok):
             "permanent record of every goalpost this run moved; its absence is a violation, "
             "not a missing nicety. Recover it from git (`git show <commit>:" + logrel + "`).")
         return violations, notes
+    # One run, one `initial`. Replay resets on `action: "initial"` and NOTHING
+    # counted them, so a second one appended under the SAME frozen_at silently
+    # became the definition of the freeze — the map, the goals digest, all of
+    # it — with the original still sitting above it in the log looking honest.
+    # `init --force` rotates the log aside rather than appending, so two
+    # `initial` records sharing one timestamp are never something freeze wrote.
+    dup = sorted(set(
+        r.get("frozen_at") for r in recs
+        if r.get("action") == "initial"
+        and sum(1 for x in recs
+                if x.get("action") == "initial"
+                and x.get("frozen_at") == r.get("frozen_at")) > 1))
+    if dup:
+        violations.append(
+            "[FORGED] %s — %d `initial` record(s) share the freeze timestamp %s. A run has "
+            "exactly one, and replay RESETS the whole protected map on each one, so the "
+            "later record silently redefines every frozen digest and every target while "
+            "the earlier one stays in the log looking untouched. One of these was appended; "
+            "recover the log from git and restore the frozen bytes with 'restore-harness'."
+            % (logrel,
+               sum(1 for r in recs
+                   if r.get("action") == "initial" and r.get("frozen_at") in dup),
+               ", ".join(str(x) for x in dup)))
+
     idx = _freeze_log_match_index(recs, manifest)
     if idx is None:
         violations.append(
@@ -1086,7 +1149,7 @@ def _authenticate_manifest(root, d, manifest, disk_ok):
                 f"{logrel} recorded at freeze time ({want[:16]}…). The manifest was edited "
                 "to match altered bytes; that is the P-2 tamper this check exists for.")
 
-    v, n = _log_git_check(root, d, recs)
+    v, n = _log_git_check(root, d, recs, _anchor_initial(recs, idx))
     if v:
         violations.append(v)
     if n:
@@ -3849,11 +3912,20 @@ def cmd_check_wave(args):
         die("the same ticket is listed twice in the wave")
 
     owns = {t: _ticket_owns(idx[t]) for t in wave}
+    # A member that declares nothing owns EVERYTHING until it says otherwise —
+    # the rule this command already PRINTS, and used to contradict one line
+    # later. An empty ownership list made the overlap loops treat the member as
+    # owning nothing, so a mixed wave (one ticket declaring `scope`, one with
+    # `scope` absent / [] / null) passed clean; the refusal below only ever
+    # fired when EVERY member declared nothing. `owns` stays the DECLARED map
+    # (the display and that all-undeclared refusal both read it); `eff` is what
+    # the conflict machinery is allowed to reason with.
+    eff = {t: (p or ["**"]) for t, (p, _) in owns.items()}
     conflicts = []
     for i, a in enumerate(wave):
         for b in wave[i + 1:]:
-            for pa in owns[a][0]:
-                for pb in owns[b][0]:
+            for pa in eff[a]:
+                for pb in eff[b]:
                     if _patterns_overlap(pa, pb):
                         conflicts.append((a, b, pa, pb))
                         break
@@ -3866,7 +3938,7 @@ def cmd_check_wave(args):
     for rec in _open_dispatches(d):
         for f_ in rec.get("target_files") or []:
             for t in wave:
-                for pa in owns[t][0]:
+                for pa in eff[t]:
                     if _patterns_overlap(pa, f_):
                         inflight.append((t, rec.get("agent_ref"), pa, f_))
                         break
@@ -3924,11 +3996,36 @@ def cmd_check_wave(args):
 
 
 def _collected_count(text):
-    """pytest's collected/selected count, when it says one. None otherwise."""
-    m = re.search(r"collected (\d+) item", text)
+    """How many tests pytest actually SELECTED to run. None when it says none.
+
+    It used to read `collected N items` — the number pytest COLLECTED — and
+    pytest prints the collected count and the deselected count on the SAME
+    line. So `pytest -m ticket_T010`, written before that marker exists (the
+    single most likely shape for a declared per-ticket `verify`), prints
+    `collected 120 items / 120 deselected / 0 selected`, exits non-zero, and
+    red-check scored it `red (120 test(s) collected) — a real gate`. Zero tests
+    ran. Selection is what "was anything observed?" actually means, so an
+    explicit `N selected` wins, and `collected - deselected` is the fallback
+    for the pytest versions that do not print it.
+
+    The old fallback `(\\d+) (?:passed|failed|error)` was unanchored and matched
+    the bare substring `error` inside `errors`, so any tool that says "errors"
+    handed red-check a fabricated test count off a run that collected nothing:
+    tsc's `Found 3 errors in 2 files.` -> 3, ruff's `Found 12 errors.` -> 12,
+    eslint's `7 problems (7 errors, 0 warnings)` -> 7 — each one scored "a real
+    gate". The fallback is now anchored on both sides and reads only pytest's
+    own `N passed` / `N failed` summary. A compiler's error count is not a test
+    count, and a gate that produced no test count is WEAK, which is the honest
+    answer."""
+    m = re.search(r"\b(\d+) selected\b", text)
     if m:
         return int(m.group(1))
-    m = re.search(r"(\d+) (?:passed|failed|error)", text)
+    m = re.search(r"\bcollected (\d+) item", text)
+    if m:
+        n = int(m.group(1))
+        de = re.search(r"\b(\d+) deselected\b", text)
+        return max(0, n - int(de.group(1))) if de else n
+    m = re.search(r"\b(\d+) (?:passed|failed)\b", text)
     return int(m.group(1)) if m else None
 
 
@@ -3943,9 +4040,16 @@ def cmd_red_check(args):
     orchestrator caught it by hand and wrote the warning into all five packets.
 
     H-7's correction is folded in: exit 4/5 is the CORRECT pre-build shape, not
-    an environment failure — so the classification is by what was COLLECTED, not
-    by the exit code alone. A gate that collects zero tests is weak for the same
-    reason a green one is: nothing about the ticket is being observed."""
+    an environment failure — so the classification is by what was SELECTED, not
+    by the exit code alone. A gate that selects zero tests is weak for the same
+    reason a green one is: nothing about the ticket is being observed.
+
+    THE EXIT CODE IS THE CONTRACT, and it covers every non-red bucket. It used
+    to be `if vacuous: sys.exit(1)` — so WEAK, NO GATE and SKIPPED all exited 0
+    and the caller read that as "these gates are fine". T-011/T-012 above are
+    WEAK, not VACUOUS: two of the five tickets that motivated this command would
+    have passed its own gate. Exit 0 now means every selected ticket has a gate
+    that was CHECKED and found genuinely red."""
     root = repo_root()
     d = sd(root)
     state = load_json(os.path.join(d, STATE_FILE), "state")
@@ -3966,7 +4070,7 @@ def cmd_red_check(args):
     if subprocess.run(["git", "rev-parse", "--verify", base],
                       capture_output=True, cwd=root).returncode != 0:
         die(f"base ref '{base}' does not resolve — pass --base <ref>")
-    vacuous, weak, red, nogate = [], [], [], []
+    vacuous, weak, red, nogate, skipped = [], [], [], [], []
     tmpbase = tempfile.mkdtemp(prefix="swarmloop-redcheck-")
     print(f"red-check: {len(sel)} ticket(s) against a clean worktree of {base}")
     try:
@@ -3982,7 +4086,13 @@ def cmd_red_check(args):
             # it only ever creates and removes its OWN throwaway worktree.
             add = _git(root, "worktree", "add", "--detach", "-q", wt, base)
             if add.returncode != 0:
-                print(f"  {tid:<9} SKIPPED — could not create a worktree: "
+                # SKIPPED used to land in NO bucket at all: it was not counted
+                # in the summary and it could not affect the exit code, so a
+                # provisioning failure read exactly like a ticket that had been
+                # checked and passed. An unchecked gate is not a checked one.
+                skipped.append(tid)
+                print(f"  {tid:<9} SKIPPED — could not create a worktree, so this "
+                      "ticket's gate was NEVER CHECKED: "
                       + (add.stderr or "").strip()[:160])
                 continue
             try:
@@ -3992,14 +4102,14 @@ def cmd_red_check(args):
                 if proc.returncode == 0:
                     vacuous.append(tid)
                     print(f"  {tid:<9} VACUOUS — `{cmd}` EXITS 0 with nothing implemented"
-                          + (f" ({n} test(s) collected)" if n else ""))
+                          + (f" ({n} test(s) selected)" if n else ""))
                 elif not n:
                     weak.append(tid)
                     print(f"  {tid:<9} WEAK — exit {proc.returncode}, but NO tests were "
-                          f"collected: `{cmd}` proves nothing about this ticket either way")
+                          f"SELECTED: `{cmd}` proves nothing about this ticket either way")
                 else:
                     red.append(tid)
-                    print(f"  {tid:<9} red (exit {proc.returncode}, {n} test(s) collected) — "
+                    print(f"  {tid:<9} red (exit {proc.returncode}, {n} test(s) selected) — "
                           "a real gate")
             except subprocess.TimeoutExpired:
                 weak.append(tid)
@@ -4015,13 +4125,20 @@ def cmd_red_check(args):
 
     print("")
     print(f"red-check: {len(red)} real · {len(vacuous)} VACUOUS · {len(weak)} weak · "
-          f"{len(nogate)} with no gate")
-    if vacuous or weak or nogate:
+          f"{len(nogate)} with no gate · {len(skipped)} SKIPPED")
+    if vacuous or weak or nogate or skipped:
         print("A ticket's verify command must FAIL before the ticket is built. A gate that")
         print("passes on an empty tree measures the scaffold, not the work; a gate that")
         print("collects nothing measures nothing at all. Rewrite these before dispatching")
         print("them, and say in each task packet which grader is the real one.")
-    if vacuous:
+    # The exit code IS the contract, and it used to be `if vacuous` alone —
+    # WEAK, NO GATE and SKIPPED all exited 0. The incident this command was
+    # built for is in its own docstring: T-011/T-012 "reported `no tests ran`".
+    # That is pytest exit 5 with `collected 0 items`, which classifies WEAK —
+    # so two of the five tickets that motivated red-check would have walked
+    # straight through its gate. A ticket whose gate proves nothing is not
+    # dispatchable, and a ticket that was never checked is not either.
+    if vacuous or weak or nogate or skipped:
         sys.exit(1)
 
 
@@ -4816,7 +4933,8 @@ def main():
     s.set_defaults(func=cmd_check_wave)
 
     s = sub.add_parser("red-check", help="prove each ticket's verify command FAILS before it "
-                                         "is built")
+                                         "is built (exit 1 on VACUOUS, WEAK, NO GATE or "
+                                         "SKIPPED — exit 0 means every gate is real)")
     s.add_argument("--ticket", action="append", default=None, metavar="IDS",
                    help="repeatable, comma-separated (default: every ticket in the graph)")
     s.add_argument("--graph", default=None, metavar="PATH")
