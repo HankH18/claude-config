@@ -4010,7 +4010,41 @@ def _norm_pat(p):
 
 
 def _has_glob(p):
-    return any(ch in p for ch in "*?[")
+    # `{` is here because brace expansion IS a glob: without it `src/{a,b}/**`
+    # had the literal prefix `src/{a,b}`, which shares no prefix with `src/a/**`,
+    # so check-wave reported no overlap and cleared two workers to write the same
+    # files. _expand_braces below handles it precisely; this is the backstop that
+    # keeps a brace this function cannot expand on the conservative side.
+    return any(ch in p for ch in "*?[{")
+
+
+BRACE_RE = re.compile(r"\{([^{}]*)\}")
+MAX_BRACE_ALTS = 64
+
+
+def _expand_braces(p):
+    """'src/{a,b}/**' -> ['src/a/**', 'src/b/**']. Always returns >= 1 pattern.
+
+    Bounded at MAX_BRACE_ALTS: a pathological `{a,b}{c,d}{e,f}…` must not turn an
+    ownership check into an exponential one. On overflow the ORIGINAL pattern is
+    returned unexpanded, where _has_glob's `{` sends it down the conservative
+    prefix path — a false conflict, which is the safe direction."""
+    out = [p]
+    while True:
+        grew = []
+        for pat in out:
+            m = BRACE_RE.search(pat)
+            if not m:
+                grew.append(pat)
+                continue
+            head, tail = pat[:m.start()], pat[m.end():]
+            for alt in m.group(1).split(","):
+                grew.append(head + alt.strip() + tail)
+        if len(grew) > MAX_BRACE_ALTS:
+            return [p]
+        if grew == out:
+            return out
+        out = grew
 
 
 def _pattern_prefix(p):
@@ -4030,7 +4064,24 @@ def _patterns_overlap(a, b):
     costs one serialized ticket; a missed one costs two corrupted branches, and
     that asymmetry is the whole reason this function exists."""
     a, b = _norm_pat(a), _norm_pat(b)
-    if not a or not b or a == "**" or b == "**":
+    if not a or not b:
+        return True
+    # Case is folded on BOTH sides, always and on every platform. `SRC/**` and
+    # `src/**` are the same directory on darwin and on a default-configured
+    # Windows checkout, and this function's whole asymmetry — stated above — is
+    # that a false conflict costs one serialized ticket while a missed one costs
+    # two corrupted branches. Folding unconditionally also keeps the answer from
+    # depending on which machine the orchestrator happens to be running on.
+    for pa_ in _expand_braces(a):
+        for pb_ in _expand_braces(b):
+            if _overlap_one(pa_.lower(), pb_.lower()):
+                return True
+    return False
+
+
+def _overlap_one(a, b):
+    """_patterns_overlap for a single brace-free, case-folded pair."""
+    if a == "**" or b == "**":
         return True
     if a == b:
         return True
@@ -4978,7 +5029,10 @@ def _graph_reconcile_lines(root, d, state):
 # the chain T-032 -> T-033 -> T-030 already guarantees it exists). The rule that
 # actually holds is the closure rule below.
 
-READ_TEST_RE = re.compile(r"^(test_.+|.+_test)\.py$")
+# conftest.py is IN: its imports break collection for every test in the
+# directory, which is the widest read edge a file can carry, and it was the one
+# test-adjacent filename this pattern excluded.
+READ_TEST_RE = re.compile(r"^(test_.+|.+_test|conftest)\.py$")
 
 
 def _is_catchall(pat):
@@ -4999,14 +5053,17 @@ def _scope_match(pat, path):
     module itself (`packages/llm.py`, `packages/llm/__init__.py`) and the
     directory `packages/llm`, none of which carry the trailing separator the
     pattern demands."""
-    pat, path = _norm_pat(pat), _norm_pat(path)
+    pat, path = _norm_pat(pat).lower(), _norm_pat(path).lower()
     if not pat or not path:
         return False
-    if pat.endswith("/**"):
-        pre = pat[:-3]
-        if path == pre or path.startswith(pre + "/"):
+    for one in _expand_braces(pat):     # same brace rule the overlap check uses
+        if one.endswith("/**"):
+            pre = one[:-3]
+            if path == pre or path.startswith(pre + "/"):
+                return True
+        if fnmatch.fnmatch(path, one):
             return True
-    return fnmatch.fnmatch(path, pat)
+    return False
 
 
 def _module_candidates(mod):
@@ -5106,6 +5163,51 @@ def _dotted_imports(node):
     return out
 
 
+def _module_level_imports(tree):
+    """Imports reachable at MODULE scope, including guarded ones.
+
+    Read off bare `tree.body`, the two commonest shapes for an import that
+    breaks collection were both invisible: `try: import x / except ImportError`
+    and `if TYPE_CHECKING: import x`. Descends control flow; never descends into
+    a def or class, because a function body's imports are attributed per-test."""
+    out, stack = set(), list(tree.body)
+    while stack:
+        n = stack.pop()
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if isinstance(n, (ast.Import, ast.ImportFrom)):
+            out |= _dotted_imports(n)
+            continue
+        for field in ("body", "orelse", "finalbody", "handlers"):
+            v = getattr(n, field, None)
+            if isinstance(v, list):
+                stack.extend(v)
+    return out
+
+
+def _pytestmark_tickets(tree):
+    """Ticket ids from a module-level `pytestmark = pytest.mark.ticket("T-1")`.
+
+    pytestmark marks EVERY test in the file and was handled nowhere, so a file
+    that used it instead of per-function decorators read as entirely unmarked —
+    and an unmarked test is invisible to the read-edge gate that `freeze`
+    depends on. Accepts the bare form and the list/tuple form."""
+    out = []
+    for n in tree.body:
+        if not isinstance(n, ast.Assign):
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == "pytestmark" for t in n.targets):
+            continue
+        vals = (n.value.elts if isinstance(n.value, (ast.List, ast.Tuple)) else [n.value])
+        for v in vals:
+            func = v.func if isinstance(v, ast.Call) else v
+            if isinstance(func, ast.Attribute) and func.attr == "ticket":
+                for a in getattr(v, "args", []) or []:
+                    if isinstance(a, ast.Constant) and isinstance(a.value, str):
+                        out.append(a.value.strip())
+    return out
+
+
 def _read_test_files(root, state, explicit):
     """The frozen test files to AST-parse.
 
@@ -5155,6 +5257,12 @@ def _scan_read_edges(root, state, idx, explicit_tests=None, closed=()):
         "test_files": len(files), "tests_scanned": 0, "unparsed": [],
         "reads": {}, "violations": [], "unmapped": [], "dash_mismatch": [],
         "unmarked_tests": 0, "shared_scope": [],
+        # {ticket_id: how many frozen tests carry its marker}. goal-setting.md
+        # has always said "Zero frozen tests is not a row in a table; it stops
+        # the freeze" and nothing computed it, so a ticket with no acceptance
+        # coverage at all froze silently and was graded exclusively by the suite
+        # its own author wrote.
+        "marked_tests": {},
     }
     reads = {}
 
@@ -5217,15 +5325,27 @@ def _scan_read_edges(root, state, idx, explicit_tests=None, closed=()):
         # not resolve fails COLLECTION, so it takes down every test in the file
         # and not only the ones that use it — a wider blast radius than the
         # function-level import the live finding was about, not a narrower one.
-        file_marks, mod_level = [], set()
-        for n in tree.body:
-            if isinstance(n, (ast.Import, ast.ImportFrom)):
-                mod_level |= _dotted_imports(n)
+        file_marks = []
+        mod_level = _module_level_imports(tree)
+        file_level_marks = _pytestmark_tickets(tree)
 
         def visit(body, inherited):
             for n in body:
                 if isinstance(n, ast.ClassDef):
                     visit(n.body, _ticket_marks(n) or inherited)
+                    continue
+                # Descend control flow. The old walk skipped anything that was
+                # not a def or a class, so a test guarded by `if
+                # sys.version_info >= …:` or defined inside a `try:` was neither
+                # scanned nor counted as unmarked — invisible in both columns.
+                if isinstance(n, (ast.If, ast.Try, ast.With, ast.AsyncWith,
+                                  ast.For, ast.AsyncFor, ast.While)):
+                    for field in ("body", "orelse", "finalbody"):
+                        sub = getattr(n, field, None)
+                        if isinstance(sub, list):
+                            visit(sub, inherited)
+                    for h in getattr(n, "handlers", []) or []:
+                        visit(getattr(h, "body", []) or [], inherited)
                     continue
                 if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     continue
@@ -5237,9 +5357,11 @@ def _scan_read_edges(root, state, idx, explicit_tests=None, closed=()):
                     res["unmarked_tests"] += 1
                     continue
                 file_marks.extend(marks)
+                for _tid in marks:
+                    res["marked_tests"][_tid] = res["marked_tests"].get(_tid, 0) + 1
                 attribute(marks, _dotted_imports(n), n.lineno)
 
-        visit(tree.body, [])
+        visit(tree.body, file_level_marks)
         if mod_level and file_marks:
             attribute(sorted(set(file_marks)), mod_level, 1)
 
@@ -5425,6 +5547,33 @@ def _freeze_read_gate(root, d, state, allow, already_frozen=False):
     if not idx:
         return
     res = _scan_read_edges(root, state, idx)
+
+    # goal-setting.md's hard stop, finally implemented. Same intake-only shape as
+    # the read gate below and for the same D4 reason: at a FIRST freeze the
+    # remedy (write the test, or split the ticket) is a text edit against goals
+    # that are still malleable; once frozen, every remedy is itself an amendment,
+    # so refusing `freeze --amend` would refuse the only door out.
+    uncovered = sorted(t for t in idx if not res["marked_tests"].get(t))
+    if uncovered:
+        print("acceptance coverage — %d frozen test(s) across %d ticket(s):"
+              % (res["tests_scanned"], len(idx) - len(uncovered)))
+        print("  %d TICKET(S) CARRY NO FROZEN TEST AT ALL:" % len(uncovered))
+        for t in uncovered:
+            title = str((idx[t] or {}).get("title") or "").strip()
+            print("    %-9s %s" % (t, title[:70]))
+        if not allow and not already_frozen:
+            die("freeze REFUSED: %d ticket(s) in the graph have ZERO frozen tests carrying "
+                "their marker, so nothing outside their own author's suite will ever grade "
+                "them. Measured on a real run: the ticket with zero frozen tests was the "
+                "foundation five others built on, and an adversarial review of the finished "
+                "branch found two critical defects squarely where its own tests could not "
+                "reach. Write an acceptance test marked "
+                "@pytest.mark.ticket(\"<id>\") for each, or drop the ticket. Freeze anyway "
+                "with --allow-read-violations once you have decided it is acceptable."
+                % len(uncovered))
+        print("  ADVISORY only (%s) — these tickets are graded by nobody but themselves."
+              % ("--allow-read-violations passed" if allow else "already frozen"))
+
     lines = _read_edge_report(res, idx)
     if not lines:
         return

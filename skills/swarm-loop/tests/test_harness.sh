@@ -3089,6 +3089,182 @@ ck_exit "(t) CONTROL: and frontier" 0 "$RC"
 
 
 # ===========================================================================
+# (u) Ownership overlap: brace expansion and case. check-wave's ONE safety
+#     property is that two concurrent workers never own the same file, and it
+#     answered "no overlap" for two pairs that collide on disk.
+# ===========================================================================
+section "(u) ownership overlap gaps  [repo: ovl]"
+mk_repo ovl
+python3 - "$SL" > "$OUT" 2>&1 <<'PY'
+import importlib.util, sys, time
+spec = importlib.util.spec_from_file_location("sl", sys.argv[1])
+sl = importlib.util.module_from_spec(spec); spec.loader.exec_module(sl)
+must_overlap = [("src/{a,b}/**","src/a/**"), ("src/{a,b}/**","src/b/core.py"),
+                ("pkg/{x,y}/m.py","pkg/x/m.py"), ("SRC/**","src/**"),
+                ("Src/App.py","src/app.py")]
+must_not    = [("src/a/**","src/b/**"), ("pkg/x/m.py","pkg/y/m.py"),
+               ("a/**","b/**"), ("src/{a,b}/**","src/{c,d}/**")]
+bad  = ["%s vs %s should OVERLAP" % (a,b) for a,b in must_overlap if not sl._patterns_overlap(a,b)]
+bad += ["%s vs %s must NOT overlap" % (a,b) for a,b in must_not if sl._patterns_overlap(a,b)]
+# Bounded AND conservative. Timing alone left the `{` in _has_glob — the
+# backstop for exactly this overflow path — with no coverage: reverting that
+# one character kept the whole suite green.
+t = time.time()
+overflow = sl._patterns_overlap("{a,b}"*12 + "/**", "zzz/**")
+if time.time() - t > 5:
+    bad.append("brace expansion is not bounded")
+if not overflow:
+    bad.append("a brace too large to expand must fall back to OVERLAP, not to no-overlap")
+if len(sl._expand_braces("{a,b}"*12 + "/**")) != 1:
+    bad.append("expansion past MAX_BRACE_ALTS must return the pattern unexpanded")
+for b in bad:
+    print("  BAD: " + b)
+print("OVERLAP_BAD=%d" % len(bad))
+PY
+ck_has "(u) every brace/case/bounding expectation holds" "OVERLAP_BAD=0"
+
+sl_out=$(python3 - "$SL" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("sl", sys.argv[1])
+sl = importlib.util.module_from_spec(spec); spec.loader.exec_module(sl)
+print(int(sl._patterns_overlap("src/{a,b}/**","src/a/**")), end="")
+print(int(sl._patterns_overlap("SRC/**","src/**")), end="")
+print(int(sl._patterns_overlap("src/a/**","src/b/**")), end="")
+print(int(sl._scope_match("src/{a,b}/**","src/b/core.py")), end="")
+print(int(sl._scope_match("SRC/**","src/app.py")), end="")
+print(int(sl._scope_match("src/a/**","src/b/x.py")))
+PY
+)
+ck "(u) brace/case overlap and scope-match, 6 answers" "110110" "$sl_out"
+
+# and end-to-end: check-wave must VETO a brace-vs-plain collision
+cat > tickets.json <<'EOF'
+{"tickets":[
+ {"id":"T-001","title":"ab","verify":"true","scope":["src/{a,b}/**"],"depends_on":[]},
+ {"id":"T-002","title":"a","verify":"true","scope":["src/a/**"],"depends_on":[]},
+ {"id":"T-003","title":"upper","verify":"true","scope":["SRC/**"],"depends_on":[]},
+ {"id":"T-004","title":"lower","verify":"true","scope":["src/**"],"depends_on":[]},
+ {"id":"T-005","title":"c","verify":"true","scope":["src/c/**"],"depends_on":[]}]}
+EOF
+sl check-wave T-001 T-002
+ck_exit "(u) check-wave VETOES src/{a,b}/** against src/a/**" 1 "$RC"
+ck_has "(u) naming the intersecting pair" "T-001 <-> T-002"
+sl check-wave T-003 T-004
+ck_exit "(u) check-wave VETOES SRC/** against src/**" 1 "$RC"
+sl check-wave T-002 T-005
+ck_exit "(u) CONTROL: genuinely disjoint globs still pass" 0 "$RC"
+
+# ===========================================================================
+# (v) `reads` blind spots — it GATES freeze, so a missed edge means a ticket
+#     is graded against a moving target with no warning.
+# ===========================================================================
+section "(v) reads scanner blind spots  [repo: rdscan]"
+mk_repo rdscan
+mkdir -p packages/alpha packages/beta
+echo "x = 1" > packages/alpha/__init__.py
+echo "y = 1" > packages/beta/__init__.py
+cat > tickets.json <<'EOF'
+{"tickets":[
+ {"id":"T-001","title":"alpha","verify":"true","scope":["packages/alpha/**"],"depends_on":["T-002"]},
+ {"id":"T-002","title":"beta","verify":"true","scope":["packages/beta/**"],"depends_on":[]}]}
+EOF
+# mk_repo ships its own unmarked test_feature.py; drop it so the counts below
+# are about THIS section's files and nothing else.
+rm -f .swarm-loop/acceptance/test_feature.py
+cat > .swarm-loop/acceptance/test_guarded.py <<'PYEOF2'
+import pytest, sys
+try:
+    from packages.beta import y            # guarded module-level import
+except ImportError:
+    y = None
+
+@pytest.mark.ticket("T-001")
+def test_a(): assert True
+
+if sys.version_info >= (3, 8):
+    @pytest.mark.ticket("T-001")
+    def test_nested():                     # a test defined inside an `if`
+        assert True
+PYEOF2
+cat > .swarm-loop/acceptance/test_pytestmark.py <<'PYEOF3'
+import pytest
+pytestmark = pytest.mark.ticket("T-001")
+from packages.beta import y
+def test_b(): assert True
+PYEOF3
+gq add -A; gq commit -qm scan
+sl reads --json
+ck_exit "(v) reads runs" 0 "$RC"
+ck "(v) a test nested in an if-block is SCANNED (was invisible)" "3" \
+   "$(python3 -c "import json;print(json.load(open('$OUT'))['tests_scanned'])" 2>/dev/null || echo ERR)"
+ck "(v) pytestmark marks the file, so nothing reads as unmarked" "0" \
+   "$(python3 -c "import json;print(json.load(open('$OUT'))['unmarked_tests'])" 2>/dev/null || echo ERR)"
+ck "(v) the guarded import IS a read edge T-001 -> T-002" "['packages.beta']" \
+   "$(python3 -c "import json;print(json.load(open('$OUT'))['reads'].get('T-001',{}).get('T-002'))" 2>/dev/null || echo ERR)"
+ck "(v) conftest.py is scanned as a test file" "True" \
+   "$(python3 -c "
+import re,sys
+sys.path.insert(0,'$SL_DIR')
+import importlib.util
+spec=importlib.util.spec_from_file_location('sl','$SL'); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+print(bool(m.READ_TEST_RE.match('conftest.py')))")"
+
+# ===========================================================================
+# (w) goal-setting.md: "Zero frozen tests is not a row in a table; it stops
+#     the freeze." It never did.
+# ===========================================================================
+section "(w) zero-coverage tickets stop the freeze  [repo: zcov]"
+mk_repo zcov
+mkdir -p packages/alpha packages/beta
+echo "x = 1" > packages/alpha/__init__.py
+echo "y = 1" > packages/beta/__init__.py
+cat > tickets.json <<'EOF'
+{"tickets":[
+ {"id":"T-001","title":"alpha","verify":"true","scope":["packages/alpha/**"],"depends_on":[]},
+ {"id":"T-002","title":"beta","verify":"true","scope":["packages/beta/**"],"depends_on":[]}]}
+EOF
+rm -f .swarm-loop/acceptance/test_feature.py
+printf 'import pytest\n@pytest.mark.ticket("T-001")\ndef test_a(): assert True\n' \
+  > .swarm-loop/acceptance/test_a.py
+gq add -A; gq commit -qm zc
+sl freeze
+ck_exit "(w) freeze REFUSES a ticket with zero frozen tests" 1 "$RC"
+ck_has "(w) the uncovered ticket is named" "T-002"
+ck_has "(w) and the count is stated" "TICKET(S) CARRY NO FROZEN TEST AT ALL"
+ck "(w) goals were NOT frozen by the refusal" "False" \
+   "$(jget .swarm-loop/goals.json "d['frozen']")"
+
+sl freeze --allow-read-violations
+ck_exit "(w) --allow-read-violations is the documented override" 0 "$RC"
+ck_has "(w) which says so rather than passing silently" "ADVISORY only"
+
+# CONTROL: full coverage must freeze cleanly
+mk_repo zcov2
+mkdir -p packages/alpha packages/beta
+echo "x = 1" > packages/alpha/__init__.py
+echo "y = 1" > packages/beta/__init__.py
+cat > tickets.json <<'EOF'
+{"tickets":[
+ {"id":"T-001","title":"alpha","verify":"true","scope":["packages/alpha/**"],"depends_on":[]},
+ {"id":"T-002","title":"beta","verify":"true","scope":["packages/beta/**"],"depends_on":[]}]}
+EOF
+rm -f .swarm-loop/acceptance/test_feature.py
+printf 'import pytest\n@pytest.mark.ticket("T-001")\ndef test_a(): assert True\n' > .swarm-loop/acceptance/test_a.py
+printf 'import pytest\n@pytest.mark.ticket("T-002")\ndef test_b(): assert True\n' > .swarm-loop/acceptance/test_b.py
+gq add -A; gq commit -qm zc2
+sl freeze
+ck_exit "(w) CONTROL: every ticket covered freezes cleanly" 0 "$RC"
+ck_hasnt "(w) CONTROL: no coverage complaint" "CARRY NO FROZEN TEST"
+
+# CONTROL: a project with NO ticket graph is a silent no-op
+mk_repo zcov3
+gq add -A; gq commit -qm zc3
+sl freeze
+ck_exit "(w) CONTROL: no ticket graph, freeze is unaffected" 0 "$RC"
+ck_hasnt "(w) CONTROL: and says nothing about coverage" "CARRY NO FROZEN TEST"
+
+
+# ===========================================================================
 cd / 2>/dev/null || true
 ELAPSED=$(( $(date +%s) - START_TS ))
 echo
