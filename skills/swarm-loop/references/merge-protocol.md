@@ -126,10 +126,34 @@ The premise: worktrees moved conflicts from silent runtime corruption to visible
 
    **The same obligation applies per-worktree at dispatch** (cross-reference SKILL.md Phase 4): a fresh worktree contains only *tracked* files, so every gitignored dependency or build directory is missing, and how that missing dependency presents depends on where the worktree sits. Beside the repo (the default) it is a loud `MODULE_NOT_FOUND` — a blocked worker, but a visible one. Under the in-tree fallback it is silent and worse: Node's resolver climbs UP out of the nested worktree into the primary tree's `node_modules` and, under workspaces, into MAIN's source, so an unprovisioned worktree quietly tests main's code while the worker believes it is testing its own. Either way the fix is the same and it is the dispatcher's job: provision each worktree's environment as an explicit dispatch step, never as the worker's first guess.
 
-9. **Land it:**
+9. **Land it — rebase onto `main` FIRST, then fast-forward:**
    ```bash
+   git fetch . main                                          # no-op locally; keeps the form honest
+   git rebase main integration/<epoch>-<batch>               # replay the batch onto current main
+   # re-run THIS BATCH'S verify here — see the paragraph below; a rebase invalidates it
    git checkout main && git merge --ff-only integration/<epoch>-<batch>
    ```
+   **The bare `--ff-only` on its own provably cannot run, and this is why the rebase is not optional.**
+   Phase 8 commits `.swarm-loop/` to `main` at every epoch boundary (SKILL.md), which moves `main`;
+   the moment it has, `main` and the integration branch have diverged and `--ff-only` aborts —
+   reproduced: `main` ahead 1, integration ahead 2, `git merge-tree` **clean**, and
+   `git merge --ff-only` exits **128** with *"Not possible to fast-forward"*. A clean `merge-tree`
+   is not permission to land: it says the texts do not collide, nothing about whether the base the
+   batch was built on still exists. Rebasing answers the second question, and keeps the linear
+   history that makes `--ff-only` worth prescribing at all.
+
+   **A rebase invalidates the batch's own green, so re-run its `verify` after the rebase and before
+   the merge.** The suite that went green in step 4 ran against the pre-rebase base; the whole point
+   of moving the batch onto current `main` is that `main` changed underneath it. `swarmloop.py
+   check-branch --branch integration/<epoch>-<batch>` will now also print the branch's commit counts
+   — `0 commit(s) ahead` is a refusal (there is nothing to land), and a non-zero *behind* count before
+   the rebase is exactly the condition this step exists to clear, so it should read `/ 0 behind` by
+   the time you merge.
+
+   **Do NOT commit the epoch ledger onto the integration branch to dodge the divergence.** It is the
+   obvious shortcut and it is blocked one gate later: `check-branch` refuses any branch whose diff
+   touches `.swarm-loop/` — reproduced, `VETO: branch writes orchestrator-owned state under
+   .swarm-loop/`, exit 1. The ledger belongs to `main` and to Phase 8; the batch rebases around it.
    **Mandatory at every landing — tracked-file-count tripwire:**
    ```bash
    git ls-tree -r HEAD --name-only | wc -l

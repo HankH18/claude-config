@@ -75,6 +75,8 @@ MANIFEST_FILE = "manifest.json"
 FREEZE_LOG_FILE = "freeze-log.jsonl"
 ESCALATIONS_FILE = "escalations.jsonl"
 ESCALATIONS_MD = "ESCALATIONS.md"
+LEARNINGS_MD = "learnings.md"      # per-run, project-specific (Phase 8 appends)
+LEARNED_MD = "LEARNED.md"          # the SKILL's cross-run memory (Termination distils into it)
 HISTORY_FILE = "history.csv"
 ANALYSIS_DIR = "analysis"
 
@@ -3303,6 +3305,8 @@ def cmd_resume(args):
               "and a crashed one look identical from here")
     for i, line in enumerate(_graph_reconcile_lines(root, d, state)):
         print(("ticket graph    : " if i == 0 else "                  ") + line)
+    for i, line in enumerate(_learning_lines(d)):
+        print(("self-improvement: " if i == 0 else "                  ") + line)
     hi = max(seen_cycles | analyzed | checkpointed | reported | {0})
     print("cycle artifacts : (m)easured (a)nalyzed (c)heckpointed (r)eported"
           + ("  ·  ! in the m column = PARTIAL measurement (a metric command failed)"
@@ -3690,6 +3694,14 @@ def cmd_checkpoint(args):
     print(f"stall count: {state['stall_count']}/{state['stall_limit']} (codebase)")
     print(f"goal-progress stall: {state['goal_stall_count']}/{_goal_stall_limit(state)} "
           f"({goal_verdict} — {goal_detail})")
+    # The epoch boundary IS where SKILL.md Phase 8 owes the process-loop append,
+    # so this is where not having made it should be visible. Advisory; a bare
+    # except because a reporting line may never move checkpoint's exit code.
+    try:
+        for line in _learning_lines(d):
+            print("self-improvement: " + line)
+    except Exception as _e:      # noqa: BLE001 - a status line is never the crash
+        print(f"(self-improvement check skipped: {_e})")
 
     # Tripwire: a sharp drop in tracked-file count is the one signal that sees
     # an index-wipe (an emptied index turns add+commit into a full repo delete
@@ -4475,6 +4487,67 @@ def cmd_red_check(args):
     # dispatchable, and a ticket that was never checked is not either.
     if vacuous or weak or nogate or skipped:
         sys.exit(1)
+
+
+def _learning_lines(d):
+    """Two lines on the self-improvement loop: the per-run file, and the skill's.
+
+    P1 / OPEN §3: SKILL.md tells the loop to append to `.swarm-loop/learnings.md`
+    at every epoch boundary and to distil that into the skill's `LEARNED.md` at
+    Termination — and NOTHING has ever checked. `grep -rn LEARNED` over the whole
+    harness returned no hits, the capacity gate was prose, and the result is a
+    `LEARNED.md` with zero entries across every run to date. This does not
+    enforce the append (see below); it makes the omission visible in the status
+    block the orchestrator already reads every cycle, which is the difference
+    between a rule nobody kept and a rule nobody kept IN FRONT OF THEM.
+
+    Deliberately NOT enforcement, and deliberately read-only: the harness writes
+    nothing outside the run's own repo. LEARNED.md lives in the skill directory,
+    shared by every run on the machine and by any concurrent run — a counter that
+    edits it is a different decision with a much larger blast radius, and it is
+    not this one.
+
+    Never raises: a missing skill directory (the script invoked from a copy, a
+    relocated skill) degrades to 'cannot see it', never to a crash in `resume`,
+    which is the command for when everything else is already broken.
+    """
+    out = []
+    lpath = os.path.join(d, LEARNINGS_MD)
+    try:
+        n = sum(1 for ln in open(lpath) if ln.strip()) if os.path.exists(lpath) else None
+    except OSError:
+        n = None
+    if n is None:
+        out.append(f"{STATE_DIR}/{LEARNINGS_MD}: ABSENT — Phase 8 appends the process-loop lesson "
+                   "for every epoch to it; a run with none has recorded nothing about its own "
+                   "orchestration")
+    else:
+        out.append(f"{STATE_DIR}/{LEARNINGS_MD}: {n} non-empty line(s)")
+
+    # The skill's own memory, located from THIS file rather than from the repo.
+    learned = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                            os.pardir, LEARNED_MD))
+    try:
+        if not os.path.exists(learned):
+            out.append(f"{LEARNED_MD}: not found at {learned} — cannot report the skill's memory")
+            return out
+        with open(learned) as f:
+            text = f.read()
+    except OSError as e:
+        out.append(f"{LEARNED_MD}: unreadable ({e})")
+        return out
+    body = text.split("## Entries", 1)[-1] if "## Entries" in text else text
+    entries = sum(1 for ln in body.splitlines()
+                  if ln.startswith("- ") or ln.startswith("### "))
+    if entries == 0:
+        out.append(f"{LEARNED_MD}: EMPTY (0 entries) — Termination is supposed to distil "
+                   f"{STATE_DIR}/{LEARNINGS_MD} into it. Every run so far has ended without "
+                   "doing so, which is why it is empty; do not let this one be another")
+    else:
+        out.append(f"{LEARNED_MD}: {entries} entr(ies)"
+                   + ("  ·  AT CAPACITY (>=40) — SKILL.md's capacity gate applies: stop and tell "
+                      "the user before further runs" if entries >= 40 else ""))
+    return out
 
 
 def _graph_reconcile_lines(root, d, state):

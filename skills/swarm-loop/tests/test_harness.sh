@@ -2893,6 +2893,48 @@ sl status
 ck_exit "(q) status runs on it" 0 "$RC"
 
 # ===========================================================================
+# (r) P1 / OPEN §3 — the self-improvement loop is REPORTED, at both the places
+#     the orchestrator already reads. SKILL.md has told every run to append to
+#     .swarm-loop/learnings.md each epoch and to distil it into the skill's
+#     LEARNED.md at Termination since the beginning; nothing ever checked, and
+#     LEARNED.md has zero entries to show for it. This does not enforce the
+#     append — it makes the omission visible. Read-only by design: the harness
+#     writes nothing outside the run's own repo.
+# ===========================================================================
+section "(r) self-improvement visibility  [repo: selfimp]"
+mk_repo selfimp
+sl freeze
+gq add -A; gq commit -qm harness
+sl measure --cycle 0
+sl checkpoint --cycle 0
+ck_exit "(r) checkpoint still exits 0 with the new line" 0 "$RC"
+ck_has "(r) checkpoint reports the self-improvement loop" "self-improvement:"
+ck_has "(r) an absent per-run learnings file is called out" "learnings.md: ABSENT"
+ck_has "(r) the skill's cross-run memory is named too" "LEARNED.md"
+ck_hasnt "(r) no traceback from the reporter" "Traceback"
+
+sl resume
+ck_exit "(r) resume still exits 0" 0 "$RC"
+ck_has "(r) resume carries the same block" "self-improvement:"
+
+# once the run actually keeps a learnings file, it is counted, not scolded
+mkdir -p .swarm-loop
+printf -- '- cycle 0: packets lacked the ownership map\n- cycle 1: wave width too wide\n' \
+  > .swarm-loop/learnings.md
+sl checkpoint --cycle 0
+ck_exit "(r) checkpoint replay with a learnings file" 0 "$RC"
+ck_has "(r) a populated learnings file is COUNTED, not reported absent" "learnings.md: 2 non-empty line(s)"
+ck_hasnt "(r) and is no longer called absent" "learnings.md: ABSENT"
+
+# the reporter must survive a skill it cannot see (script run from a copy)
+cp "$SL" ./swarmloop-copy.py
+python3 ./swarmloop-copy.py checkpoint --cycle 0 > "$OUT" 2>&1; RC=$?
+ck_exit "(r) a relocated script does not crash the reporter" 0 "$RC"
+ck_hasnt "(r) still no traceback when LEARNED.md is not where it looked" "Traceback"
+ck_has "(r) it says plainly that it cannot see the skill memory" "LEARNED.md"
+
+
+# ===========================================================================
 cd / 2>/dev/null || true
 ELAPSED=$(( $(date +%s) - START_TS ))
 echo
