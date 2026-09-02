@@ -15,7 +15,7 @@ whole contract; run it before any edit to `SKILL.md`, `scripts/` or `hooks/`.
 ./tests/run.sh -v           # list every passing guard case, not just failures
 ```
 
-Takes well under a minute. It is meant to be run casually, on a whim, before you
+Takes a minute or two. It is meant to be run casually, on a whim, before you
 touch anything.
 
 ---
@@ -25,10 +25,10 @@ touch anything.
 | file | covers |
 | --- | --- |
 | `run.sh` | the entry point: runs both suites, prints a summary, owns the exit code |
-| `test_git_guard.py` | `../hooks/git-guard.py` — 316 command strings (138 BLOCK, 178 ALLOW), each asserted against exit 2 / exit 0 |
-| `test_harness.sh` | `../scripts/swarmloop.py` — 174 assertions, end-to-end runs of the frozen metric harness against throwaway repos |
+| `test_git_guard.py` | `../hooks/git-guard.py` — 443 cases: 417 command strings (195 BLOCK, 222 ALLOW) plus 26 whole-payload cases (16 BLOCK, 10 ALLOW) that carry a `cwd` and a `tool_name`, each asserted against exit 2 / exit 0 |
+| `test_harness.sh` | `../scripts/swarmloop.py` — 390 assertions, end-to-end runs of the frozen metric harness against throwaway repos |
 
-490 assertions, ~35 seconds, exit 0.
+833 assertions, ~95 seconds, exit 0.
 
 Both suites are addressed **relative to this directory** (`../hooks/`,
 `../scripts/`), never by absolute path, so the suite keeps working after the
@@ -92,13 +92,29 @@ kill switch; escalations (inert, blocking, outranking every other terminal
 condition in `resume`); and backward compatibility with a run that has no
 `escalations.jsonl` at all.
 
+The `BC` section is the one that guards a **live** liability rather than a past
+defect. A swarm-loop run can be PAUSED across an upgrade of this skill, and on
+resume it loads whatever the harness has become, against state the previous
+version wrote. So `BC` freezes a run, DOWNGRADES it to the previous on-disk shape
+by dropping the one key the current writer added (`manifest["targets"]`), and
+then requires every subcommand to still load it: `verify`, `status`, `analyze`,
+`resume`, `checkpoint`, `measure`, `record`, `dispatch`, and a clean exit-3
+decline from the four subcommands that need a ticket graph a pre-change run does
+not have. It downgrades a real run rather than pasting a fixture so it cannot
+drift out of date.
+
 ---
 
 ## Adding a case
 
-**Guard.** Append a `(name, command, expected)` tuple to `MUST_BLOCK` or
-`MUST_ALLOW` in `test_git_guard.py`. Names must be unique — the suite refuses to
-run on a duplicate. If the case needs a file, a branch or an alias to exist for
+**Guard.** Append a `(name, command)` tuple to `MUST_BLOCK` or `MUST_ALLOW` in
+`test_git_guard.py`. Names must be unique — the suite refuses to run on a
+duplicate. If the contract you are asserting cannot be expressed as a command
+string — which directory the command runs in, or which tool is asking — add a
+`(name, expected, payload_dict)` triple to `PAYLOAD_CASES` instead; `{REPO}` and
+`{WT}` are substituted at any depth, and the hook process always starts in the
+primary checkout so a `cwd` case is a real differential rather than a
+restatement. If the case needs a file, a branch or an alias to exist for
 git to answer "ref or path?", add it in `build_repo()`; the guard resolves those
 questions against the cwd, so a case whose fixture is missing fails open and
 proves nothing.
@@ -117,14 +133,26 @@ genuinely wrong, say so out loud and change it deliberately.
 Neither suite is vacuously green — both were checked by sabotage, not by
 inspection:
 
-- Guard, pointed at a stubbed **always-allow** hook: all 138 block cases fail.
-  Pointed at an **always-block** hook: all 178 allow cases fail.
+- Guard, pointed at a stubbed **always-allow** hook: every block case fails.
+  Pointed at an **always-block** hook: every allow case fails. Per-rule, on a
+  sabotaged copy: neutering `check_rm_paths` reddens exactly the 6 `rm` block
+  cases and no allow case; dropping `MultiEdit` alone from `FILE_TOOLS` reddens
+  exactly the one case that covers it; widening the home rule from "is the home
+  directory" to "is under it" reddens exactly `rm-rf-home-subdir`; keying the
+  worktree rule on the word `worktrees` instead of asking git reddens exactly
+  `rm-rf-stale-worktree`; and scoping the file-tool rule to `.swarm-loop/`
+  instead of the ledger reddens exactly `edit-swarm-prose-doc`.
 - Harness, run against a copy of `swarmloop.py` with
   `stale_metrics` forced empty (the exact defect fixed in the analyze path):
   the three `(a)` stale-verdict assertions go red and nothing else does.
   With `all_done` widened to ignore manual rows: the three `(k)` assertions go
   red. With `escalate` made to write `state.json`: exactly one assertion goes
   red, and it names the file that moved.
+- Backward compat specifically: with `manifest["targets"]` made MANDATORY in
+  `_authenticate_manifest`, 9 `BC` assertions go red and **nothing else in the
+  suite does** — that mutation is invisible to all 381 other assertions, which
+  is precisely why the section exists. With the pre-`targets` fallback in
+  `freeze --amend` removed, exactly 3 `BC` assertions go red.
 
 Both suites were also run from a copy of the whole skill relocated to an
 unrelated directory, from `cwd=/`, and stayed green — the relative-path

@@ -25,6 +25,30 @@ The premise: in an unattended run, a permission prompt is a hung worker, and a h
 
 5. **Browser work has a second gate no settings file reaches:** the Chrome extension's own site-level permissions, granted in the extension itself beforehand — the localhost dev server at minimum. The settings file allows the TOOL; the extension allows the SITE. Miss the second gate and every browser call still stalls, allowlist or not.
 
+## What the guard's scope actually is — session, not global, not repo
+
+Phase 0 is where the guard is provisioned, so this is where its real scope belongs. Getting it wrong in either direction is expensive: overestimate it and you dispatch an unguarded wave believing it is covered; underestimate it and you go hunting for a repo-level file that does not exist.
+
+- **The guard is SESSION-scoped.** It is registered in exactly one place — the project's gitignored `.claude/settings.local.json`, as a `PreToolUse` entry with `matcher: "Bash|Edit|Write|NotebookEdit|MultiEdit"` (the template below) — and it is loaded once, when the `claude` session starts. It is **not** installed globally and it is **not** a property of the repository: other projects are unaffected, and no file inside the repo makes a command guarded. What makes a command guarded is that it was issued by a Bash tool call from **this session** (subagents of this session included). Nothing else.
+- **Therefore: a worktree has no `.claude/` of its own, and a `claude` process started with cwd inside a worktree runs COMPLETELY UNGUARDED.** A worktree carries only tracked files, and `.claude/settings.local.json` is gitignored, so there is nothing there to load — and being "inside the repo's worktree" confers nothing, because the guard was never repo-scoped to begin with. **Guarded status therefore depends entirely on workers being Agent-tool subagents of the parent session.** That is an assumption the whole isolation model rests on, so state it rather than leaving it implicit: if any part of the run spawns a *separate* `claude` process against a worktree — a nested launch, a terminal opened there by hand, a script that shells out to the CLI — that process is outside the guard and the isolation invariant has no backstop under it for the whole of its life.
+- **The matcher is the other half of the scope, and it is no longer `Bash`-only.** The guard now carries path-based rules, so the matcher must route the file-writing tools as well: `Bash|Edit|Write|NotebookEdit|MultiEdit`, exactly as in the template below. **`MultiEdit` is the one that gets dropped** — the guard's `FILE_TOOLS` is `{Edit, Write, NotebookEdit, MultiEdit}`, so a matcher missing it leaves the widest file-writing tool unhooked. Verified against the live hook: an `Edit`/`Write`/`MultiEdit` payload with `file_path` on a ledger file, and a `NotebookEdit` with `notebook_path` on one, all exit 2; the same tools on an ordinary source path exit 0. What the file-tool path covers is **only the ledger** (`state.json`, `goals.json`, `manifest.json`, `history.csv`, `freeze-log.jsonl`, `escalations.jsonl`, `ESCALATIONS.md`) — a frozen acceptance test edited by `Edit` still passes the hook, and enforcement against *that* remains post-hoc via `verify` and `check-branch`. `Read` is not routed and never blocked.
+
+## What the guard actually blocks — the probed enumeration
+
+`SKILL.md` gives the three-family summary; this is the list, and every line below was re-probed against the shipped `hooks/git-guard.py` by feeding it a `PreToolUse` payload (`{"tool_name","cwd","tool_input"}`) from inside a real throwaway repo. **`cwd` matters** — the guard `chdir`s to the payload's `cwd` before asking git anything, so a probe run from the wrong directory classifies operands wrongly. Exit 2 = blocked, exit 0 = allowed.
+
+**Blocked, git verbs.** `git stash` (push/save/pop/apply/drop/clear/branch/store, and bare; `list`/`show`/`create` are allowed) · `reset --hard`/`--merge`/`--keep` · `checkout -- <path>` · `checkout .` · `checkout <tree-ish> <path>` · `checkout <one operand git will not resolve as a ref that exists on disk>` and the shapes no refname can take (`:/`, `src/`, a glob) · `checkout --pathspec-from-file` · `checkout -f/--force` · `switch -f`/`--discard-changes` · `restore <path>` (anything not `--staged`-only) · `clean` with `-f/-d/-x` unless `--dry-run`/`-n` · `checkout-index -f/-a` · `read-tree -u` · `apply -R` · `git rm` over a repo-wide pathspec (`.`, `:/`, a bare glob) · `push --force` (**not** `--force-with-lease`) · `update-ref` · `reflog expire|delete` · `gc --prune=<not never>` · `prune` · `repack -ad` · `filter-branch` · `symbolic-ref <ref> <target>` · `submodule deinit -f` · `sparse-checkout set|add|init|reapply|disable`.
+
+**Conflict-stage selection is BLOCKED, and this is the one that surprises people.** `git checkout --ours <file>`, `--theirs <file>`, `-2 <file>` and `-3 <file>` all exit 2: `check_checkout` has no conflict-stage case, the flags strip as options, and the file operand arrives as a lone non-ref pathspec. `--ours -- <file>` exits 2 on the `--` rule and `--ours .` on the `checkout .` rule. The working substitute is `git show :2:<file> > <file>` (ours) / `:3:` (theirs) then `git add` — both exit 0, verified end-to-end on a `UU` file. `references/merge-protocol.md` step 5 carries the full note.
+
+**Worktrees.** `worktree add`, `list` and `prune` are allowed. **Plain `git worktree remove <path>` is ALLOWED** (exit 0) — it is the sanctioned teardown, and the guard's own block message points at it. `worktree remove --force` / `-f` (exit 2) and `worktree move` (exit 2) are blocked.
+
+**Blocked, no git verb — paths.** `rm -r` whose target is the repo root, a worktree root, any directory *containing* a worktree root, `/`, or `$HOME` — including the collapsed form, so `rm -rf "$WT_ROOT/$ID"` with `$ID` unset is blocked (exit 2) because it reduces to the worktree parent. Any `rm` (recursive or not) or `mv` of a path under `.swarm-loop/`. `find <path under .swarm-loop> … -delete`. And in-place rewrites of the run **ledger** — `state.json`, `goals.json`, `manifest.json`, `history.csv`, `freeze-log.jsonl`, `escalations.jsonl`, `ESCALATIONS.md` — via `> `, `>>`, `truncate`, `sed -i`, `dd of=`, or `tee`. Non-Bash: an `Edit`/`Write`/`MultiEdit` `file_path` or a `NotebookEdit` `notebook_path` naming one of those seven.
+
+**Allowed, and worth knowing so you do not route around a block that is not there.** `rm -rf node_modules`, `rm -rf /tmp/scratch-$USER`, `rm -rf "$V"` with `$V` unset (the shell hands `rm` an empty string and `rm` refuses on its own) · `cat > .swarm-loop/worker-preamble.md` and any other non-ledger file under `.swarm-loop/` — the redirect rule is scoped to the seven ledger names, not the directory · `cp` and `install` onto **any** path, ledger included: neither program is in the guard's non-git table, which is the gap the freeze-log recovery in `references/goal-setting.md` deliberately walks through · `Read` of anything.
+
+**Not a set, and not exact.** Coverage is bounded by what the tokenizer can see as an argv, and the guard fails open on any parse or logic error. A heredoc body piped to a shell, `eval "$var"`, `python3 -c 'os.system("git stash")'`, a script file, and `$X stash` where `$X` does not mention git all pass through by design — widening any of them costs false blocks, and a false block wedges an unattended run. Re-probe rather than quoting this list at a version you have not checked.
+
 ## The worktree location is a permission scope
 
 Phase 4 puts each worker's worktree at `../<repo>-worktrees/<task-id>` — a **sibling of the repo, outside the project root** — because a worktree inside the repo lands inside every root-walking metric command's scan. That fixes the measurement and creates a permission problem in the same move: `git worktree add` writes there, every worker then reads, edits and commits there, and the cleanup step `rm -rf`s it. A session scoped to the project root prompts on the first of those, which under this skill's premise is not one prompt — it is **every worker in the first mutating wave hung at once**, each one eventually marked failed-hung for a reason that has nothing to do with its task.
@@ -39,7 +63,7 @@ Three rules, in order:
    git worktree add ../<repo>-worktrees/_probe -b task/_probe main
    echo probe > ../<repo>-worktrees/_probe/_probe.txt   # write
    cat ../<repo>-worktrees/_probe/_probe.txt            # read
-   rm -rf ../<repo>-worktrees/_probe && git worktree prune && git branch -D task/_probe
+   git worktree remove ../<repo>-worktrees/_probe && git branch -D task/_probe
    ```
 
    Run it through the same tool surface the workers will use, and watch for a prompt on **every** line — a grant that covers reads but not writes passes the first half and hangs the wave on the second. If any line prompts, the grant is wrong; fix it and re-probe. A probe that prompts costs one click now.
@@ -67,7 +91,7 @@ One JSON document, permissions and git-guard together. JSON has no comments, so 
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "Bash|Edit|Write|NotebookEdit|MultiEdit",
         "hooks": [
           {
             "type": "command",

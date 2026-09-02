@@ -46,6 +46,16 @@ background. Read it; never edit it.
 ## Where you work
 - Worktree (absolute path): <path>   — do all work here
 - Branch: task/<task-id>             — already created and checked out
+- Branch point: <sha>                — the commit your worktree was cut from
+
+  The shared, orchestrator-owned documents in your worktree — decisions.md,
+  public-surface.md, backlog.md, learnings.md, the codebase map — are a
+  SNAPSHOT taken at <sha>. The orchestrator keeps correcting those same files
+  on `main` while you work. So a discrepancy you find in one of them may
+  ALREADY BE FIXED on `main`: report it under SHARED-DOC-OBSERVATIONS as an
+  observation, not a defect under BUGS-OBSERVED, and do not work around it and
+  do not "fix" it. Your own source files are not affected by this — only the
+  shared documents.
 
 ## Files you own (create/modify freely)
 - <path/one>
@@ -100,8 +110,10 @@ permission to change its own route has misread this packet.
   swarm you are never alone in that tree, so it clobbers EVERY parallel agent's
   in-progress edits at once, not just yours (`refs/stash` is one ref shared by
   every worktree; a `stash`+`pop` observed live swapped two agents' trees mid-wave
-  and nearly lost one's work, recoverable only from a dangling stash commit before
-  `git gc`). To
+  and nearly lost one's work — recoverable only from a dangling stash commit, and
+  only until garbage collection reaps it. Treat that window as ZERO: that recovery
+  is a lucky outcome someone noticed in time, never a mechanism you may rely on,
+  and nothing in this loop guarantees the dangling commit survives). To
   compare your change against the committed baseline, use the READ-ONLY forms
   instead: `git show HEAD:<file>` for the baseline contents, or
   `git diff HEAD -- <file>` for your diff — neither touches the tree. If you truly
@@ -112,6 +124,15 @@ permission to change its own route has misread this packet.
   tree from a commit or the index, and it blocks them no matter how narrow the
   pathspec looks: `git restore <one file>` and `git checkout HEAD -- <one file>`
   are refused exactly like `git checkout .`. It does NOT block READING from git.
+  **The guard's surface is WIDER than the list above, so do not read that list as
+  the complete set of things that will be refused.** Also blocked, and blocked for
+  the same reason: bare `git stash` and `git stash branch`; `git worktree remove --force`
+  and `git worktree move` (discarding or relocating a tree another agent may be
+  working in — plain `git worktree remove` without `--force` IS allowed, and is
+  the orchestrator's sanctioned teardown, but it is not yours to run); a repo-wide `git rm`; `git apply -R`; `git read-tree -u`; and
+  `git checkout-index -f`/`-a`. If a git command you did not expect comes back
+  refused, the guard is working and the answer is a read-only form or a report —
+  never a re-spelling that gets the same effect past it.
   So there is exactly one worker-side restore, and it is the redirect form:
 
       git show HEAD:<file> > <file>       # ALLOW (verified) — restores ONE path
@@ -206,6 +227,12 @@ BUGS-OBSERVED: <every defect you noticed ANYWHERE while working — in your
   in this branch (in-ownership drive-by fixes only, committed separately).
   Per item: file:line (or a reproduction), the evidence you saw, suspected
   cause if you have one. Write "none" if none.>
+SHARED-DOC-OBSERVATIONS: <anything in an orchestrator-owned SHARED document
+  that looks wrong or stale — decisions.md, public-surface.md, backlog.md,
+  learnings.md, the codebase map. These go here and NOT in BUGS-OBSERVED,
+  because your copy is a snapshot at your branch point and the orchestrator may
+  already have fixed it on `main`. Quote the line and say what you expected.
+  Write "none" if none.>
 CONCERNS: <anything smelling wrong, including tests you believe are incorrect.
   For a FROZEN acceptance test you believe is wrong, make the objection
   actionable or it dies in this report instead of reaching the human who can
@@ -221,9 +248,21 @@ CONCERNS: <anything smelling wrong, including tests you believe are incorrect.
 ## Orchestrator-side notes
 
 - **Waves are emergent batches, not planned rounds.** The readiness scheduler decides membership: a ticket dispatches the moment its `depends_on` are closed, its blast radius overlaps no in-flight writer, and merge-review bandwidth allows. When several tickets become ready in the same turn, spawn them with parallel Task tool calls in that turn so they actually run concurrently — but never hold a ready ticket back to round out a batch, and never wait for a whole batch to land before dispatching the next ready ticket.
+- **Record every non-ticket agent with `swarmloop.py dispatch` — it is the only way `resume` and `check-wave` can see it.** `resume` reconstructs in-flight work from `git worktree list` + `git branch`, so a ticket worker in its own worktree is recoverable and **every agent doing orchestrator-owned work without a worktree is invisible**: resume reports "nothing in flight" for that whole class, and a resumed orchestrator re-dispatches it, putting two agents on the same file. Reproduced live — a compacted orchestrator found a running subagent it could not identify and had to interrogate it. So, in the same turn you spawn a recon agent, a doc regenerator, a wave verifier or an auditor:
+
+  ```bash
+  swarmloop.py dispatch --agent <how you refer to it> --kind recon|regen|verifier|audit|ticket|other \
+                        --subject "<ticket id, document, or task>" \
+                        --files "path/a.md,path/b.py"        # what it owns — comma-separated
+  swarmloop.py dispatch --list                                # every dispatch never closed, oldest first
+  swarmloop.py dispatch --close <agent ref> [--note "..."]    # when you collect it
+  ```
+
+  The file is append-only (`.swarm-loop/dispatch.jsonl` — verified against `DISPATCH_FILE` in the shipped script); nothing else in the run is changed by writing to it. `--agent`, `--kind` and `--subject` are all required unless you passed `--list` or `--close`. **`--files` is the load-bearing one:** `check-wave` intersects a candidate wave's ownership not only against in-flight *worktrees* but against these records, which is the only protection a ticket worker has against colliding with an orchestrator-owned agent. A dispatch recorded without `--files` still shows up in `--list` but contributes nothing to the wave check. Closing an agent-ref that is not open is recorded anyway with a warning rather than refused. `resume` reads the same open records, so a recorded agent survives a compaction. Run `dispatch --list` at every `resume` and at the top of every wave; a stale open record is a five-second close, and a missing one is two agents on one file.
 - **Model/effort scaling.** Straightforward, well-bounded tasks can go to a faster model if the environment supports per-subagent model selection; keep the default model for anything with design judgment in it. Matching effort to task difficulty is the main cost lever in a swarm.
 - **The report is a claim.** Phase 5 checks it against the diff and Phase 7 checks it against the metrics. Treat `DECISIONS`, `NEEDS`, and `BUGS-OBSERVED` as the valuable part — they feed the codebase map, the ticket backlog, and the scheduler's next dispatch decisions.
 - **A worker's frozen-test objection is yours to carry, not to file away.** The worker's wall has exactly one door in it and you are it. When a report's CONCERNS names a frozen acceptance test as *wrong* with the four-part evidence — not merely hard — you neither edit it nor bury it: `swarmloop.py escalate --kind frozen-test --subject <test path> --reason "<the worker's evidence>" --proposed "<the change being asked for>" --cycle <N>`, then keep dispatching everything the disputed test does not judge. Judge the evidence before forwarding it: "this test is hard" is the job, and passing that up as an escalation trains the one human in the loop to stop reading escalations. Until the user amends it, the test stands — the retry packet carries it as an unchanged constraint, and the worker's branch still may not touch it. Reply to the worker's objection in the retry packet either way, so the same objection is not re-litigated from scratch by the next agent.
+- **Every SHARED-DOC-OBSERVATION gets a `main`-side check before it becomes an action.** A long-running worker's copy of every orchestrator-owned document is pinned at its branch point while you keep correcting those documents mid-wave, so its findings are *time-shifted*, not wrong. Observed: both `T-010` and `T-011` reported that `public-surface.md` still said "the five trust dimensions" **after** an amendment had made it six and `main` already read six. Cheap per item, but it is a per-finding tax and a false alarm is one careless step from a re-fix of something already fixed — or from telling the next wave something false. Read the line on `main` first; then either answer the worker in its retry packet or fix `main` once. The separate report field exists so the whole class triages in one pass instead of one finding at a time.
 - **Inject learnings selectively.** Only entries relevant to the task's area; a packet stuffed with every lesson ever learned buries the two that matter.
 - **State the CURRENT baseline, never a remembered one.** Every packet carries the suite's pass count as measured at dispatch time, plus the line "other agents are in flight; prove any failure is yours by reverting YOUR file and re-running." A remembered number goes stale within minutes of other branches landing, and the worker then burns effort explaining a discrepancy that is just drift — the revert-and-rerun check is the one that matters anyway.
 - **Consolidation/dedup packets are non-additive — state done as "the old pattern no longer exists."** Write the done-condition as e.g. "grep shows zero inline occurrences in these files" or "every new accessor has ≥1 caller outside its module", never "the new abstraction exists". Additive-only does NOT apply to these tasks and the packet must say so explicitly — the payoff of a consolidation IS editing the call sites, and a worker given the additive-only default once shipped six accessors with zero callers, leaving more duplication than before with every metric green. At collection, grep for callers of anything the refactor added; an addition with zero callers means the wiring half was skipped.
