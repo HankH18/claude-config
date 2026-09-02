@@ -35,12 +35,25 @@ Design:
     this path belong to?". If git cannot answer — no binary, not a repository,
     timeout — the answer is ALLOW, with ONE exception documented under
     FAIL-OPEN below.
+  - Only THIS RUN's trees are protected. A repository the operand happens to
+    sit near — a throwaway clone, a submodule, a vendored dependency, a pytest
+    scratch dir holding a fixture repo — is not the run's and stays deletable.
+    A tree belongs to the run if it is the tree the command is running in (or a
+    worktree of it), or if it carries `.swarm-loop`. Widening resolution
+    without this scoping made every git repository on the machine undeletable,
+    which is a false block, not caution.
   - Git is asked FROM THE OPERAND, not from this process's cwd. A path names
     the thing it is about, so `git -C <that path>` is what gets asked. Asking
     from the process cwd is what made a cwd outside any repository disarm every
     path rule at once: `rm -rf <repo>` was exit 2 from the repo and exit 0 from
     one directory up. The command's own directory is tracked too — the payload's
     `cwd`, then any `git -C <path>` global, then any `cd <path>` segment.
+    A `cd` is followed only where bash's CURRENT shell would keep it: at paren
+    depth 0, not in a pipeline stage or `$( … )`, and only while nothing
+    conditional has run on the line yet — `cd <wt> && <cmd>` yes,
+    `( cd x )`, `X=$(cd x && pwd)`, `[ -d x ] && cd x` and
+    `if false; then cd x; fi` no. `cd -` swaps back, as it does in bash;
+    ignoring it left the guard pointing at a directory bash had already left.
   - Blocks ONLY positively-identified destructive repo-global ops. Everything
     else — including all normal loop/auditor git — is allowed. Getting an
     allow-case wrong (breaking `git commit`, or blocking a task packet that
@@ -86,7 +99,16 @@ found the guard had no path awareness at all):
     <worktree-root>/` and takes every live worktree's uncommitted work — and
     the VARIABLE-ROOT/LITERAL-TAIL form beside it, `rm -rf "$WT/T-010"`, which
     collapses to a harmless-looking `/T-010` and so walked past the rule above
-    while naming a live worktree out loud
+    while naming a live worktree out loud. NOTE the residual limit: an operand
+    with a variable root has no path to resolve FROM, so this one rule is still
+    answered from the effective directory — it fires from the repo or the
+    worktrees parent and not from an unrelated directory
+  rm -r of `<repo>/.git` or `<worktree>/.git` — the admin directory is not
+    "under" the root by the ancestor test, and deleting it detaches every
+    linked worktree and takes all refs, history and the reflog
+  rm -r of `$PWD` / `${PWD}` / `$OLDPWD` / `$HOME` / `"$(pwd)"` when that
+    expands to a protected tree: these are the variables whose value the guard
+    is actually tracking, and the lone-variable exemption used to swallow them
   rm / mv of anything under `.swarm-loop/` (the run's frozen goals, acceptance
     suite, manifest and history — deleting it destroys the DETECTOR, not just
     the data), and `find <under .swarm-loop> ... -delete`
@@ -121,6 +143,10 @@ argv, and widening it would cost false blocks, which are worse):
     `python3 -c 'os.system("git stash")'`, a destructive op inside a script file.
   - a program named by a variable that does not mention git (`$X stash` where
     `X=git`); `$GIT`-style names are caught, the rest would cost false blocks.
+  - `rm -rf $(pwd)` UNQUOTED. Bare `(`/`)` are tokenizer punctuation, so it
+    splits into an `rm -rf $` segment and a separate `pwd` command and the
+    operand never exists as a string. The quoted `"$(pwd)"` survives as one
+    token and IS covered.
   - the INTERIOR of a `$(...)` or backtick substitution that sits after a `cd`
     on the same line. A plain `cd <path> && ...` IS honoured now, and so is
     `git -C <path> ...`; but substitution bodies are scanned off the RAW string
@@ -725,6 +751,9 @@ try:
 except Exception:                      # cwd deleted out from under the process
     _CWD = os.sep
 
+# bash's OLDPWD, tracked so `cd -` means what it means to bash.
+_CWD_PREV: str | None = None
+
 
 def _init_cwd() -> None:
     global _CWD
@@ -740,6 +769,7 @@ def _set_cwd(d: str | None) -> str:
     NOTHING — an unresolvable `cd` must never become a block of its own.
     Returns the previous value so the caller can restore it."""
     global _CWD
+    global _CWD_PREV
     prev = _CWD
     if d:
         try:
@@ -754,6 +784,23 @@ def _set_cwd(d: str | None) -> str:
 def _restore_cwd(prev: str) -> None:
     global _CWD
     _CWD = prev
+
+
+def _apply_cd(target: str) -> None:
+    """`cd <dir>` / `cd -` / bare `cd`, with bash's own OLDPWD swap. `cd -` was
+    ignored, which left `_CWD` pointing at the directory bash had already left:
+    `cd /tmp && cd - >/dev/null; rm -rf T-010` deleted a live worktree at
+    exit 0."""
+    global _CWD, _CWD_PREV
+    if target == "-":
+        if _CWD_PREV and os.path.isdir(_CWD_PREV):
+            _CWD, _CWD_PREV = _CWD_PREV, _CWD
+        return
+    if target == "":
+        target = os.path.expanduser("~")
+    prev = _set_cwd(target)
+    if prev != _CWD:
+        _CWD_PREV = prev
 
 
 def _git_at(d: str | None, args: list[str]):
@@ -1132,6 +1179,13 @@ def check_fetch(rest: list[str]) -> str | None:
         d = d.strip()
         if not d or d.startswith("refs/remotes/") or d.startswith("refs/tags/"):
             continue
+        # Only an EXISTING local branch can be overwritten. `+…:pr-7` creating a
+        # new branch is the documented GitHub PR-fetch idiom and destroys
+        # nothing; unanswerable (no git, not a repo) -> allow, as everywhere else.
+        full = d if d.startswith("refs/") else "refs/heads/" + d
+        q = _git_at(_CWD, ["rev-parse", "--verify", "--quiet", full])
+        if q is None or q.returncode != 0:
+            continue
         return ("`git fetch <remote> +<src>:" + d + "` force-updates the LOCAL ref "
                 "`" + d + "`, discarding whatever it pointed at.\n" + 'If the branch really must move, delete and re-create it explicitly (`git branch -D <b>` is allowed) so the move is a deliberate two-step, not a flag.')
     return None
@@ -1348,6 +1402,14 @@ def _nearest_existing_dir(ap: str | None) -> str | None:
     for _ in range(MAX_ANCESTOR_WALK):
         try:
             if os.path.isdir(d):
+                # A `.git` DIRECTORY is the admin dir, not a working tree:
+                # asking git from inside it answers about itself and
+                # `--show-toplevel` fails outright, so `rm -rf <repo>/.git`
+                # resolved to nothing at all. Step up to the tree it belongs to.
+                if os.path.basename(d) == ".git":
+                    up = os.path.dirname(d)
+                    if up and up != d and os.path.isdir(up):
+                        return up
                 return d
         except Exception:
             return None
@@ -1356,6 +1418,38 @@ def _nearest_existing_dir(ap: str | None) -> str | None:
             return None
         d = nd
     return None
+
+
+def _is_linked_worktree(d: str) -> bool:
+    """Is `d` a LINKED WORKTREE, as opposed to a submodule?
+
+    Both have a `.git` FILE, which is what the first cut of this keyed on — and
+    a submodule is by far the commoner of the two, so `rm -rf vendor` in any
+    monorepo became a false block, reported as "that is the repository root".
+    They are told apart by where the file points: git puts a linked worktree's
+    admin dir under `.git/worktrees/<name>` and a submodule's under
+    `.git/modules/<path>`. Read, not shelled — this runs inside a directory
+    scan.
+
+    HONEST ACCOUNTING: this is no longer what prevents that false block —
+    `_is_this_run` does, and reverting this alone leaves the suite green. What
+    it still buys is COST: it keeps `_ctx_at` from shelling git at every
+    submodule it walks past. Measured on `rm -rf <dir with 8 submodules>`:
+    136 ms with it, 223 ms without. Kept for that, and because the distinction
+    is the one this file got wrong once."""
+    gitfile = os.path.join(d, ".git")
+    try:
+        if not os.path.isfile(gitfile):
+            return False
+        with open(gitfile, "r", errors="replace") as fh:
+            head = fh.read(4096)
+    except Exception:
+        return False
+    for line in head.splitlines():
+        if line.startswith("gitdir:"):
+            target = line[len("gitdir:"):].strip().replace(os.sep, "/")
+            return "/worktrees/" in target or target.endswith("/worktrees")
+    return False
 
 
 def _linked_worktrees_under(d: str | None) -> list[str]:
@@ -1397,7 +1491,7 @@ def _linked_worktrees_under(d: str | None) -> list[str]:
             continue
         for child in entries:
             try:
-                if os.path.isfile(os.path.join(child, ".git")):
+                if _is_linked_worktree(child):
                     found.append(child)
                     if len(found) >= MAX_CHILD_PROBES:
                         break
@@ -1406,6 +1500,45 @@ def _linked_worktrees_under(d: str | None) -> list[str]:
                 pass
             frontier.append((child, depth + 1))
     return found
+
+
+def _session_family() -> set:
+    """Every tree of the repository the command is actually running in."""
+    r, w, _d = _ctx_at(_CWD)
+    fam = set(w)
+    if r:
+        fam.add(r)
+    return fam
+
+
+def _is_this_run(root: str | None, wts: list) -> bool:
+    """Does this git context belong to THE RUN, or is it just some repository
+    that happens to sit near the operand?
+
+    The guard is SESSION-scoped — one `<repo>/.claude/settings.local.json`
+    registers it for one run — and protecting every repository on the machine
+    is not caution, it is a false block: a worker cleaning up a throwaway
+    clone, a vendored dependency, or its own pytest scratch dir (which may well
+    contain a fixture repo AND a worktree — this suite's does) got exit 2.
+
+    Two independent ways to belong, so neither has to be assumed:
+      - the tree the command is running in, or any worktree of it;
+      - a tree carrying `.swarm-loop`, which is the run's own state directory.
+    Before `init` creates that directory there is nothing to protect yet, and
+    the session family still covers the repo and its worktrees."""
+    trees = list(wts) + ([root] if root else [])
+    if not trees:
+        return False
+    fam = _session_family()
+    for t in trees:
+        if t in fam:
+            return True
+        try:
+            if os.path.isdir(os.path.join(t, SWARM_DIR)):
+                return True
+        except Exception:
+            pass
+    return False
 
 
 def _resolve(ap: str | None, scan_below: bool = False) -> tuple:
@@ -1431,6 +1564,8 @@ def _resolve(ap: str | None, scan_below: bool = False) -> tuple:
         r, w, det = _ctx_at(d)
         if not det:
             determined = False
+        if d != _CWD and not _is_this_run(r, w):
+            continue          # some other repository, not this run's — not ours
         if r and r not in roots:
             roots.append(r)
         for x in w:
@@ -1499,7 +1634,7 @@ def in_swarm_tree(op: str) -> bool:
     """Is this operand inside (or exactly) some `<repo-root>/.swarm-loop`?
     The `SWARM_DIR in op` prefilter keeps the git queries off the hot path: no
     ordinary command mentions the directory at all."""
-    if SWARM_DIR not in op:
+    if SWARM_DIR not in op and SWARM_DIR not in _CWD:
         return False
     ap = abs_path(op)
     if not ap:
@@ -1508,7 +1643,11 @@ def in_swarm_tree(op: str) -> bool:
 
 
 def is_ledger(op: str) -> bool:
-    if SWARM_DIR not in op:
+    # The prefilter has to consider the effective DIRECTORY as well as the
+    # operand text: `cd .swarm-loop && rm -f state.json` names the ledger
+    # without the operand containing `.swarm-loop` at all. Still off the hot
+    # path — an ordinary command mentions the directory in neither place.
+    if SWARM_DIR not in op and SWARM_DIR not in _CWD:
         return False
     ap = abs_path(op)
     if not ap:
@@ -1549,6 +1688,11 @@ def critical_dir_reason(op: str) -> str | None:
         if _under(wt, ap):
             return ("that directory CONTAINS live worktrees — every one of them, and "
                     "all their uncommitted work, goes with it")
+    for t in roots + wts:
+        if ap == os.path.join(t, ".git"):
+            return ("that is `" + t + "/.git` — the repository itself. Deleting it "
+                    "detaches every linked worktree and takes all refs, history and "
+                    "the reflog with it")
     return None
 
 
@@ -1783,6 +1927,26 @@ UNDETERMINED_HINT = (
 )
 
 
+def expand_known_vars(op: str) -> str | None:
+    """`$PWD`, `$OLDPWD`, `$HOME` and `$(pwd)`/`` `pwd` `` — the expansions the
+    guard can actually perform, because it is tracking the value.
+
+    `collapse_unexpanded` empties every `$…` it cannot evaluate, so a lone
+    `"$V"` becomes `''` and is skipped — correct for an unknown variable, since
+    `rm` refuses an empty operand. But `rm -rf $PWD` in a worktree root is not
+    unknown, and it was exit 0. Returns None when nothing was substituted."""
+    home = os.path.expanduser("~")
+    pairs = [("$PWD", _CWD), ("${PWD}", _CWD), ("$(pwd)", _CWD), ("`pwd`", _CWD),
+             ("$HOME", home), ("${HOME}", home)]
+    if _CWD_PREV:
+        pairs += [("$OLDPWD", _CWD_PREV), ("${OLDPWD}", _CWD_PREV)]
+    out = op
+    for name, val in pairs:
+        if name in out and val:
+            out = out.replace(name, val)
+    return out if out != op else None
+
+
 def check_rm_paths(args: list[str]) -> str | None:
     """Non-git `rm`. This is the rule the guard was missing entirely."""
     recursive = long_opt_abbrev(args, "--recursive") or short_cluster_has(args, "rRd")
@@ -1796,7 +1960,13 @@ def check_rm_paths(args: list[str]) -> str | None:
         why = rm_target_reason(op)
         if why:
             return "`rm -r " + op + "` — " + why + ".\n" + RM_HINT
-        if "$" in op:
+        if "$" in op or "`" in op:
+            known = expand_known_vars(op)
+            if known is not None:
+                why = rm_target_reason(known)
+                if why:
+                    return ("`rm -r " + op + "` — that expands to `" + known
+                            + "`, and " + why + ".\n" + RM_HINT)
             collapsed = collapse_unexpanded(op)
             if collapsed:
                 why = rm_target_reason(collapsed)
@@ -2176,7 +2346,9 @@ def cd_target(seg: list[str]) -> str | None:
     i = program_index(seg)
     if i >= len(seg) or base_name(seg[i]) != "cd":
         return None
-    ops = [a for a in seg[i + 1:] if not a.startswith("-")]
+    ops = [a for a in seg[i + 1:] if a == "-" or not a.startswith("-")]
+    if not ops:
+        return ""              # bare `cd` is `cd $HOME`
     return ops[0] if len(ops) == 1 else None
 
 
@@ -2215,28 +2387,54 @@ def _scan_command(command: str, depth: int) -> None:
                 scan_command(inner, depth + 1)
 
     cur: list[str] = []
+    pdepth = 0        # `( … )` and `$( … )` nesting: a subshell's cd dies with it
+    leading = True    # still at the head of this line, i.e. nothing conditional yet
     for k, tok in enumerate(toks):
         if is_operator(tok):
             if cur:
-                _scan_segment(cur, depth)
+                if not _scan_segment(cur, depth, cd_applies(pdepth, leading, cur)):
+                    leading = False
                 cur = []
             # AFTER flushing, so a `cd` on this line is already in effect.
             if tok in REDIRECT_OPS and k + 1 < len(toks):
                 check_redirect_target(toks[k + 1])
+            pdepth += tok.count("(") - tok.count(")")
+            if ";" in tok or "\n" in tok:
+                leading = True          # a new line starts unconditionally again
             continue
         cur.append(tok)
     if cur:
-        _scan_segment(cur, depth)
+        _scan_segment(cur, depth, cd_applies(pdepth, leading, cur))
 
 
-def _scan_segment(seg: list[str], depth: int) -> None:
+def cd_applies(pdepth: int, leading: bool, seg: list[str]) -> bool:
+    """Would bash's CURRENT shell keep this `cd`?
+
+    Two ways it would not, and the first cut of this honoured neither:
+      - inside `( … )`, a pipeline stage, or `$( … )` — all subshells, whose cd
+        dies with them. `X=$(cd "$d" && pwd)` is an everyday idiom and it was
+        being applied to the whole rest of the line.
+      - after any command that is not itself a `cd`, because whether the cd ran
+        at all then depends on that command's exit status or on a branch this
+        guard cannot evaluate: `[ -d x ] && cd x`, `if false; then cd x; fi`.
+    `cd <path> && <cmd>` — the shape that has to work — is a leading `cd` at
+    paren depth 0, so it still applies. Everything skipped here merely returns
+    to the older behaviour of not following the cd, which costs a block, not a
+    false block."""
+    if seg and seg[0] in KEYWORDS:
+        return False          # `then`/`do`/`else`/`{` — a branch that may not run
+    return pdepth == 0 and leading
+
+
+def _scan_segment(seg: list[str], depth: int, allow_cd: bool = True) -> None:
     """One simple command. Split out of the token walk so redirect targets and
     simple commands can be interleaved in source order — see
     `check_redirect_target`."""
     target = cd_target(seg)
     if target is not None:
-        _set_cwd(target)
-        return
+        if allow_cd:
+            _apply_cd(target)
+        return True          # a `cd` does not end the line's leading run
     git_args = git_args_of(seg)
     if git_args is None:
         git_args = var_git_args(seg)
@@ -2244,16 +2442,17 @@ def _scan_segment(seg: list[str], depth: int) -> None:
         reason = evaluate_git(git_args, depth)
         if reason:
             block(reason)
-        return
+        return False
     reason = non_git_reason(seg)
     if reason:
         block(reason)
     if depth >= MAX_SHELL_DEPTH:
-        return
+        return False
     payload = shell_payload(seg) or eval_payload(seg)
     if not payload:
-        return
+        return False
     scan_command(payload, depth + 1)
+    return False
 
 
 
