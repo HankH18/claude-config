@@ -85,6 +85,10 @@ ANALYSIS_DIR = "analysis"
 HISTORY_HEADER = ["cycle", "metric_id", "value", "error", "timestamp", "source"]
 
 SLOPE_EPS = 1e-9  # below this magnitude, treat the error trend as flat
+# Relative floor under which a change in a metric's error is float noise rather
+# than progress. Scaled by the previous error so a metric measured in millions
+# and one measured in percent get the same treatment.
+PROGRESS_EPS = 1e-9
 
 # D3: the two protected paths that are NOT negotiable. goals.json holds every
 # target; .swarm-loop/acceptance holds the tests that grade them. `init
@@ -499,6 +503,13 @@ def cmd_init(args):
         "push_remote": args.push_remote,
         "stall_limit": args.stall_limit,
         "stall_count": 0,
+        # The second stall counter, on the question the run is actually for.
+        # Defaults to the same limit; both feed the same kill switch, and they
+        # are separate because they measure different things — the codebase one
+        # cannot see a pinned metric, and this one cannot see a dead loop that
+        # still measures.
+        "goal_stall_limit": args.goal_stall_limit or args.stall_limit,
+        "goal_stall_count": 0,
         "head_history": [],
         "worktree_root": wt_root,
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -546,7 +557,9 @@ def cmd_init(args):
     print(f"  max cycles   : {state['max_cycles']}")
     print(f"  autonomy     : {state['autonomy']}")
     print(f"  push remote  : {state['push_remote']}")
-    print(f"  stall limit  : {state['stall_limit']} unchanged cycles")
+    print(f"  stall limit  : {state['stall_limit']} cycles with an unchanged codebase")
+    print(f"  goal stall   : {state['goal_stall_limit']} measured cycles with no improvement "
+          "in any graded metric")
     print(f"  audit loops  : {state['audit_loops']} after the build converges")
     print("  protected    : " + ", ".join(state["protected_paths"]))
     print(f"next: define metrics in {STATE_DIR}/{GOALS_FILE} and acceptance tests in {STATE_DIR}/acceptance/, then run 'freeze'")
@@ -2271,6 +2284,51 @@ def _metric_config_hits(root, changed):
     return hits
 
 
+def _lane_commits(root, base, branch):
+    """Commit COUNTS across the base/branch fork. -> dict, or None if git cannot answer.
+
+    {"ahead": commits on branch not on base, "behind": commits on base since the
+     fork, "fork": the merge-base sha, "base_files": files base changed since it}
+
+    Every question the harness asked about a branch was ancestry-shaped -- "is it
+    merged", "does it merge clean" -- and ancestry cannot count. A branch with
+    ZERO commits is an ancestor of base, merges clean, and reads MERGED, so a
+    lane that was provisioned and never dispatched is indistinguishable from one
+    that delivered. The reciprocal question was asked nowhere: `git merge-tree`
+    is clean against a base the worker forked from 27 commits ago, because
+    textual mergeability is unaffected by a stale base.
+
+    None -- never 0 -- when git cannot answer (an unborn base, a branch that is
+    gone). A count of zero is a finding; "unknown" must never be reported as one,
+    and must never veto.
+    """
+    fork = _git(root, "merge-base", base, branch)
+    if fork.returncode != 0:
+        return None
+    fork_sha = (fork.stdout or "").strip()
+    if not fork_sha:
+        return None
+    ahead = _git(root, "rev-list", "--count", "%s..%s" % (base, branch))
+    behind = _git(root, "rev-list", "--count", "%s..%s" % (fork_sha, base))
+    if ahead.returncode != 0 or behind.returncode != 0:
+        return None
+    try:
+        n_ahead = int((ahead.stdout or "").strip())
+        n_behind = int((behind.stdout or "").strip())
+    except ValueError:
+        return None
+    files = []
+    if n_behind:
+        # --no-renames and -z for the reasons the protected-path diff spells out:
+        # rename detection hides a move's source, and a non-ASCII path comes back
+        # \-escaped and quoted without -z, matching no prefix it actually lives under.
+        out = _git(root, "diff", "--no-renames", "--name-only", "-z",
+                   "%s..%s" % (fork_sha, base), "--")
+        if out.returncode == 0:
+            files = [p for p in (out.stdout or "").split("\0") if p.strip()]
+    return {"ahead": n_ahead, "behind": n_behind, "fork": fork_sha, "base_files": files}
+
+
 def cmd_check_branch(args):
     root = repo_root()
     d = sd(root)
@@ -2310,8 +2368,11 @@ def cmd_check_branch(args):
             swarm_hits.append(path)
 
     config_hits = _metric_config_hits(root, changed)
+    lane = _lane_commits(root, base, args.branch)
 
     print(f"branch {args.branch} vs {base}: {len(changed)} changed file(s)"
+          + ("" if lane is None else
+             f", {lane['ahead']} commit(s) ahead / {lane['behind']} behind")
           + (f" ({len(artifacts)} tool-cache/bytecode path(s) ignored)" if artifacts else ""))
     for path in changed:
         tag = "  "
@@ -2322,6 +2383,23 @@ def cmd_check_branch(args):
         elif path in config_hits:
             tag = " ?"
         print(f" {tag} {path}")
+    # The COUNT, not the ancestry. Checked before the protected-path veto because
+    # it is the more fundamental statement: an empty branch cannot touch a
+    # protected path, and reporting it as OK is how a lane that delivered nothing
+    # got integrated as delivered work. `is None` is tested, never falsiness --
+    # a git that could not answer must not veto.
+    if lane is not None and lane["ahead"] == 0:
+        print(f"VETO: {args.branch} has NO COMMITS of its own vs {base} — "
+              f"`git rev-list --count {base}..{args.branch}` is 0.")
+        print(f"  Ancestry cannot see this: a branch with no commits IS an ancestor of "
+              f"{base}, merges clean, and reads MERGED everywhere else the harness looks.")
+        print("  Either the worker never committed — a failed or hung task: reclaim the "
+              "ticket to the backlog and re-dispatch it — or this branch already landed "
+              "and check-branch is running after the merge, in which case there is nothing "
+              "left to review. Both are refusals: merging it delivers nothing.")
+        print(f"  Tell them apart with:  git reflog {args.branch}   and   "
+              f"{STATE_DIR}/{DISPATCH_FILE}")
+        sys.exit(1)
     if protected_hits:
         print("VETO: branch modifies the frozen goal harness — do not merge; return task to backlog")
         sys.exit(1)
@@ -2337,6 +2415,30 @@ def cmd_check_branch(args):
               "changed runner target, or a wiped addopts moves the metric without moving "
               "the code. Legitimate config work is normal — record the justification in the "
               "collection notes, do not reflex-veto.")
+    # The reciprocal count. A branch is not safe to integrate merely because it
+    # merges: `git merge-tree` is clean against a base the branch forked from 27
+    # commits ago, and every test the worker ran to prove itself green ran against
+    # that vanished tree. Warn-only, with the number and the intersecting files,
+    # because a stale base is normal in a long wave and only sometimes matters.
+    if lane is not None and lane["behind"]:
+        overlap = sorted(set(lane["base_files"]) & set(changed))
+        print(f"ADVISORY (not a veto) — STALE BASE: {args.branch} forked at "
+              f"{lane['fork'][:12]}; {base} has moved {lane['behind']} commit(s) over "
+              f"{len(lane['base_files'])} file(s) since.")
+        if overlap:
+            print(f"    {len(overlap)} of those file(s) are ALSO changed on this branch:")
+            for path in overlap[:20]:
+                print(f"    ~ {path}")
+            if len(overlap) > 20:
+                print(f"    ... and {len(overlap) - 20} more")
+            print("    A clean merge does NOT clear this — textual mergeability says nothing "
+                  "about a stale base. The branch was built and self-verified against a tree "
+                  f"that no longer exists. Rebase onto {base} and re-run its verify before "
+                  "integrating, or read each overlapping file's diff on both sides.")
+        else:
+            print("    None of them intersect this branch's own changes, so the merge itself "
+                  f"is low-risk — but the branch's verify still ran against a {base} that is "
+                  f"{lane['behind']} commit(s) old.")
     print("check-branch: OK (review the file list above against the task's ownership map)")
 
 
@@ -3134,8 +3236,9 @@ def cmd_resume(args):
     # --- report
     print(f"=== swarm-loop resume report: {state['project']} ===")
     print(f"budget          : cycle {state['current_cycle']}/{state['max_cycles']} checkpointed"
-          f" · stall {state['stall_count']}/{state['stall_limit']} · autonomy {state['autonomy']}"
-          f" · push {state['push_remote']}")
+          f" · stall {state['stall_count']}/{state['stall_limit']} codebase"
+          f" · {int(state.get('goal_stall_count') or 0)}/{_goal_stall_limit(state)} goal-progress"
+          f" · autonomy {state['autonomy']} · push {state['push_remote']}")
     amendments = int(goals.get("amendments", 0))
     manifest_exists = os.path.exists(os.path.join(d, MANIFEST_FILE))
     print(f"goals           : {'frozen' if goals.get('frozen') else 'NOT FROZEN'} ({len(goals.get('metrics', []))} metrics)"
@@ -3276,7 +3379,15 @@ def cmd_resume(args):
                          "write the final report. Metrics still red? Report them as-shipped; "
                          "the budget, not the colour, ends the act"), True
     elif state["stall_count"] >= state["stall_limit"]:
-        rec, terminal = "kill switch already fired — go to Termination and write the final report", True
+        rec, terminal = ("kill switch already fired (codebase: the product tree stopped "
+                         "changing) — go to Termination and write the final report"), True
+    elif int(state.get("goal_stall_count") or 0) >= _goal_stall_limit(state):
+        rec, terminal = ("kill switch already fired (goal progress: no graded metric improved "
+                         f"for {int(state.get('goal_stall_count') or 0)} consecutive measured "
+                         f"cycles, limit {_goal_stall_limit(state)}) — the codebase kept "
+                         "changing and the goal did not, which is the stall the fingerprint "
+                         "check structurally cannot see. Go to Termination and write the final "
+                         "report, naming the pinned metric(s) and their last value"), True
     elif state["current_cycle"] >= state["max_cycles"]:
         rec, terminal = (f"cycle budget exhausted ({state['current_cycle']}/{state['max_cycles']}) "
                          "— go to Termination and write the final report"), True
@@ -3334,6 +3445,128 @@ def cmd_resume(args):
 
 # --------------------------------------------------------------- checkpoint
 
+def _goal_stall_limit(state):
+    """The goal-progress stall limit, always >= 1.
+
+    Falls back to `stall_limit` for every run initialized before this key
+    existed — the live one included — so an in-flight run picks the switch up
+    without a state migration. Floored at 1 because a limit of 0 would make a
+    fresh run (count 0) terminal on its first checkpoint."""
+    try:
+        v = int(state.get("goal_stall_limit") or 0)
+    except (TypeError, ValueError):
+        v = 0
+    if v <= 0:
+        try:
+            v = int(state.get("stall_limit") or 0)
+        except (TypeError, ValueError):
+            v = 0
+    return max(1, v)
+
+
+def _graded_progress(d, goals, cycle):
+    """Did ANY graded metric's error fall at `cycle`? -> (verdict, one-line detail)
+
+    verdict is one of:
+      "moved"    something improved, or every graded metric is already at target
+      "flat"     this cycle measured metrics and not one of them improved
+      "unknown"  this cycle measured nothing comparable — a failed `measure`, a
+                 run with no frozen goals, an unreadable history
+
+    THE defect this exists for. The stall kill switch asked
+    _codebase_fingerprint "did the code change", never "did the goal move".
+    Those are different questions and only the second is what the run is for, so
+    any loop that writes a line of product code every cycle reset the counter
+    forever: a metric pinned at one value for seven consecutive cycles sat at
+    stall 0/3 with 95 cycles of budget left. The diagnosis already existed —
+    _verdict has returned "stalled" the whole time — and was wired to a sort key
+    and a "Priority for next cycle" line, nothing that could stop anything.
+
+    Conservative in the direction of NOT killing a live run, on purpose:
+      * ANY metric improving resets the counter. A net-zero cycle where one
+        metric gained what another lost is not a stall.
+      * A metric's FIRST-EVER reading counts as movement: the run just learned
+        something it did not know.
+      * Every graded metric inside tolerance resets it. That is convergence,
+        which analyze reports as ALL TARGETS MET; it must never read as a stall.
+      * A cycle that measured nothing leaves the counter EXACTLY where it was —
+        neither bumped nor cleared. A broken metric command is a defect to fix
+        (analyze already exits 1 saying so); it may not also terminate the run.
+
+    What it does NOT catch, stated rather than papered over: a metric creeping
+    toward target by a hair every cycle registers as movement forever. That case
+    belongs to _verdict's converging_off_track projection, a different signal.
+
+    Errors are RECOMPUTED from `value` against the target in force now, never
+    read from history.csv's stored `error` column — the same rule cmd_analyze
+    follows, for the same reason (a `freeze --amend` that moved a target
+    invalidated every error written before it).
+
+    Never raises and never calls die(): a progress counter may not be the thing
+    that crashes a checkpoint. Every failure path returns "unknown".
+    """
+    metrics = (goals or {}).get("metrics") or []
+    if not metrics:
+        return "unknown", "no graded metrics — nothing to make progress against"
+    hpath = os.path.join(d, HISTORY_FILE)
+    if not os.path.exists(hpath) or os.path.getsize(hpath) == 0:
+        return "unknown", f"{STATE_DIR}/{HISTORY_FILE} is empty — nothing measured yet"
+    values = {}
+    try:
+        with open(hpath) as f:
+            reader = csv.DictReader(f)
+            if list(reader.fieldnames or [])[:5] != HISTORY_HEADER[:5]:
+                return "unknown", f"{STATE_DIR}/{HISTORY_FILE} has no usable header row"
+            for row in reader:
+                try:
+                    c = int(row["cycle"])
+                    v = float(row["value"])
+                except (TypeError, ValueError):
+                    continue
+                # Score the run AS OF `cycle`: a re-checkpoint of an earlier
+                # cycle must not read rows from a later one. Last row per cycle
+                # in FILE order wins, matching cmd_analyze's dedupe.
+                if c > cycle or not math.isfinite(v):
+                    continue
+                values.setdefault(row["metric_id"], {})[c] = v
+    except (OSError, ValueError) as e:
+        return "unknown", f"{STATE_DIR}/{HISTORY_FILE} unreadable: {e}"
+
+    improved, flat, first, at_target = [], [], [], []
+    for m in metrics:
+        try:
+            tgt, tol, direction = _target(m), _tol(m), m["direction"]
+            mid = m["id"]
+        except (KeyError, TypeError, ValueError):
+            continue                       # a malformed metric is freeze's problem
+        by_cycle = values.get(mid) or {}
+        if cycle not in by_cycle:
+            continue                       # not measured THIS cycle
+        cur = _error(by_cycle[cycle], tgt, direction)
+        if cur <= tol:
+            at_target.append(mid)
+        earlier = [c for c in by_cycle if c < cycle]
+        if not earlier:
+            first.append(mid)
+            continue
+        prev = _error(by_cycle[max(earlier)], tgt, direction)
+        if prev - cur > PROGRESS_EPS * max(1.0, abs(prev)):
+            improved.append(mid)
+        else:
+            flat.append(mid)
+
+    compared = improved + flat + first
+    if not compared:
+        return "unknown", f"no graded metric has a cycle-{cycle} measurement"
+    if improved:
+        return "moved", "error fell for " + ", ".join(sorted(improved))
+    if first:
+        return "moved", "first-ever reading for " + ", ".join(sorted(first))
+    if len(at_target) == len(compared) == len(metrics):
+        return "moved", "every graded metric is at target"
+    return "flat", "no improvement in " + ", ".join(sorted(flat))
+
+
 def _codebase_fingerprint(root):
     """sha256 over HEAD's tree with the loop's OWN state excluded.
 
@@ -3380,6 +3613,14 @@ def cmd_checkpoint(args):
             "codebase state to checkpoint. Commit the baseline (including "
             f"{STATE_DIR}/) first, then re-run 'checkpoint --cycle {args.cycle}'")
     fingerprint = _codebase_fingerprint(root)
+    # Tolerant read: checkpoint must still work on a run whose Phase 2 has not
+    # frozen any goals (the cycle-0 baseline), and the goal-stall counter is
+    # never allowed to be the thing that crashes a checkpoint.
+    try:
+        with open(os.path.join(d, GOALS_FILE)) as _gf:
+            goals = json.load(_gf)
+    except (OSError, ValueError):
+        goals = {}
 
     # Compare against the last entry for a STRICTLY EARLIER cycle, not simply the
     # last entry: re-running 'checkpoint --cycle N' is explicitly sanctioned (a
@@ -3399,6 +3640,9 @@ def cmd_checkpoint(args):
         if h_["cycle"] < args.cycle:
             prev_entry = h_
     replay = any(h_["cycle"] == args.cycle for h_ in hist)
+    # The OTHER stall, and the one this loop is actually for: the fingerprint
+    # above answers "did the code change", this answers "did the goal move".
+    goal_verdict, goal_detail = _graded_progress(d, goals, args.cycle)
 
     prev_fp = prev_entry.get("codebase") if prev_entry else None
     prev = prev_entry["head"] if prev_entry else None
@@ -3416,9 +3660,21 @@ def cmd_checkpoint(args):
         # the first checkpoint of this cycle left it: a replay is not a new cycle.
         state["head_history"] = [h_ for h_ in hist if h_["cycle"] != args.cycle] + [entry]
         state["head_history"].sort(key=lambda h_: h_["cycle"])
+        # Same rule the code stall follows: a replay is not a new cycle. The
+        # assignment is still made so the key exists in a state.json written
+        # before this counter did.
+        state["goal_stall_count"] = int(state.get("goal_stall_count") or 0)
     else:
         hist.append(entry)
         state["stall_count"] = 0 if changed else state["stall_count"] + 1
+        prior = int(state.get("goal_stall_count") or 0)
+        # "unknown" holds the count where it is — neither bumped nor cleared. A
+        # metric command that failed is a defect analyze already exits 1 over;
+        # it may not silently spend the run's stall budget, and it may not
+        # silently refund it either.
+        state["goal_stall_count"] = (0 if goal_verdict == "moved"
+                                     else prior + 1 if goal_verdict == "flat"
+                                     else prior)
     # A replay of an EARLIER cycle must not rewind the budget the loop is on.
     state["current_cycle"] = max(args.cycle, int(state.get("current_cycle", 0)))
     save_json(spath, state)
@@ -3431,7 +3687,9 @@ def cmd_checkpoint(args):
         print(f"cycle {args.cycle} was already checkpointed — entry overwritten, "
               "stall count deliberately left untouched (a replay is not a new cycle)")
     print(f"tracked files at HEAD: {tracked_files}")
-    print(f"stall count: {state['stall_count']}/{state['stall_limit']}")
+    print(f"stall count: {state['stall_count']}/{state['stall_limit']} (codebase)")
+    print(f"goal-progress stall: {state['goal_stall_count']}/{_goal_stall_limit(state)} "
+          f"({goal_verdict} — {goal_detail})")
 
     # Tripwire: a sharp drop in tracked-file count is the one signal that sees
     # an index-wipe (an emptied index turns add+commit into a full repo delete
@@ -3474,6 +3732,19 @@ def cmd_checkpoint(args):
 
     if state["stall_count"] >= state["stall_limit"]:
         print(f"KILL SWITCH: no codebase changes for {state['stall_count']} consecutive cycles — terminate the loop and report")
+        sys.exit(2)
+    _gsl = _goal_stall_limit(state)
+    if state["goal_stall_count"] >= _gsl:
+        print(f"KILL SWITCH: no graded metric has improved for {state['goal_stall_count']} "
+              f"consecutive measured cycles (limit {_gsl}) — terminate the loop and report.")
+        print(f"  latest reading: {goal_detail}")
+        print("  This is the OTHER stall. The codebase check above asks whether the code "
+              "changed; a loop that writes product code every cycle resets it forever. This "
+              "one asks whether the run is getting anywhere, which is the question the run "
+              "exists to answer.")
+        print(f"  Read {STATE_DIR}/{ANALYSIS_DIR}/cycle-{args.cycle}.md before reporting: the "
+              "per-metric verdicts and the 'Priority for next cycle' line say WHICH goal is "
+              "pinned and by how much.")
         sys.exit(2)
     if args.cycle >= state["max_cycles"]:
         print("cycle budget exhausted — this was the final cycle; terminate the loop and report")
@@ -4004,6 +4275,57 @@ def cmd_check_wave(args):
         for a, b, mods in crossing:
             print("    %s's frozen tests import %s — which %s is building in this same wave. "
                   "%s cannot be graded until %s merges." % (a, ", ".join(mods), b, a, b))
+    # Commit counts, asked BEFORE dispatch rather than after. Nothing here
+    # vetoes, deliberately: pre-dispatch, a branch with zero commits is a
+    # freshly provisioned lane, which is the normal state, and refusing it would
+    # block the loop's own provisioning step. What IS actionable here is the
+    # reciprocal question nobody asked live -- seven lanes were dispatched onto
+    # worktrees 26-27 commits behind base, and every one of them merged clean.
+    base = args.base
+    head = _git(root, "rev-parse", "--verify", "--quiet", base + "^{commit}")
+    if head.returncode != 0:
+        print(f"  fork accounting: SKIPPED — cannot resolve base ref {base!r}")
+    else:
+        fresh, existing = [], []
+        for t in wave:
+            br = "task/" + t
+            if _git(root, "rev-parse", "--verify", "--quiet",
+                    br + "^{commit}").returncode != 0:
+                fresh.append(t)
+            else:
+                existing.append((t, br, _lane_commits(root, base, br)))
+        print("  base %s @ %s" % (base, head.stdout.strip()[:12])
+              + ("  ·  %d member(s) have no branch yet and will fork from it: %s"
+                 % (len(fresh), ", ".join(fresh)) if fresh else ""))
+        for t, br, lane in existing:
+            if lane is None:
+                print(f"  {br}: git could not count commits against {base}")
+                continue
+            print("  %s: %d commit(s) ahead / %d behind %s"
+                  % (br, lane["ahead"], lane["behind"], base))
+            if lane["ahead"] == 0:
+                print("      no commits yet — an EMPTY lane. Expected for a branch that was "
+                      "provisioned and not yet dispatched; a FAILED task if it was already "
+                      "dispatched and collected. check-branch refuses it at integration, "
+                      "which is the gate that matters; this is the early warning.")
+            if lane["behind"]:
+                drift = [f for f in lane["base_files"]
+                         if any(_scope_match(p, f) for p in eff[t])]
+                print("      STALE BASE: forked at %s; %s has moved %d commit(s) over %d "
+                      "file(s) since%s" % (lane["fork"][:12], base, lane["behind"],
+                                           len(lane["base_files"]),
+                                           ", %d of them inside this ticket's own ownership:"
+                                           % len(drift) if drift
+                                           else " — none inside this ticket's ownership."))
+                for f_ in drift[:10]:
+                    print(f"      ~ {f_}")
+                if len(drift) > 10:
+                    print(f"      ... and {len(drift) - 10} more")
+                if drift:
+                    print("      Re-create this worktree from current %s before dispatching. "
+                          "Otherwise the worker builds and self-verifies against a tree that "
+                          "no longer exists, and a clean merge at collection will not reveal "
+                          "it — textual mergeability is unaffected by a stale base." % base)
     print("check-wave: OK — no two members can own the same file, and nothing in flight "
           "overlaps them")
 
@@ -5283,7 +5605,12 @@ def cmd_status(args):
                        + (" CLEAN" if state.get("clean_audit") else ""),
         "autonomy": state["autonomy"],
         "push_remote": state["push_remote"],
+        # "stall" is kept under its original name: a live run may already be
+        # reading it. The goal-progress counter is an ADDITION, never a rename.
         "stall": f"{state['stall_count']}/{state['stall_limit']}",
+        "stall_codebase": f"{state['stall_count']}/{state['stall_limit']}",
+        "stall_goal_progress": (f"{int(state.get('goal_stall_count') or 0)}"
+                                f"/{_goal_stall_limit(state)}"),
         "goals_frozen": goals.get("frozen", False),
         "goal_amendments": int(goals.get("amendments", 0)),
         "last_amended_at": goals.get("last_amended_at"),
@@ -5316,7 +5643,13 @@ def main():
     s.add_argument("--autonomy", default="approve-cycle-1",
                    choices=["approve-cycle-1", "approve-every-cycle", "fully-autonomous"])
     s.add_argument("--push-remote", default="when-clean", choices=["when-clean", "never"])
-    s.add_argument("--stall-limit", type=int, default=3)
+    s.add_argument("--stall-limit", type=int, default=3,
+                   help="consecutive cycles with an UNCHANGED codebase before the kill switch")
+    s.add_argument("--goal-stall-limit", type=int, default=None,
+                   help="consecutive MEASURED cycles in which no graded metric improved, "
+                        "before the kill switch (default: --stall-limit). The two are "
+                        "different questions: a loop that writes code every cycle never "
+                        "trips the first one")
     s.add_argument("--worktree-root", default=None,
                    help="where task worktrees are created (default: a SIBLING dir "
                         "../<repo>-worktrees, so they stay out of every root-walking metric "
@@ -5458,6 +5791,10 @@ def main():
     s = sub.add_parser("check-wave", help="refuse a wave whose members could own the same file")
     s.add_argument("tickets", nargs="+", metavar="T-0xx")
     s.add_argument("--graph", default=None, metavar="PATH")
+    s.add_argument("--base", default="main",
+                   help="ref the wave's worktrees fork from — used to count how far any "
+                        "EXISTING member branch has drifted behind it (report only, "
+                        "never a veto)")
     s.set_defaults(func=cmd_check_wave)
 
     s = sub.add_parser("red-check", help="prove each ticket's verify command FAILS before it "

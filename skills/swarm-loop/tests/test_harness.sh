@@ -2617,6 +2617,281 @@ ck_hasnt "BC: no traceback out of the tripwire" "Traceback"
 sl status
 ck_exit "BC: status is unchanged by the new optional keys" 0 "$RC"
 
+
+# ===========================================================================
+# (n) THE OTHER STALL — a run whose code changes every cycle and whose goal
+#     never moves. The fingerprint kill switch cannot see this and never
+#     could: it asks "did the code change", not "did the goal move", so any
+#     loop that writes a line of product code per cycle resets it forever.
+#     Live shape this reproduces: one metric pinned at 13.33 for seven
+#     consecutive cycles at stall 0/3 with 95 cycles of budget left.
+# ===========================================================================
+section "(n) goal-progress kill switch  [repo: gstall]"
+mk_repo gstall
+sl freeze
+ck_exit "(n) freeze the pinned harness" 0 "$RC"
+gq add -A; gq commit -qm harness
+
+# score.txt / lint.txt never move. src/app.py moves every single cycle, which
+# is exactly what keeps the codebase fingerprint "changed" forever.
+gcycle() {  # gcycle <n> — one product-changing, goal-pinning cycle
+  echo "# cycle $1 product work" >> src/app.py
+  gq add -A; gq commit -qm "cycle $1 product work"
+  sl measure --cycle "$1"
+  gq add -A; gq commit -qm "cycle $1 bookkeeping"
+  sl checkpoint --cycle "$1"
+}
+gstall_n() { jget .swarm-loop/state.json "d['goal_stall_count']"; }
+cstall_n() { jget .swarm-loop/state.json "d['stall_count']"; }
+
+gcycle 0
+ck_exit "(n) cycle 0 baseline checkpoint" 0 "$RC"
+ck_has "(n) a first-ever reading is movement, never a stall" "first-ever reading"
+ck "(n) goal stall is 0 after the baseline" "0" "$(gstall_n)"
+
+gcycle 1
+ck_exit "(n) cycle 1 checkpoint is not yet terminal" 0 "$RC"
+ck_has "(n) the pinned metric is named" "no improvement in"
+ck "(n) goal stall 1 after one pinned cycle" "1" "$(gstall_n)"
+ck "(n) the CODEBASE stall is still 0 — the code changed" "0" "$(cstall_n)"
+
+gcycle 2
+ck_exit "(n) cycle 2 checkpoint is not yet terminal" 0 "$RC"
+ck "(n) goal stall 2" "2" "$(gstall_n)"
+ck "(n) codebase stall still 0" "0" "$(cstall_n)"
+
+gcycle 3
+ck_exit "(n) the goal-progress kill switch FIRES at the limit" 2 "$RC"
+ck "(n) goal stall reached the limit" "3" "$(gstall_n)"
+ck_has "(n) it says which switch fired" "no graded metric has improved"
+ck_has "(n) it distinguishes itself from the codebase switch" "This is the OTHER stall"
+ck_has "(n) it points at the analysis that names the pinned goal" "analysis/cycle-3.md"
+ck "(n) the codebase stall NEVER left 0 — it structurally cannot see this" "0" "$(cstall_n)"
+ck_hasnt "(n) the codebase kill switch did not fire" "no codebase changes for"
+
+sl resume
+ck_exit "(n) resume runs against the fired switch" 0 "$RC"
+ck_has "(n) resume reports it as terminal" "kill switch already fired (goal progress"
+ck_has "(n) resume shows both counters" "goal-progress"
+sl status
+ck_exit "(n) status runs" 0 "$RC"
+ck_has "(n) status exposes the goal-progress counter" "stall_goal_progress"
+ck_has "(n) status KEEPS the original stall key — an addition, not a rename" "\"stall\":"
+
+# ===========================================================================
+# (n2) The switch must be capable of NOT firing. A run making real progress
+#      may never be terminated by it, and ANY single metric improving is
+#      enough to reset — a net-zero cycle is not a stall.
+# ===========================================================================
+section "(n2) goal progress resets on ANY improvement  [repo: gmove]"
+mk_repo gmove
+sl freeze
+gq add -A; gq commit -qm harness
+gmove_cycle() {  # <n> <accept-score>   (lint stays pinned at 3 throughout)
+  echo "$2" > score.txt
+  echo "# c$1" >> src/app.py
+  gq add -A; gq commit -qm "c$1"
+  sl measure --cycle "$1"
+  gq add -A; gq commit -qm "b$1"
+  sl checkpoint --cycle "$1"
+}
+gmove_cycle 0 40
+ck_exit "(n2) baseline" 0 "$RC"
+gmove_cycle 1 50
+ck_exit "(n2) cycle 1" 0 "$RC"
+ck_has "(n2) the improving metric is named" "error fell for accept"
+gmove_cycle 2 60
+ck_exit "(n2) cycle 2" 0 "$RC"
+gmove_cycle 3 70
+ck_exit "(n2) cycle 3" 0 "$RC"
+gmove_cycle 4 80
+ck_exit "(n2) five cycles of real progress never trip the switch" 0 "$RC"
+ck "(n2) goal stall is still 0 with one metric pinned the whole time" "0" \
+   "$(jget .swarm-loop/state.json "d['goal_stall_count']")"
+ck_hasnt "(n2) and no kill switch text anywhere" "KILL SWITCH"
+
+# ===========================================================================
+# (n3) An UNMEASURED cycle holds the counter where it is — neither bumped nor
+#      cleared. A broken metric command is a defect analyze already exits 1
+#      over; it may not also spend the run's stall budget, and it may not
+#      silently refund it.
+# ===========================================================================
+section "(n3) an unmeasured cycle HOLDS the goal counter  [repo: ghold]"
+mk_repo ghold
+sl freeze
+gq add -A; gq commit -qm harness
+hcycle() {  # <n>  — pinned cycle, metric commands intact
+  echo 40 > score.txt; echo 3 > lint.txt
+  echo "# c$1" >> src/app.py
+  gq add -A; gq commit -qm "c$1"
+  sl measure --cycle "$1"
+  gq add -A; gq commit -qm "b$1"
+  sl checkpoint --cycle "$1"
+}
+hcycle 0
+hcycle 1
+hcycle 2
+ck "(n3) two pinned cycles put the counter at 2" "2" \
+   "$(jget .swarm-loop/state.json "d['goal_stall_count']")"
+
+# both metric commands now fail: nothing is recorded for this cycle at all
+rm -f score.txt lint.txt
+echo "# c3" >> src/app.py
+gq add -A; gq commit -qm c3
+sl measure --cycle 3
+ck_exit "(n3) measure fails when every metric command does" 1 "$RC"
+gq add -A; gq commit -qm b3
+sl checkpoint --cycle 3
+ck_exit "(n3) checkpoint of an unmeasured cycle is not terminal" 0 "$RC"
+ck_has "(n3) it says the cycle is unknown, not flat" "unknown"
+ck "(n3) the counter HELD at 2 — not bumped by a broken measuring stick" "2" \
+   "$(jget .swarm-loop/state.json "d['goal_stall_count']")"
+
+# restore the measuring stick: the counter resumes from 2, it was not refunded
+echo 40 > score.txt; echo 3 > lint.txt
+echo "# c4" >> src/app.py
+gq add -A; gq commit -qm c4
+sl measure --cycle 4
+gq add -A; gq commit -qm b4
+sl checkpoint --cycle 4
+ck_exit "(n3) the switch fires once real measurement resumes" 2 "$RC"
+ck "(n3) the counter was not refunded by the gap either" "3" \
+   "$(jget .swarm-loop/state.json "d['goal_stall_count']")"
+
+# a replay is not a new cycle, for this counter as for the other one
+G_BEFORE="$(jget .swarm-loop/state.json "d['goal_stall_count']")"
+sl checkpoint --cycle 4
+sl checkpoint --cycle 4
+ck "(n3) three replays of cycle 4 do not move the goal counter" "$G_BEFORE" \
+   "$(jget .swarm-loop/state.json "d['goal_stall_count']")"
+
+# ===========================================================================
+# (o) check-branch COUNTS COMMITS. Every question the harness asked about a
+#     branch was ancestry-shaped, and ancestry cannot count: a branch with
+#     zero commits is an ancestor of main, merges clean, and reads MERGED.
+#     Live: two lanes provisioned, never dispatched, 0 commits, both passing.
+# ===========================================================================
+section "(o) check-branch counts commits  [repo: bcount]"
+mk_repo bcount
+sl freeze
+gq add -A; gq commit -qm harness
+
+gq branch task/T-empty main
+git merge-base --is-ancestor task/T-empty main >/dev/null 2>&1; ANC=$?
+ck "(o) ancestry ALONE still calls the empty lane merged" "0" "$ANC"
+sl check-branch --branch task/T-empty --base main
+ck_exit "(o) an EMPTY lane is REFUSED, not reported OK" 1 "$RC"
+ck_has "(o) the refusal states the finding" "NO COMMITS of its own"
+ck_has "(o) and names the command that answers it" "rev-list --count"
+ck_has "(o) and says why ancestry could not see it" "reads MERGED"
+ck_has "(o) and gives both readings of a zero" "never committed"
+ck_hasnt "(o) an empty lane is never reported OK" "check-branch: OK"
+
+# stale base, DISJOINT files: the live shape — merges clean, base long gone
+gq branch task/T-stale main
+gq checkout -q main
+echo "moved once" > src/other.py
+gq add -A; gq commit -qm "main moves 1"
+echo "moved twice" >> src/other.py
+gq add -A; gq commit -qm "main moves 2"
+gq checkout -q task/T-stale
+echo "# worker" >> src/app.py
+gq add -A; gq commit -qm "worker work"
+gq checkout -q main
+sl check-branch --branch task/T-stale --base main
+ck_exit "(o) a stale base is a WARNING, never a veto" 0 "$RC"
+ck_has "(o) the drift is reported with its commit count" "STALE BASE"
+ck_has "(o) the branch still passes" "check-branch: OK"
+ck_has "(o) a non-intersecting drift says so" "None of them intersect"
+
+# stale base OVERLAPPING the branch's own changes
+gq branch task/T-over "$(git merge-base main task/T-stale)"
+gq checkout -q task/T-over
+echo "# worker touches the same file main moved" >> src/other.py
+gq add -A; gq commit -qm "worker work on src/other.py"
+gq checkout -q main
+sl check-branch --branch task/T-over --base main
+ck_exit "(o) an overlapping stale base is still not a veto" 0 "$RC"
+ck_has "(o) the intersecting file is listed by name" "~ src/other.py"
+ck_has "(o) mergeability is explicitly NOT the answer" "textual mergeability"
+
+# CONTROL: real work on a current base must not be blocked or warned about
+gq checkout -q -b task/T-good main
+echo "# good work" >> src/app.py
+gq add -A; gq commit -qm "good work"
+gq checkout -q main
+sl check-branch --branch task/T-good --base main
+ck_exit "(o) CONTROL: real work on a current base passes" 0 "$RC"
+ck_hasnt "(o) CONTROL: no false empty-lane veto" "NO COMMITS"
+ck_hasnt "(o) CONTROL: no false stale-base warning" "STALE BASE"
+ck_has "(o) CONTROL: the count is reported either way" "commit(s) ahead"
+
+# ===========================================================================
+# (p) check-wave asks the reciprocal question BEFORE dispatch: how far has
+#     the base moved since an existing member branch forked from it, and does
+#     that drift land inside what the ticket owns. Live: seven lanes were
+#     dispatched onto worktrees 26-27 commits behind main and every one of
+#     them merged clean. Nothing here vetoes — pre-dispatch, an empty lane is
+#     the normal state, and refusing it would block the loop's own
+#     provisioning step.
+# ===========================================================================
+section "(p) check-wave fork accounting  [repo: wfork]"
+mk_repo wfork
+cat > tickets.json <<'EOF'
+{"version": 1, "project": "e2e", "tickets": [
+ {"id": "T-101", "title": "alpha", "verify": "true",
+  "scope": ["src/alpha/**"], "depends_on": [], "parallel_safe": true},
+ {"id": "T-102", "title": "beta", "verify": "true",
+  "scope": ["src/beta/**"], "depends_on": [], "parallel_safe": true}
+]}
+EOF
+gq add -A; gq commit -qm graph
+gq branch task/T-101 main
+mkdir -p src/alpha
+echo "main moved inside T-101's ownership" > src/alpha/mod.py
+gq add -A; gq commit -qm "main moves"
+sl check-wave T-101 T-102 --base main
+ck_exit "(p) fork accounting never vetoes" 0 "$RC"
+ck_has "(p) an existing member branch is counted" "task/T-101:"
+ck_has "(p) a zero-commit lane is named as such" "EMPTY lane"
+ck_has "(p) the stale base is reported" "STALE BASE"
+ck_has "(p) drift inside the ticket's OWN ownership is listed" "~ src/alpha/mod.py"
+ck_has "(p) a member with no branch yet is accounted for" "no branch yet"
+ck_has "(p) the base sha the wave will fork from is pinned" "base main @"
+ck_has "(p) the wave still passes" "check-wave: OK"
+
+# ===========================================================================
+# (q) The goal counter must work on a state.json written before it existed —
+#     an in-flight run picks the switch up with no migration.
+# ===========================================================================
+section "(q) goal stall on a pre-counter state.json  [repo: gbc]"
+mk_repo gbc
+python3 - <<'PY'
+import json
+p = ".swarm-loop/state.json"
+s = json.load(open(p))
+s.pop("goal_stall_count", None)
+s.pop("goal_stall_limit", None)
+json.dump(s, open(p, "w"), indent=2)
+PY
+ck "(q) the fixture really has neither key" "False False" \
+   "$(jget .swarm-loop/state.json "'%s %s' % ('goal_stall_count' in d, 'goal_stall_limit' in d)")"
+sl freeze
+gq add -A; gq commit -qm harness
+sl measure --cycle 0
+ck_exit "(q) measure" 0 "$RC"
+sl checkpoint --cycle 0
+ck_exit "(q) checkpoint runs on the pre-counter state shape" 0 "$RC"
+ck_hasnt "(q) no traceback" "Traceback"
+ck_has "(q) the limit falls back to stall_limit" "goal-progress stall: 0/3"
+ck "(q) and the counter key is created" "0" \
+   "$(jget .swarm-loop/state.json "d['goal_stall_count']")"
+sl resume
+ck_exit "(q) resume runs on it" 0 "$RC"
+ck_hasnt "(q) resume does not call a fresh run terminal" "kill switch already fired"
+sl status
+ck_exit "(q) status runs on it" 0 "$RC"
+
 # ===========================================================================
 cd / 2>/dev/null || true
 ELAPSED=$(( $(date +%s) - START_TS ))
