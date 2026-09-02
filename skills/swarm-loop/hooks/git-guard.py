@@ -29,10 +29,18 @@ Design:
     re-evaluated, and a `!shell` alias body is re-scanned as a command line.
     `co = checkout` in a developer's dotfiles is boilerplate, so this path needs
     no adversarial intent at all.
-  - Two questions are answered by ASKING git (read-only `rev-parse` /
-    `config`, ~2s timeout): "is this checkout operand a ref or a path?" and
-    "is this subcommand an alias?". If git cannot answer — no binary, not a
-    repository, timeout — the answer is ALLOW.
+  - Questions are answered by ASKING git (read-only `rev-parse` / `worktree
+    list` / `config`, ~2s timeout, one longer retry): "is this checkout operand
+    a ref or a path?", "is this subcommand an alias?", "what repo/worktree does
+    this path belong to?". If git cannot answer — no binary, not a repository,
+    timeout — the answer is ALLOW, with ONE exception documented under
+    FAIL-OPEN below.
+  - Git is asked FROM THE OPERAND, not from this process's cwd. A path names
+    the thing it is about, so `git -C <that path>` is what gets asked. Asking
+    from the process cwd is what made a cwd outside any repository disarm every
+    path rule at once: `rm -rf <repo>` was exit 2 from the repo and exit 0 from
+    one directory up. The command's own directory is tracked too — the payload's
+    `cwd`, then any `git -C <path>` global, then any `cd <path>` segment.
   - Blocks ONLY positively-identified destructive repo-global ops. Everything
     else — including all normal loop/auditor git — is allowed. Getting an
     allow-case wrong (breaking `git commit`, or blocking a task packet that
@@ -59,13 +67,26 @@ Blocked:
     git gc --prune=<not never>, git prune, git repack -ad, git filter-branch,
     git symbolic-ref <ref> <target>, git submodule deinit -f,
     git sparse-checkout set|add|init|reapply|disable
+  the same effects under their OTHER spellings, which used to be exit 0 while
+    the three above were exit 2 — the guard reasoned about spellings, not
+    effects: git branch -f (moves a branch ref; `-D`/`--delete` stays allowed,
+    it is the documented teardown), git checkout -B and git switch -C (force-
+    reset an existing branch; `-b`/`-c` create and stay allowed),
+    git push --mirror, git push --delete, git push <remote> :<ref> (the
+    empty-source refspec = delete), git push <remote> +<src>:<dst> (`+` is
+    --force for one ref), and git fetch <remote> +<src>:<local ref> (a forced
+    fetch INTO a local branch; `+…:refs/remotes/…` and `+…:refs/tags/…` are the
+    ordinary refspecs and stay allowed)
 
 Blocked WITHOUT a git verb (rules keyed on the PATH, added after a live audit
 found the guard had no path awareness at all):
   rm -r of the repo root, a worktree root, a directory CONTAINING worktree
     roots, `/`, or `$HOME` — including the collapsed form, since
     `rm -rf <worktree-root>/$ID` with `$ID` unset really is `rm -rf
-    <worktree-root>/` and takes every live worktree's uncommitted work
+    <worktree-root>/` and takes every live worktree's uncommitted work — and
+    the VARIABLE-ROOT/LITERAL-TAIL form beside it, `rm -rf "$WT/T-010"`, which
+    collapses to a harmless-looking `/T-010` and so walked past the rule above
+    while naming a live worktree out loud
   rm / mv of anything under `.swarm-loop/` (the run's frozen goals, acceptance
     suite, manifest and history — deleting it destroys the DETECTOR, not just
     the data), and `find <under .swarm-loop> ... -delete`
@@ -100,9 +121,13 @@ argv, and widening it would cost false blocks, which are worse):
     `python3 -c 'os.system("git stash")'`, a destructive op inside a script file.
   - a program named by a variable that does not mention git (`$X stash` where
     `X=git`); `$GIT`-style names are caught, the rest would cost false blocks.
-  - anything reached after a `cd` WITHIN the command. The payload's declared
-    `cwd` IS honoured now (see `_main`), so a worker's worktree resolves
-    correctly; a `cd` in the middle of the command string still does not.
+  - the INTERIOR of a `$(...)` or backtick substitution that sits after a `cd`
+    on the same line. A plain `cd <path> && ...` IS honoured now, and so is
+    `git -C <path> ...`; but substitution bodies are scanned off the RAW string
+    (single quotes decide whether bash runs them at all, and posix tokenization
+    erases quotes), so their interiors are judged from the directory the line
+    STARTED in. That errs toward BLOCK, which is the survivable direction, and
+    it is what remains of the older, wider "anything after a `cd`" limitation.
   - `find . ... -delete` outside `.swarm-loop/`, and `... | xargs rm`. Narrow on
     purpose: `find . -name '*.pyc' -delete` is ordinary housekeeping, and a false
     block on housekeeping is worse than this miss.
@@ -117,9 +142,20 @@ argv, and widening it would cost false blocks, which are worse):
   This is a guard rail against accidents, not a sandbox against a determined
   caller. The real protection is per-agent worktree isolation.
 
-FAIL-OPEN, and what it costs (stated plainly because it is a real limit, not an
-oversight): `main()` catches BaseException and exits 0. Any command that crashes
-the parser is therefore allowed WHOLESALE — not just the part that crashed.
+ONE FAIL-CLOSED RULE, and only one. A RECURSIVE `rm` whose target the guard
+could not classify — because git could not be RUN at all (no binary, or a
+timeout that survived the longer retry) — is REFUSED. Everything else in this
+file still fails open. The reason it is the exception: an empty protected set
+used to mean two different things at once, "nothing is protected here" and "I
+could not find out", and a recursive delete is the one operation where guessing
+the second is unrecoverable. Git ANSWERING "not a git repository" is not this
+case — that is determined-and-empty, and it allows. If git really is missing,
+the harness cannot run anyway.
+
+FAIL-OPEN otherwise, and what it costs (stated plainly because it is a real
+limit, not an oversight): `main()` catches BaseException and exits 0. Any
+command that crashes the parser is therefore allowed WHOLESALE — not just the
+part that crashed.
 That is deliberate: a guard that blocks all bash when it hits a bug wedges an
 unattended run, and a false block is worse than a missed block. Two reachable
 crash paths were found and closed rather than left to this net — `$'…'` ANSI-C
@@ -175,7 +211,10 @@ Contract (Claude Code PreToolUse):
                      honoured — without it the ref-vs-path question for
                      `git checkout <operand>` was answered from the SESSION root,
                      so a worker could destructively check out any file that
-                     existed only in its own worktree.
+                     existed only in its own worktree. `cwd` is the STARTING
+                     point only: `git -C <path>` and `cd <path>` move it, and
+                     path rules additionally ask git about the operand itself,
+                     so no single directory decides a verdict any more.
   exit 0             ALLOW (no output).
   exit 2 + stderr    BLOCK; stderr shown to the model.
 Fails OPEN (exit 0) on any parse/logic error or unbalanced quotes — a broken
@@ -665,19 +704,83 @@ def long_opt_abbrev(args: list[str], *full_names: str) -> bool:
 
 
 GIT_QUERY_TIMEOUT = 2.0
-_ALIAS_CACHE: dict[str, str] | None = None
+_ALIAS_CACHE: dict[str, dict[str, str]] = {}
 
 
-def _git_run(args: list[str]):
+def _git_run(args: list[str], timeout: float | None = None):
     """Run a READ-ONLY git query. Returns the CompletedProcess, or None if git
     could not be run at all (missing binary, timeout, ...) -> caller fails open."""
     try:
         return subprocess.run(
             ["git"] + args, capture_output=True, text=True,
-            timeout=GIT_QUERY_TIMEOUT,
+            timeout=GIT_QUERY_TIMEOUT if timeout is None else timeout,
         )
     except Exception:
         return None
+
+
+# --- WHERE the command will actually run -----------------------------------
+#
+# Every question this guard asks git ("is this operand a ref?", "what is the
+# repo root?") and every relative path it resolves has an implicit answer-from
+# location. `_main` chdir's to the payload's declared `cwd`, and that was the
+# whole of the previous fix. But a process cwd is ONE location and a command
+# names others out loud, in argv: `git -C <worktree> checkout f` and
+# `cd <worktree> && git checkout f` both say exactly where they mean, and both
+# returned exit 0 for a file that exists only in that worktree.
+#
+# `_CWD` is that location. It starts at the payload's cwd and is re-pointed for
+# the extent of a `git -C` segment, or from a `cd` onward. Re-pointing is a
+# variable, never a real `os.chdir`: the hook is one process evaluating many
+# segments, and a chdir would leak into all of them.
+try:
+    _CWD = os.getcwd()
+except Exception:                      # cwd deleted out from under the process
+    _CWD = os.sep
+
+
+def _init_cwd() -> None:
+    global _CWD
+    try:
+        _CWD = os.getcwd()
+    except Exception:
+        pass
+
+
+def _set_cwd(d: str | None) -> str:
+    """Point resolution at `d`, resolved relative to the current `_CWD` (so
+    `git -C ../x` and `cd ..` compose). A directory that is not usable changes
+    NOTHING — an unresolvable `cd` must never become a block of its own.
+    Returns the previous value so the caller can restore it."""
+    global _CWD
+    prev = _CWD
+    if d:
+        try:
+            cand = os.path.realpath(os.path.join(_CWD, os.path.expanduser(d)))
+            if os.path.isdir(cand):
+                _CWD = cand
+        except Exception:
+            pass
+    return prev
+
+
+def _restore_cwd(prev: str) -> None:
+    global _CWD
+    _CWD = prev
+
+
+def _git_at(d: str | None, args: list[str]):
+    """A read-only git query asked FROM directory `d`, via `git -C`.
+
+    Retried once with a longer timeout when the first attempt could not run at
+    all. That retry is load-bearing: "git could not answer" is now a
+    fail-CLOSED signal for recursive deletes, and a flaky 2-second timer must
+    not be allowed to read as one."""
+    pre = ["-C", d] if d else []
+    p = _git_run(pre + args)
+    if p is None:
+        p = _git_run(pre + args, timeout=GIT_QUERY_TIMEOUT * 2)
+    return p
 
 
 def git_aliases() -> dict[str, str]:
@@ -686,17 +789,18 @@ def git_aliases() -> dict[str, str]:
     Loaded once per process, lazily: an alias is only consulted for a subcommand
     the guard does not already recognize. `co = checkout` in someone's dotfiles
     is boilerplate, and without this `git co .` walks straight past the guard."""
-    global _ALIAS_CACHE
-    if _ALIAS_CACHE is None:
+    hit = _ALIAS_CACHE.get(_CWD)
+    if hit is None:
         out: dict[str, str] = {}
-        p = _git_run(["config", "--get-regexp", "^alias\\."])
+        p = _git_at(_CWD, ["config", "--get-regexp", "^alias\\."])
         if p is not None and p.returncode == 0:
             for line in p.stdout.splitlines():
                 key, _, val = line.partition(" ")
                 if key.startswith("alias.") and val:
                     out.setdefault(key[len("alias."):], val)
-        _ALIAS_CACHE = out
-    return _ALIAS_CACHE
+        _ALIAS_CACHE[_CWD] = out
+        hit = out
+    return hit
 
 
 def inline_aliases(args: list[str]) -> dict[str, str]:
@@ -719,7 +823,7 @@ def is_commit_ish(name: str) -> bool | None:
     """True if git resolves `name` to a commit, False if it definitively does not,
     None if the question could not be answered (no git, not a repo, ...).
     None means fail open: an unanswerable question must never produce a block."""
-    p = _git_run(["rev-parse", "--verify", "--quiet", name + "^{commit}"])
+    p = _git_at(_CWD, ["rev-parse", "--verify", "--quiet", name + "^{commit}"])
     if p is None:
         return None
     if p.returncode == 0:
@@ -771,6 +875,21 @@ PATHSPEC_REASON = (
 )
 
 
+def _lexists(op: str) -> bool:
+    """Does this operand name something on disk WHERE THE COMMAND WILL RUN?
+    Asked against `_CWD`, not this process's cwd: `git -C <worktree> checkout f`
+    and `cd <worktree> && git checkout f` both returned exit 0 for a file that
+    exists only in that worktree, because the question was asked from the
+    session root where the file does not exist."""
+    try:
+        p = os.path.expanduser(op)
+        if not os.path.isabs(p):
+            p = os.path.join(_CWD, p)
+        return os.path.lexists(p)
+    except Exception:
+        return False
+
+
 def check_checkout(rest: list[str]) -> str | None:
     if "--" in rest:
         return "`git checkout ... -- <path>` overwrites working-tree files from another commit."
@@ -797,6 +916,13 @@ def check_checkout(rest: list[str]) -> str | None:
     # command then falls through to the two-operand `<tree-ish> <path>` veto
     # below — a FALSE BLOCK on the branch create the swarm dispatches constantly.
     # -b/-B take an attached value, so the scan stops there (`-bfix` = branch fix).
+    # -B is NOT -b: it force-RESETS an existing branch to the start point,
+    # exactly as `git branch -f` does. It has to be tested before the
+    # branch-create early-return below, which used to swallow it.
+    if short_flag_has(rest, "B", "bB"):
+        return ("`git checkout -B <branch>` force-resets an existing branch to the "
+                "start point (`-b` creates without clobbering, and is allowed).\n"
+                + 'If the branch really must move, delete and re-create it explicitly (`git branch -D <b>` is allowed) so the move is a deliberate two-step, not a flag.')
     branch_flags = {"-b", "-B", "--orphan", "--detach", "-t", "--track"}
     if short_flag_has(rest, "bB", "bB") or any(
         a in branch_flags or a.startswith("--track") for a in rest
@@ -813,7 +939,7 @@ def check_checkout(rest: list[str]) -> str | None:
         op = operands[0]
         if certainly_pathspec(op):
             return PATHSPEC_REASON
-        if is_commit_ish(op) is False and os.path.lexists(op):
+        if is_commit_ish(op) is False and _lexists(op):
             # not a ref, and it names something on disk -> a real pathspec.
             # (not a ref and not on disk -> git itself errors out; harmless.)
             return PATHSPEC_REASON
@@ -824,6 +950,11 @@ def check_switch(rest: list[str]) -> str | None:
     # -c/-C take an attached value, so `git switch -cfeat` is a branch name.
     if long_opt_abbrev(rest, "--discard-changes", "--force") or short_flag_has(rest, "f", "cC"):
         return "`git switch --discard-changes/-f` throws away uncommitted working-tree changes."
+    # -C is to -c what checkout's -B is to -b: it force-resets an existing branch.
+    if short_flag_has(rest, "C", "cC"):
+        return ("`git switch -C <branch>` force-resets an existing branch to the "
+                "start point (`-c` creates without clobbering, and is allowed).\n"
+                + 'If the branch really must move, delete and re-create it explicitly (`git branch -D <b>` is allowed) so the move is a deliberate two-step, not a flag.')
     return None
 
 
@@ -961,6 +1092,61 @@ def check_push(rest: list[str]) -> str | None:
     if long_opt_abbrev(rest, "--force") or short_flag_has(rest, "f", "o"):
         return ("`git push --force` overwrites the remote branch, discarding "
                 "commits other agents may have already pushed.")
+    # Same effects, different spellings — all of these were exit 0 while
+    # `--force` above was exit 2. `--mirror` makes the remote match this repo
+    # EXACTLY, deleting every remote ref this repo does not have.
+    if long_opt_abbrev(rest, "--mirror"):
+        return ("`git push --mirror` makes the remote match this repo exactly — "
+                "every remote ref this repo does not have is DELETED.")
+    if long_opt_abbrev(rest, "--delete") or short_flag_has(rest, "d", "o"):
+        return "`git push --delete` deletes the named ref on the remote."
+    for a in rest:
+        if a.startswith("-") or ":" not in a:
+            continue
+        s, _, d = a.partition(":")
+        if not s.strip():
+            return ("`git push <remote> :" + d + "` is the empty-source refspec: "
+                    "it DELETES `" + d + "` on the remote.")
+        if s.startswith("+"):
+            return ("`git push <remote> +" + s.lstrip("+") + ":" + d + "` is a "
+                    "forced refspec — the `+` is `--force` for that ref, which is "
+                    "blocked above under its other spelling.")
+    return None
+
+
+def check_branch(rest: list[str]) -> str | None:
+    """`git branch -f <b> <commit>` MOVES an existing branch ref to another
+    commit — the plumbing under it is `git update-ref`, which this guard already
+    blocks. Deleting a branch stays allowed: `git branch -D task/<id>` is the
+    documented teardown step and `-D` is `--delete --force`, so the force test
+    has to run after the delete test or it would false-block the runbook.
+    -m/-c/-u/-t take values that can attach, so the cluster scan stops there."""
+    if long_opt_abbrev(rest, "--delete") or short_flag_has(rest, "dD", "umcMC"):
+        return None
+    if long_opt_abbrev(rest, "--force") or short_flag_has(rest, "f", "umcMC"):
+        return ("`git branch -f/--force` moves an existing branch to another "
+                "commit, orphaning everything reachable only from where it was — "
+                "the same effect as the `git update-ref` this guard blocks.\n"
+                + 'If the branch really must move, delete and re-create it explicitly (`git branch -D <b>` is allowed) so the move is a deliberate two-step, not a flag.')
+    return None
+
+
+def check_fetch(rest: list[str]) -> str | None:
+    """A `+` refspec is `--force` for one ref. Fetching into `refs/remotes/…`
+    (or a tag) that way is the ORDINARY default refspec and must stay allowed;
+    fetching into a LOCAL branch overwrites it with no merge and no reflog
+    warning, which is `git reset --hard` for the ref."""
+    for a in rest:
+        if a.startswith("-") or ":" not in a:
+            continue
+        s, _, d = a.partition(":")
+        if not s.startswith("+"):
+            continue
+        d = d.strip()
+        if not d or d.startswith("refs/remotes/") or d.startswith("refs/tags/"):
+            continue
+        return ("`git fetch <remote> +<src>:" + d + "` force-updates the LOCAL ref "
+                "`" + d + "`, discarding whatever it pointed at.\n" + 'If the branch really must move, delete and re-create it explicitly (`git branch -D <b>` is allowed) so the move is a deliberate two-step, not a flag.')
     return None
 
 
@@ -1073,54 +1259,205 @@ FILE_TOOLS = frozenset({"Edit", "Write", "NotebookEdit", "MultiEdit"})
 # the fail-open contract. Kept as one string so a reader can copy it.
 REQUIRED_MATCHER = "Bash|Edit|Write|NotebookEdit|MultiEdit"
 
-_UNSET = object()
-_REPO_ROOT_CACHE = _UNSET
-_WORKTREE_CACHE: list[str] | None = None
-
-
-def repo_root() -> str | None:
-    """The repo (or worktree) root the command runs in, or None if git cannot say.
-    Lazy: an ordinary command never reaches a path rule and never pays for it."""
-    global _REPO_ROOT_CACHE
-    if _REPO_ROOT_CACHE is _UNSET:
-        root = None
-        p = _git_run(["rev-parse", "--show-toplevel"])
-        if p is not None and p.returncode == 0 and p.stdout.strip():
-            try:
-                root = os.path.realpath(p.stdout.strip())
-            except Exception:
-                root = None
-        _REPO_ROOT_CACHE = root
-    return _REPO_ROOT_CACHE
-
-
-def worktree_roots() -> list[str]:
-    """Every worktree git knows about, main tree included. Authoritative for both
-    layouts the skill offers (`../<repo>-worktrees/<id>` and the in-tree
-    `.swarm-loop/worktrees/<id>` fallback), so no path convention is hard-coded."""
-    global _WORKTREE_CACHE
-    if _WORKTREE_CACHE is None:
-        out: list[str] = []
-        p = _git_run(["worktree", "list", "--porcelain"])
-        if p is not None and p.returncode == 0:
-            for line in p.stdout.splitlines():
-                if line.startswith("worktree "):
-                    try:
-                        out.append(os.path.realpath(line[len("worktree "):].strip()))
-                    except Exception:
-                        pass
-        _WORKTREE_CACHE = out
-    return _WORKTREE_CACHE
-
-
 def abs_path(op: str) -> str | None:
-    """Absolute, symlink-resolved form of an operand. Purely lexical about
-    existence — the target of an `rm` is exactly the thing that may not survive,
-    and a rule that only fires on paths that exist right now is not a rule."""
+    """Absolute, symlink-resolved form of an operand, relative to `_CWD` — the
+    directory the command will actually run in, not this process's. Purely
+    lexical about existence: the target of an `rm` is exactly the thing that may
+    not survive, and a rule that only fires on paths that exist right now is not
+    a rule."""
     try:
-        return os.path.realpath(os.path.expanduser(op))
+        p = os.path.expanduser(op)
+        if not os.path.isabs(p):
+            p = os.path.join(_CWD, p)
+        return os.path.realpath(p)
     except Exception:
         return None
+
+
+# --- git context, resolved FROM THE OPERAND -------------------------------
+#
+# THE BUG THIS REPLACES. `repo_root()` shelled `git rev-parse --show-toplevel`
+# and cached **None** on failure; `worktree_roots()` shelled `git worktree list
+# --porcelain` and cached **[]**. Both asked git from the PROCESS cwd, and every
+# path rule then fell through on the falsy value — `if root and ...` skipped,
+# `for wt in worktree_roots()` never entered, an empty protected set read as
+# "nothing is protected". Measured, one identical command string:
+#
+#     rc=2  cwd=<repo>              rm -rf <repo>
+#     rc=0  cwd=<worktrees parent>  rm -rf <repo>      *** same string ***
+#     rc=0  cwd=/tmp                rm -rf <repo>
+#     rc=2  cwd=<repo>              rm -rf <worktrees parent>/T-010
+#     rc=0  cwd=<worktrees parent>  rm -rf <worktrees parent>/T-010
+#
+# The run's worktree PARENT (`../<repo>-worktrees`) is exactly such a directory:
+# `git rev-parse` there says "not a git repository", the run GRANTS it with
+# `--add-dir`, and it is the natural place to stand for a teardown loop.
+#
+# The design intent was already right — "ask git what is live" beats hard-coding
+# a path convention. Git was just asked from the wrong place. An operand NAMES
+# the thing it is about, so that is where it is asked now.
+_CTX_CACHE: dict[str, tuple] = {}
+
+MAX_ANCESTOR_WALK = 64
+MAX_SCAN_ENTRIES = 64
+MAX_CHILD_PROBES = 4
+MAX_CHILD_DEPTH = 2
+
+
+def _ctx_at(d: str | None) -> tuple:
+    """(repo root or None, [worktree roots], determined) as git sees it FROM `d`.
+
+    `determined` is False ONLY when git could not be run or could not answer:
+    no binary, a timeout that survived the retry, an unexpected failure. A clean
+    "not a git repository" is git ANSWERING, so it is determined-and-empty.
+    That distinction is the whole of the fail-closed rule below — today both
+    outcomes were the same empty list, which is why "nothing is protected" and
+    "I could not find out" were indistinguishable."""
+    if not d:
+        return (None, [], False)
+    hit = _CTX_CACHE.get(d)
+    if hit is not None:
+        return hit
+    root, wts, determined = None, [], True
+    p = _git_at(d, ["rev-parse", "--show-toplevel"])
+    if p is None:
+        determined = False
+    elif p.returncode == 0:
+        out = p.stdout.strip()
+        if out:
+            try:
+                root = os.path.realpath(out)
+            except Exception:
+                determined = False
+        else:
+            determined = False         # exit 0 with no answer is not an answer
+    # a non-zero exit is git saying "no repository here" -> determined, empty
+    if root is not None:
+        q = _git_at(d, ["worktree", "list", "--porcelain"])
+        if q is None or q.returncode != 0:
+            determined = False
+        else:
+            for line in q.stdout.splitlines():
+                if line.startswith("worktree "):
+                    try:
+                        wts.append(os.path.realpath(line[len("worktree "):].strip()))
+                    except Exception:
+                        determined = False
+    _CTX_CACHE[d] = (root, wts, determined)
+    return _CTX_CACHE[d]
+
+
+def _nearest_existing_dir(ap: str | None) -> str | None:
+    """Deepest directory that EXISTS at or above `ap`.
+
+    `git -C` needs a real directory and an `rm` operand very often is not one
+    (`rm -rf dist`, `rm -rf /tmp/scratch-$USER`). Asking from its nearest real
+    ancestor is what turns those into a determined "nothing protected here"
+    rather than an unanswered question — which, under the rule below, is the
+    difference between allowed and blocked."""
+    if not ap:
+        return None
+    d = ap
+    for _ in range(MAX_ANCESTOR_WALK):
+        try:
+            if os.path.isdir(d):
+                return d
+        except Exception:
+            return None
+        nd = os.path.dirname(d)
+        if not nd or nd == d:
+            return None
+        d = nd
+    return None
+
+
+def _linked_worktrees_under(d: str | None) -> list[str]:
+    """Directories at or under `d` (<= MAX_CHILD_DEPTH levels) that are LINKED
+    worktrees — their `.git` is a FILE (`gitdir: ...`), not a directory.
+
+    This is the only way to see `rm -rf ../<repo>-worktrees`: that operand is
+    not IN a repository, is not UNDER one, and has none above it. The worktrees
+    are BELOW it. One hit is usually enough — `git worktree list` from any
+    member returns the whole set, siblings and main tree included.
+
+    Deliberately restricted to the LINKED shape. A plain clone's `.git` is a
+    DIRECTORY, so a vendored checkout under `node_modules` is not probed and
+    `rm -rf node_modules` stays allowed; that false block would be far worse
+    than this miss. Bounded on every axis — entries scanned, probes issued,
+    depth — because this runs on `rm`."""
+    if not d:
+        return []
+    found: list[str] = []
+    frontier = [(d, 0)]
+    scanned = 0
+    while frontier and len(found) < MAX_CHILD_PROBES:
+        cur, depth = frontier.pop(0)
+        if depth > MAX_CHILD_DEPTH or scanned >= MAX_SCAN_ENTRIES * 4:
+            continue
+        entries = []
+        try:
+            with os.scandir(cur) as it:
+                for e in it:
+                    scanned += 1
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            entries.append(e.path)
+                    except Exception:
+                        pass
+                    if len(entries) >= MAX_SCAN_ENTRIES or scanned >= MAX_SCAN_ENTRIES * 4:
+                        break
+        except Exception:
+            continue
+        for child in entries:
+            try:
+                if os.path.isfile(os.path.join(child, ".git")):
+                    found.append(child)
+                    if len(found) >= MAX_CHILD_PROBES:
+                        break
+                    continue
+            except Exception:
+                pass
+            frontier.append((child, depth + 1))
+    return found
+
+
+def _resolve(ap: str | None, scan_below: bool = False) -> tuple:
+    """(repo roots, worktree roots, determined) relevant to operand `ap`.
+
+    Three probe points, deliberately a UNION rather than a replacement:
+      - `_CWD`, so no verdict that already worked can be lost;
+      - the operand's own nearest existing directory — the fix;
+      - for a recursive delete, the linked worktrees BELOW it.
+    """
+    roots: list[str] = []
+    wts: list[str] = []
+    determined = True
+    base = _nearest_existing_dir(ap)
+    probes = [_CWD, base]
+    if scan_below:
+        probes.extend(_linked_worktrees_under(base))
+    seen = set()
+    for d in probes:
+        if not d or d in seen:
+            continue
+        seen.add(d)
+        r, w, det = _ctx_at(d)
+        if not det:
+            determined = False
+        if r and r not in roots:
+            roots.append(r)
+        for x in w:
+            if x not in wts:
+                wts.append(x)
+    return roots, wts, determined
+
+
+def repo_roots(ap: str | None = None) -> list[str]:
+    return _resolve(ap)[0]
+
+
+def worktree_roots(ap: str | None = None) -> list[str]:
+    return _resolve(ap, scan_below=True)[1]
 
 
 def _under(path: str, root: str) -> bool:
@@ -1159,28 +1496,49 @@ def collapse_unexpanded(op: str) -> str:
     return "/".join(out)
 
 
-def swarm_dir() -> str | None:
-    root = repo_root()
-    return os.path.join(root, SWARM_DIR) if root else None
+def swarm_dirs(ap: str | None) -> list[str]:
+    """`<repo-root>/.swarm-loop` for every repo root in scope for this operand.
+    Plural because the operand and the cwd can name different repositories —
+    `> <repo>/.swarm-loop/state.json` issued from the worktrees parent is the
+    case that used to escape entirely, since the cwd had no repo root at all.
+
+    Worktree roots are included as well as repo roots, and that is not padding:
+    inside a worker's worktree `rev-parse --show-toplevel` answers with the
+    WORKTREE, so the main tree — where the run's real `.swarm-loop` lives —
+    only ever shows up in the worktree list."""
+    roots, wts, _det = _resolve(ap, scan_below=True)
+    seen, out = set(), []
+    for r in roots + wts:
+        sd = os.path.join(r, SWARM_DIR)
+        if sd not in seen:
+            seen.add(sd)
+            out.append(sd)
+    return out
 
 
 def in_swarm_tree(op: str) -> bool:
-    """Is this operand inside (or exactly) `<repo-root>/.swarm-loop`?
+    """Is this operand inside (or exactly) some `<repo-root>/.swarm-loop`?
     The `SWARM_DIR in op` prefilter keeps the git queries off the hot path: no
     ordinary command mentions the directory at all."""
     if SWARM_DIR not in op:
         return False
-    ap, sd = abs_path(op), swarm_dir()
-    return bool(ap and sd and _under(ap, sd))
+    ap = abs_path(op)
+    if not ap:
+        return False
+    return any(_under(ap, sd) for sd in swarm_dirs(ap))
 
 
 def is_ledger(op: str) -> bool:
     if SWARM_DIR not in op:
         return False
-    ap, sd = abs_path(op), swarm_dir()
-    if not ap or not sd or not _under(ap, sd) or ap == sd:
+    ap = abs_path(op)
+    if not ap:
         return False
-    return os.path.relpath(ap, sd) in LEDGER_NAMES
+    for sd in swarm_dirs(ap):
+        if _under(ap, sd) and ap != sd:
+            if os.path.relpath(ap, sd) in LEDGER_NAMES:
+                return True
+    return False
 
 
 def critical_dir_reason(op: str) -> str | None:
@@ -1200,13 +1558,15 @@ def critical_dir_reason(op: str) -> str | None:
     home = os.path.expanduser("~")
     if home and home != os.sep and ap == os.path.realpath(home):
         return "that is the home directory"
-    root = repo_root()
-    if root and _under(root, ap):
-        return "that is the repository root (or an ancestor of it)"
-    for wt in worktree_roots():
+    roots, wts, _det = _resolve(ap, scan_below=True)
+    for wt in wts:
         if ap == wt:
             return ("that is a live worktree root — another agent may be working in "
                     "it, and its uncommitted work exists nowhere else")
+    for root in roots:
+        if _under(root, ap):
+            return "that is the repository root (or an ancestor of it)"
+    for wt in wts:
         if _under(wt, ap):
             return ("that directory CONTAINS live worktrees — every one of them, and "
                     "all their uncommitted work, goes with it")
@@ -1295,10 +1655,22 @@ def _component_matches(pat: str, name: str) -> bool:
         return False
 
 
-def _protected_paths() -> list[str]:
-    """The concrete directories the path rules protect. Ancestors are reached by
-    TRIMMING these, so `../worktree*` still resolves to "contains worktrees"."""
-    return [p for p in ([repo_root(), swarm_dir()] + worktree_roots()) if p]
+def _protected_paths(ap: str | None = None) -> list[str]:
+    """The concrete directories the path rules protect, as seen from the operand.
+    Ancestors are reached by TRIMMING these, so `../worktree*` still resolves to
+    "contains worktrees"."""
+    roots, wts, _det = _resolve(ap, scan_below=True)
+    out: list[str] = []
+    for r in roots + wts:
+        if r and r not in out:
+            out.append(r)
+    # via swarm_dirs(), not a second join, so "where the run state lives" has
+    # exactly one definition. It was two, and the copy here silently covered
+    # for the other — which is how a rule ends up shipped and never exercised.
+    for sd in swarm_dirs(ap):
+        if sd not in out:
+            out.append(sd)
+    return out
 
 
 def glob_reason(op: str) -> str | None:
@@ -1330,7 +1702,7 @@ def glob_reason(op: str) -> str | None:
     ap = abs_path(op)
     if ap:
         pcomps = ap.split(os.sep)
-        for cand in _protected_paths():
+        for cand in _protected_paths(ap):
             ccomps = cand.split(os.sep)
             if len(ccomps) < len(pcomps):
                 continue
@@ -1381,14 +1753,61 @@ def operands_after_options(args: list[str]) -> list[str]:
     return out
 
 
+def var_tail_reason(op: str) -> str | None:
+    """`rm -rf "$WT/T-010"` — a VARIABLE root with a LITERAL tail.
+
+    `collapse_unexpanded` only catches the FULLY collapsed spelling: `"$WT/$ID"`
+    becomes `/`, which is the filesystem root and is blocked. Leave one literal
+    component and `"$WT/T-010"` collapses to `/T-010`, which is not a protected
+    path and was ALLOWED — the same delete, one variable less. `${WT}/T-010` and
+    the unquoted form were allowed too.
+
+    But the guard already knows the NAME of every live worktree, and this
+    operand states it verbatim. If the literal tail is the tail of a protected
+    path, then every value of `$WT` that makes the command mean anything at all
+    is a value that makes it destructive; the variable is not hiding the target,
+    only its prefix."""
+    comps = op.split("/")
+    k = None
+    for idx, c in enumerate(comps):
+        if "$" in c:
+            k = idx
+    if k is None or k == len(comps) - 1:
+        return None                      # no variable, or nothing literal after it
+    tail = [c for c in comps[k + 1:] if c]
+    if not tail or any("$" in c or GLOB_META_RE.search(c) for c in tail):
+        return None
+    ap = abs_path(op)
+    for cand in _protected_paths(ap):
+        ccomps = [c for c in cand.split(os.sep) if c]
+        if len(ccomps) < len(tail) or ccomps[-len(tail):] != tail:
+            continue
+        why = critical_dir_reason(cand)
+        if why:
+            return ("its literal tail `" + "/".join(tail) + "` names `" + cand
+                    + "`, and " + why)
+    return None
+
+
 RM_HINT = ("Retire a worktree with `git worktree remove <path>` (now allowed): it "
            "verifies the path really is a worktree and REFUSES one with uncommitted "
            "changes, which is exactly the check `rm -rf` does not have.")
 
 
+UNDETERMINED_HINT = (
+    "This is the ONE rule in this guard that fails CLOSED, and it is deliberate: "
+    "an empty protected set used to mean two different things — `nothing is "
+    "protected here` and `I could not find out` — and a recursive delete is the "
+    "one operation where guessing the second is unrecoverable. Everything else "
+    "in this hook still fails OPEN. If git really is unavailable, the run cannot "
+    "work anyway; fix git, or delete the path with a non-recursive command."
+)
+
+
 def check_rm_paths(args: list[str]) -> str | None:
     """Non-git `rm`. This is the rule the guard was missing entirely."""
     recursive = long_opt_abbrev(args, "--recursive") or short_cluster_has(args, "rRd")
+    unknown: str | None = None
     for op in operands_after_options(args):
         if is_ledger(op) or in_swarm_tree(op):
             return ("`rm " + op + "` deletes the run's own state under `" + SWARM_DIR
@@ -1400,12 +1819,26 @@ def check_rm_paths(args: list[str]) -> str | None:
             return "`rm -r " + op + "` — " + why + ".\n" + RM_HINT
         if "$" in op:
             collapsed = collapse_unexpanded(op)
+            if collapsed:
+                why = rm_target_reason(collapsed)
+                if why:
+                    return ("`rm -r " + op + "` — if that variable expands to nothing "
+                            "the target is `" + collapsed + "`, and " + why + ".\n"
+                            + RM_HINT)
+            why = var_tail_reason(op)
+            if why:
+                return "`rm -r " + op + "` — " + why + ".\n" + RM_HINT
             if not collapsed:
                 continue  # `rm -rf "$V"` with V unset is `rm -rf ''` — rm refuses
-            why = rm_target_reason(collapsed)
-            if why:
-                return ("`rm -r " + op + "` — if that variable expands to nothing the "
-                        "target is `" + collapsed + "`, and " + why + ".\n" + RM_HINT)
+        # Nothing matched. Was that an ANSWER, or a failure to ask? Only the
+        # second is a reason to refuse.
+        if unknown is None and not _resolve(abs_path(op), scan_below=True)[2]:
+            unknown = op
+    if recursive and unknown is not None:
+        return ("`rm -r " + unknown + "` — the guard could not ask git whether that "
+                "path is a repository root, a live worktree, or a directory holding "
+                "live worktrees: the query did not run (no git binary, or it timed "
+                "out twice).\n" + UNDETERMINED_HINT)
     return None
 
 
@@ -1480,7 +1913,10 @@ NON_GIT_CHECKS = {
 }
 
 
-def check_redirect_targets(toks: list[str]) -> None:
+REDIRECT_OPS = (">", ">|", ">>", "&>", "&>>")
+
+
+def check_redirect_target(target: str) -> None:
     """`> <ledger file>` truncates it to nothing before a byte is written; `>>`
     corrupts it just as thoroughly, one appended line at a time.
 
@@ -1496,14 +1932,18 @@ def check_redirect_targets(toks: list[str]) -> None:
     .swarm-loop/state.json` would block. It needs a bare-quoted `>` immediately
     followed by a ledger path, the block message says exactly what it saw, and
     any other spelling of the grep works; that is a better trade than carrying a
-    second quote-aware scanner for it."""
-    for k, tok in enumerate(toks):
-        if tok in (">", ">|", ">>", "&>", "&>>") and k + 1 < len(toks):
-            target = toks[k + 1]
-            if is_ledger(target):
-                block("`" + tok + " " + target + "` writes the run's ledger from a "
-                      "shell. Only `swarmloop.py` may write it; a hand-written "
-                      "ledger voids every score computed from it.")
+    second quote-aware scanner for it.
+
+    Called from INSIDE the token walk rather than in a pass of its own. As two
+    passes, every redirect on the line was resolved from the cwd the line
+    STARTED in, so `cd <repo> && > .swarm-loop/state.json` was allowed from
+    anywhere outside the repo and false-blocked from inside it. Neither verdict
+    can be reproduced from a single cwd, which is why no case in a 482-case
+    battery had ever disagreed with it."""
+    if is_ledger(target):
+        block("`> " + target + "` writes the run's ledger from a shell. Only "
+              "`swarmloop.py` may write it; a hand-written ledger voids every "
+              "score computed from it.")
 
 
 def protected_write_reason(path: str) -> str | None:
@@ -1536,6 +1976,8 @@ CHECKS = {
     "rm": check_rm,
     "apply": check_apply,
     "push": check_push,
+    "branch": check_branch,
+    "fetch": check_fetch,
     "update-ref": check_update_ref,
     "reflog": check_reflog,
     "gc": check_gc,
@@ -1551,7 +1993,35 @@ MAX_SHELL_DEPTH = 3
 MAX_ALIAS_DEPTH = 3
 
 
+def dash_c_dir(args: list[str]) -> str | None:
+    """The directory git is told to run in by its own `-C <path>` global.
+    Repeatable and cumulative in git, so they compose in order. This is the
+    command NAMING its target: `git -C <worktree> checkout <file>` was exit 0
+    for a file existing only in that worktree."""
+    d = None
+    j = 0
+    while j < len(args):
+        a = args[j]
+        if a == "-C" and j + 1 < len(args):
+            nxt = args[j + 1]
+            d = nxt if d is None else os.path.join(d, nxt)
+            j += 2
+            continue
+        if not a.startswith("-"):
+            break                        # the subcommand; globals are over
+        j += 1
+    return d
+
+
 def evaluate_git(args: list[str], depth: int = 0) -> str | None:
+    prev = _set_cwd(dash_c_dir(args))
+    try:
+        return _evaluate_git(args, depth)
+    finally:
+        _restore_cwd(prev)
+
+
+def _evaluate_git(args: list[str], depth: int = 0) -> str | None:
     sub = find_subcommand(args)
     if sub is None:
         return None
@@ -1585,7 +2055,7 @@ def evaluate_git(args: list[str], depth: int = 0) -> str | None:
         expanded = shlex.split(expansion) + rest
     except Exception:
         return None  # unparseable alias -> fail open
-    return evaluate_git(expanded, depth + 1)
+    return _evaluate_git(expanded, depth + 1)
 
 
 def var_git_args(seg: list[str]) -> list[str] | None:
@@ -1718,14 +2188,38 @@ def expandable_substitutions(command: str) -> list[str]:
     return out
 
 
+def cd_target(seg: list[str]) -> str | None:
+    """`cd <dir>` as a simple command. Its effect on the rest of the line is
+    real — `cd <worktree> && git checkout <file>` names its target as plainly as
+    `git -C` does, and both were exit 0 — so it is honoured from here on.
+    Only the unambiguous one-operand form: `cd` with no operand (HOME), `cd -`
+    and `cd a b` all change nothing rather than guess."""
+    i = program_index(seg)
+    if i >= len(seg) or base_name(seg[i]) != "cd":
+        return None
+    ops = [a for a in seg[i + 1:] if not a.startswith("-")]
+    return ops[0] if len(ops) == 1 else None
+
+
 def scan_command(command: str, depth: int) -> None:
     """Evaluate one command string: redirections, then every simple command,
-    recursing into `bash -c` / `eval` payloads and executed `$(...)` bodies."""
+    recursing into `bash -c` / `eval` payloads and executed `$(...)` bodies.
+
+    `_CWD` is saved and restored around the whole scan: a `cd` inside a payload
+    (or a `!shell` alias body) must not leak out into the segments that follow
+    it at the caller's level."""
+    entry_cwd = _CWD
+    try:
+        _scan_command(command, depth)
+    finally:
+        _restore_cwd(entry_cwd)
+
+
+def _scan_command(command: str, depth: int) -> None:
     try:
         toks = token_stream(command)
     except Exception:
         return  # unparseable -> fail open for this level only
-    check_redirect_targets(toks)
 
     if depth < MAX_SHELL_DEPTH:
         # Scanned off the command with heredoc BODIES removed, never off the raw
@@ -1741,24 +2235,46 @@ def scan_command(command: str, depth: int) -> None:
             for inner in expandable_substitutions(body):
                 scan_command(inner, depth + 1)
 
-    for seg in split_segments(toks):
-        git_args = git_args_of(seg)
-        if git_args is None:
-            git_args = var_git_args(seg)
-        if git_args is not None:
-            reason = evaluate_git(git_args, depth)
-            if reason:
-                block(reason)
+    cur: list[str] = []
+    for k, tok in enumerate(toks):
+        if is_operator(tok):
+            if cur:
+                _scan_segment(cur, depth)
+                cur = []
+            # AFTER flushing, so a `cd` on this line is already in effect.
+            if tok in REDIRECT_OPS and k + 1 < len(toks):
+                check_redirect_target(toks[k + 1])
             continue
-        reason = non_git_reason(seg)
+        cur.append(tok)
+    if cur:
+        _scan_segment(cur, depth)
+
+
+def _scan_segment(seg: list[str], depth: int) -> None:
+    """One simple command. Split out of the token walk so redirect targets and
+    simple commands can be interleaved in source order — see
+    `check_redirect_target`."""
+    target = cd_target(seg)
+    if target is not None:
+        _set_cwd(target)
+        return
+    git_args = git_args_of(seg)
+    if git_args is None:
+        git_args = var_git_args(seg)
+    if git_args is not None:
+        reason = evaluate_git(git_args, depth)
         if reason:
             block(reason)
-        if depth >= MAX_SHELL_DEPTH:
-            continue
-        payload = shell_payload(seg) or eval_payload(seg)
-        if not payload:
-            continue
-        scan_command(payload, depth + 1)
+        return
+    reason = non_git_reason(seg)
+    if reason:
+        block(reason)
+    if depth >= MAX_SHELL_DEPTH:
+        return
+    payload = shell_payload(seg) or eval_payload(seg)
+    if not payload:
+        return
+    scan_command(payload, depth + 1)
 
 
 
@@ -1795,6 +2311,7 @@ def _main() -> None:
                 os.chdir(cwd)
         except Exception:
             pass  # unreadable/vanished cwd -> evaluate from here, never block on it
+    _init_cwd()   # `_CWD` tracks the payload cwd, and is re-pointed by -C / cd
 
     tool = data.get("tool_name")
     tool_input = data.get("tool_input") if isinstance(data.get("tool_input"), dict) else {}
