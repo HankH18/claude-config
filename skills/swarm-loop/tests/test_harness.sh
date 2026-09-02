@@ -331,6 +331,13 @@ for c in 1 2 3; do
 done
 ck_exit "(m) kill switch fires after 3 product-code-free cycles" 2 "$LAST_RC"
 ck_has "(m) KILL SWITCH is printed" "KILL SWITCH"
+# Both switches print "KILL SWITCH", and in this scenario BOTH counters reach
+# 3/3 — the codebase one fires only because it is checked first. So the generic
+# string no longer identifies which fired; assert this switch's own words, and
+# assert the other one's are absent, or a precedence flip goes undetected.
+ck_has "(m) and it is the CODEBASE switch, by its own message" "no codebase changes for"
+ck_hasnt "(m) not the goal-progress switch, which is also at its limit here" \
+   "no graded metric has improved"
 ck "(m) stall_count reached the limit" "3" "$(jget .swarm-loop/state.json "d['stall_count']")"
 
 # ===========================================================================
