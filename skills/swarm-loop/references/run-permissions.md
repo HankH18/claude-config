@@ -51,7 +51,7 @@ Phase 0 is where the guard is provisioned, so this is where its real scope belon
 
 ## The worktree location is a permission scope
 
-Phase 4 puts each worker's worktree at `../<repo>-worktrees/<task-id>` — a **sibling of the repo, outside the project root** — because a worktree inside the repo lands inside every root-walking metric command's scan. That fixes the measurement and creates a permission problem in the same move: `git worktree add` writes there, every worker then reads, edits and commits there, and the cleanup step `rm -rf`s it. A session scoped to the project root prompts on the first of those, which under this skill's premise is not one prompt — it is **every worker in the first mutating wave hung at once**, each one eventually marked failed-hung for a reason that has nothing to do with its task.
+Phase 4 puts each worker's worktree at `../<repo>-worktrees/<task-id>` — a **sibling of the repo, outside the project root** — because a worktree inside the repo lands inside every root-walking metric command's scan. That fixes the measurement and creates a permission problem in the same move: `git worktree add` writes there, every worker then reads, edits and commits there, and `swarmloop.py retire` calls `git worktree remove` against it (**not** `rm -rf` — that form is guard-blocked, exit 2). A session scoped to the project root prompts on the first of those, which under this skill's premise is not one prompt — it is **every worker in the first mutating wave hung at once**, each one eventually marked failed-hung for a reason that has nothing to do with its task.
 
 Three rules, in order:
 

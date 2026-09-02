@@ -2336,6 +2336,288 @@ ck_exit "P4 BC: resume runs on the pre-change log shape" 0 "$RC"
 ck_has "P4 BC: ...and still reads it as intact" "harness intact"
 
 # ===========================================================================
+# retire — mechanical worktree teardown
+#
+# The defect these cover: teardown was PROSE. merge-protocol step 10 had the
+# right command, the right refusal semantics and the right escalation path, and
+# nothing executed it — thirteen worktrees, ~14.7 GB measured, six of them
+# finished work, while the run reported nothing amiss. So two things are pinned
+# here: that `retire` retires exactly the trees whose work LANDED, and that
+# `checkpoint` says so out loud when it has not been run.
+#
+# The safety assertions are the load-bearing ones. `git worktree remove` without
+# --force is the only teardown that refuses a tree holding uncommitted work;
+# every case below that proves a refusal is really proving that an agent's
+# unsaved work survived a mechanical loop.
+# ===========================================================================
+section "retire: landed / refused / kept classification  [repo: rtire]"
+mk_repo rtire
+WTR="$TMP/rtire-worktrees"
+
+mk_wt() {  # mk_wt <id> — a task worktree carrying one commit on task/<id>
+  gq worktree add -q "$WTR/$1" -b "task/$1" main
+  ( cd "$WTR/$1" && echo "work $1" > "$1.txt" && git add -A && git commit -qm "$1 work" ) \
+    >/dev/null 2>&1
+  return 0
+}
+
+mk_wt T-01     # lands on main, left clean               -> RETIRED
+mk_wt T-02     # lands on main, left DIRTY               -> REFUSED
+mk_wt T-03     # never merged anywhere                   -> kept
+mk_wt T-04     # merged into an integration branch ONLY  -> kept
+gq merge --no-edit task/T-01
+gq merge --no-edit task/T-02
+echo "uncommitted agent work" > "$WTR/T-02/scratch.txt"
+gq branch integration/9001-b2 main
+gq checkout integration/9001-b2
+gq merge --no-edit task/T-04
+gq checkout main
+# A landed integration branch whose tree is already gone MUST be deleted; an
+# unlanded one MUST NOT be. Without these two, every branch in this repo is
+# protected by a live worktree and the ancestry test in _landed_branches is
+# never actually exercised — a mutant that deleted every task/ and integration/
+# branch it found stayed green.
+gq branch integration/9002-b1 task/T-01     # landed (T-01 is on main), no worktree
+gq branch task/T-05 task/T-03               # never landed, never had a worktree
+
+ck_nofile "retire runs with NO dispatch ledger at all (the live run has none)" \
+          ".swarm-loop/dispatch.jsonl"
+
+# --- --dry-run mutates NOTHING -------------------------------------------
+BEFORE_WT="$(git worktree list | sort)"
+BEFORE_BR="$(git branch --format='%(refname:short)' | sort)"
+BEFORE_ST="$(sha_of .swarm-loop/state.json)"
+sl retire --dry-run --idle-seconds 0
+ck_exit "retire --dry-run exits 0" 0 "$RC"
+ck_has "--dry-run announces itself" "DRY RUN"
+ck_has "--dry-run names the tree it WOULD retire" "WOULD RETIRE  task/T-01"
+ck_has "--dry-run names the branches it WOULD delete" "branches that WOULD be deleted"
+ck "--dry-run removed no worktree" "$BEFORE_WT" "$(git worktree list | sort)"
+ck "--dry-run deleted no branch" "$BEFORE_BR" "$(git branch --format='%(refname:short)' | sort)"
+ck "--dry-run wrote nothing to state.json" "$BEFORE_ST" "$(sha_of .swarm-loop/state.json)"
+ck_file "--dry-run left the retirable tree on disk" "$WTR/T-01/T-01.txt"
+
+# --- the idle guard is ON by default -------------------------------------
+# Fix agents re-entered an adjudicated ticket's worktree on the live run and
+# re-verification ran at the new tips. A freshly touched tree is never retired
+# by default, however landed its branch looks.
+sl retire
+ck_exit "retire under the default idle guard exits 0 (nothing removed)" 0 "$RC"
+ck_has "the idle guard is named, with its threshold" "idle guard: 900s"
+ck_has "...and says how to release it once agents are collected" "--idle-seconds 0"
+ck_file "the idle guard left the landed tree standing" "$WTR/T-01/T-01.txt"
+
+# --- the real thing -------------------------------------------------------
+sl retire --idle-seconds 0
+ck_exit "retire exits 1 when a tree REFUSES" 1 "$RC"
+ck_has "a landed CLEAN worktree is RETIRED" "RETIRED       task/T-01"
+ck_nofile "...and its directory is really gone" "$WTR/T-01/T-01.txt"
+ck_has "a landed DIRTY worktree REFUSES" "REFUSED       task/T-02"
+ck_has "...quoting git's own refusal rather than swallowing it" \
+       "contains modified or untracked files"
+ck_file "...and the agent's uncommitted work is INTACT (never forced)" "$WTR/T-02/scratch.txt"
+ck_has "a refusal is reported as a FINDING" "A REFUSAL IS A FINDING, NOT AN OBSTACLE"
+ck_has "...with the escalate command spelled out" "escalate --kind harness --subject"
+ck_has "an unmerged task branch is left alone" "kept          task/T-03"
+ck_has "...with a reason that says it did not land" "task/T-03 has NOT landed on main"
+ck_file "...and its diff survives for the retry packet" "$WTR/T-03/T-03.txt"
+ck_has "merged into an INTEGRATION branch is NOT landed" "kept          task/T-04"
+ck_file "...so a rejected/integration-only tree survives too" "$WTR/T-04/T-04.txt"
+ck_file "the PRIMARY checkout is never touched" "src/app.py"
+ck "no retire verdict line ever names the primary checkout" "0" \
+   "$(awk '/RETIRED|REFUSED|WOULD RETIRE|  kept /{n=split($NF,a,"/"); if (a[n]=="rtire") c++}
+           END{print c+0}' "$OUT")"
+ck "git still lists the primary checkout" "1" \
+   "$(git worktree list --porcelain | awk '/^worktree /{n=split($2,a,"/"); if (a[n]=="rtire") c++}
+      END{print c+0}')"
+
+# --- branch bookkeeping ---------------------------------------------------
+ck "the landed branch of a retired tree is deleted" "0" \
+   "$(git branch --list 'task/T-01' | wc -l | tr -d ' ')"
+ck "an unmerged branch is KEPT (its diff is the retry packet)" "1" \
+   "$(git branch --list 'task/T-03' | wc -l | tr -d ' ')"
+ck "an integration-only branch is KEPT" "1" \
+   "$(git branch --list 'task/T-04' | wc -l | tr -d ' ')"
+ck "a landed branch still checked out somewhere is NOT deleted" "1" \
+   "$(git branch --list 'task/T-02' | wc -l | tr -d ' ')"
+ck "a LANDED integration branch with no worktree IS deleted" "0" \
+   "$(git branch --list 'integration/9002-b1' | wc -l | tr -d ' ')"
+ck "an UNLANDED integration branch is kept" "1" \
+   "$(git branch --list 'integration/9001-b2' | wc -l | tr -d ' ')"
+ck "an unlanded task branch with no worktree is kept" "1" \
+   "$(git branch --list 'task/T-05' | wc -l | tr -d ' ')"
+
+# --- --json ---------------------------------------------------------------
+sl retire --idle-seconds 0 --json
+ck_exit "retire --json exits 1 while a refusal stands" 1 "$RC"
+ck "--json reports the refusal machine-readably" "task/T-02" \
+   "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1]))
+print(",".join(x["branch"] for x in d["refused"]))' "$OUT")"
+ck "--json reports the kept trees and why" "task/T-03,task/T-04" \
+   "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1]))
+print(",".join(sorted(x["branch"] for x in d["kept"])))' "$OUT")"
+ck "--json carries the worktree-root size" "True" \
+   "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1]))
+print(isinstance(d["root_size_kb"], int))' "$OUT")"
+
+# --- clearing the refusal by hand finishes the job -------------------------
+rm -f "$WTR/T-02/scratch.txt"
+sl retire --idle-seconds 0
+ck_exit "retire exits 0 once the refusal is cleared" 0 "$RC"
+ck_has "the once-dirty tree is now RETIRED" "RETIRED       task/T-02"
+ck_nofile "...and its directory is gone" "$WTR/T-02/T-02.txt"
+ck "...and its landed branch is deleted now nothing holds it" "0" \
+   "$(git branch --list 'task/T-02' | wc -l | tr -d ' ')"
+
+# --- retire never reaches for a force spelling ----------------------------
+# Behavioural proof is above (the dirty tree survived). This is the structural
+# one: no call inside the retire path may pass --force, `move`, or an rm.
+ck "no call in the retire path passes a force/move/rm argument" "0" \
+   "$(python3 - <<'PY'
+import ast, inspect, os, sys
+sys.path.insert(0, os.environ["SL_DIR"])
+import swarmloop
+BAD = {"--force", "-f", "move", "rmtree", "rm", "-rf"}
+n = 0
+for fn in (swarmloop._worktree_remove, swarmloop.cmd_retire,
+           swarmloop._landed_branches, swarmloop._retire_scan):
+    for node in ast.walk(ast.parse(inspect.getsource(fn))):
+        if not isinstance(node, ast.Call):
+            continue
+        lits = [a.value for a in node.args
+                if isinstance(a, ast.Constant) and isinstance(a.value, str)]
+        for sub_ in ast.walk(node):
+            if isinstance(sub_, (ast.List, ast.Tuple)):
+                lits += [e.value for e in sub_.elts
+                         if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+        if BAD & set(lits):
+            n += 1
+print(n)
+PY
+)"
+
+# ===========================================================================
+section "retire: the guards that keep a tree standing  [repo: rtguard]"
+mk_repo rtguard
+WTG="$TMP/rtguard-worktrees"
+
+# (i) a DETACHED worktree has no branch to test against main, so nothing proves
+#     its work landed. red-check makes exactly this kind of tree.
+gq worktree add -q --detach "$WTG/scratch" main
+sl retire --idle-seconds 0
+ck_exit "retire exits 0 with only a detached tree" 0 "$RC"
+ck_has "a detached worktree is kept, never retired" "detached HEAD"
+ck_file "...and it is still on disk" "$WTG/scratch/src/app.py"
+gq worktree remove "$WTG/scratch"
+
+# (ii) a LOCKED worktree: someone claimed it deliberately.
+gq worktree add -q "$WTG/T-10" -b task/T-10 main
+gq worktree lock "$WTG/T-10"
+sl retire --idle-seconds 0
+ck_exit "retire exits 0 with a locked landed tree" 0 "$RC"
+ck_has "a LOCKED worktree is kept" "LOCKED"
+ck_file "...and survives" "$WTG/T-10/src/app.py"
+gq worktree unlock "$WTG/T-10"
+
+# (iii) an OPEN dispatch is the strongest live-agent signal there is: it says so
+#       in words instead of being inferred from a timestamp.
+sl dispatch --agent fixer-1 --kind ticket --subject "T-10 rerun after adjudication"
+ck_exit "record an open dispatch on T-10" 0 "$RC"
+sl retire --idle-seconds 0
+ck_exit "retire exits 0 while a dispatch is open" 0 "$RC"
+ck_has "an OPEN dispatch keeps its ticket's worktree" "an OPEN dispatch still owns this tree"
+ck_has "...and names the agent" "fixer-1"
+ck_file "...and the tree survives" "$WTG/T-10/src/app.py"
+sl dispatch --close fixer-1
+sl retire --idle-seconds 0
+ck_exit "retire exits 0 after the dispatch is closed" 0 "$RC"
+ck_has "closing the dispatch releases the tree" "RETIRED       task/T-10"
+ck_nofile "...and it is reclaimed" "$WTG/T-10/src/app.py"
+
+# (iv) the PRIMARY checkout, even sitting on a landed task/ branch — which is
+#      what makes it pass the ownership union — is excluded STRUCTURALLY: git
+#      lists the main working tree first, and retire skips index 0. It is where
+#      the frozen metric commands run and the one tree whose loss ends the run.
+gq checkout -b task/PRIMARY-LOCAL
+sl retire --idle-seconds 0
+ck_exit "retire exits 0 with the primary checkout on a landed task/ branch" 0 "$RC"
+ck_hasnt "the primary checkout is never even a candidate" "REFUSED       task/"
+ck_hasnt "...and is never retired" "RETIRED       task/"
+ck_has "...retire simply reports it owns no worktrees" "nothing to retire"
+ck_file "...and the primary's files are untouched" "src/app.py"
+ck "...and the branch it is standing on is never deleted" "1" \
+   "$(git branch --list 'task/PRIMARY-LOCAL' | wc -l | tr -d ' ')"
+gq checkout main
+
+# ===========================================================================
+# The half that matters most. The teardown guidance already existed and was
+# simply never executed, and skipping it left NO trace anywhere the run could
+# see. checkpoint runs at every cycle boundary, so an accumulating worktree root
+# now shows up in the run's own output instead of only on the disk.
+# ===========================================================================
+section "checkpoint: the worktree teardown tripwire  [repo: rtcp]"
+mk_repo rtcp
+gq add -A; gq commit -qm harness
+sl checkpoint --cycle 0
+ck_exit "checkpoint with no worktrees exits 0" 0 "$RC"
+ck_hasnt "checkpoint says NOTHING about teardown when nothing is stale" \
+         "WORKTREE TEARDOWN OVERDUE"
+
+WTC="$TMP/rtcp-worktrees"
+gq worktree add -q "$WTC/T-20" -b task/T-20 main
+( cd "$WTC/T-20" && echo x > x.txt && git add -A && git commit -qm w ) >/dev/null 2>&1
+gq merge --no-edit task/T-20
+echo "# cycle 1" >> src/app.py; gq add -A; gq commit -qm "cycle 1 work"
+sl checkpoint --cycle 1
+ck_exit "checkpoint STILL exits 0 with a stale worktree (advisory, never fatal)" 0 "$RC"
+ck_has "checkpoint reports the overdue teardown" "WORKTREE TEARDOWN OVERDUE: 1 worktree(s)"
+ck_has "...names the branch still on disk" "task/T-20"
+ck_has "...reports the worktree-root size" "disk          :"
+ck_has "...and points at the command that fixes it" "swarmloop.py retire"
+ck_has "...and still prints the stall count it is actually for" "stall count:"
+
+# A tree whose work has NOT landed is not overdue for anything.
+sl retire --idle-seconds 0
+ck_exit "retire reclaims it" 0 "$RC"
+gq worktree add -q "$WTC/T-21" -b task/T-21 main
+( cd "$WTC/T-21" && echo y > y.txt && git add -A && git commit -qm w ) >/dev/null 2>&1
+echo "# cycle 2" >> src/app.py; gq add -A; gq commit -qm "cycle 2 work"
+sl checkpoint --cycle 2
+ck_exit "checkpoint exits 0" 0 "$RC"
+ck_hasnt "an UNLANDED worktree is never called overdue teardown" "WORKTREE TEARDOWN OVERDUE"
+
+# The tripwire may never be the thing that crashes a checkpoint.
+set_state worktree_root '"../nowhere-at-all"'
+echo "# cycle 3" >> src/app.py; gq add -A; gq commit -qm "cycle 3 work"
+sl checkpoint --cycle 3
+ck_exit "checkpoint survives a worktree_root that does not exist" 0 "$RC"
+ck_hasnt "...without a traceback" "Traceback"
+
+# ===========================================================================
+section "retire: backward compatibility with a pre-teardown .swarm-loop  [repo: rtbc]"
+mk_repo rtbc
+python3 - <<'PY'
+import json
+p = ".swarm-loop/state.json"
+s = json.load(open(p))
+for k in ("worktree_root", "worktree_root_size_kb", "worktree_root_size_at",
+          "last_retire_at", "base_branch"):
+    s.pop(k, None)
+json.dump(s, open(p, "w"), indent=2)
+PY
+ck "BC: the fixture really has no worktree_root key" "False" \
+   "$(jget .swarm-loop/state.json "'worktree_root' in d")"
+gq add -A; gq commit -qm bc
+sl retire --dry-run
+ck_exit "BC: retire runs on a state.json with none of the new keys" 0 "$RC"
+ck_has "BC: it falls back to the legacy in-tree worktree root" ".swarm-loop/worktrees"
+sl checkpoint --cycle 0
+ck_exit "BC: checkpoint runs on the pre-teardown state shape" 0 "$RC"
+ck_hasnt "BC: no traceback out of the tripwire" "Traceback"
+sl status
+ck_exit "BC: status is unchanged by the new optional keys" 0 "$RC"
+
+# ===========================================================================
 cd / 2>/dev/null || true
 ELAPSED=$(( $(date +%s) - START_TS ))
 echo

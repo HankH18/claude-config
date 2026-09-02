@@ -21,6 +21,7 @@ Subcommands:
   check-wave  Refuse a wave whose members could own the same file
   red-check   Prove each ticket's verify command FAILS before it is built
   dispatch    Record a dispatched agent / close one (append-only)
+  retire      Reclaim worktrees whose work LANDED on main (plain remove, never --force)
   resume      Reconstruct an interrupted run from artifacts alone
   status      Print loop state summary
 
@@ -3459,6 +3460,18 @@ def cmd_checkpoint(args):
             print("!!! and:                   git status")
             print("!!! Untracked '??' files that should be tracked are the tell.")
             print(bar)
+    # Worktree teardown tripwire. The teardown guidance existed and was simply
+    # never executed — thirteen trees, ~14.7 GB, six of them finished work — and
+    # skipping it left no trace anywhere the run could see. checkpoint runs at
+    # every cycle boundary, so this is where that becomes visible. STRICTLY
+    # ADVISORY: it prints, and the bare except is deliberate — a disk-hygiene
+    # notice may never be the thing that crashes a checkpoint or moves its exit
+    # code. Prints nothing at all when nothing is stale.
+    try:
+        _print_stale_worktree_warning(root, d, state)
+    except Exception as _e:      # noqa: BLE001 - a tripwire is never allowed to be the crash
+        print(f"(worktree teardown check skipped: {_e})")
+
     if state["stall_count"] >= state["stall_limit"]:
         print(f"KILL SWITCH: no codebase changes for {state['stall_count']} consecutive cycles — terminate the loop and report")
         sys.exit(2)
@@ -4732,6 +4745,521 @@ def _freeze_read_gate(root, d, state, allow, already_frozen=False):
 
 # ------------------------------------------------------------------ status
 
+# ------------------------------------------------- worktree teardown (retire)
+#
+# The disk finding. A provisioned worktree costs about a GIGABYTE (.venv ~312M
+# + node_modules ~636M), so the scaling law of fan-out is DISK, not context.
+# On the live run wave 1 merged, landed on main and was pushed — and its five
+# task/T-0xx worktrees plus the integration worktree were all still on disk when
+# wave 2 added six more: thirteen trees, ~14.7 GB measured, six of them finished
+# work. SKILL.md's merge protocol has said to retire them since step 10 was
+# written. The advice was never the defect. The defect was that NOTHING
+# EXECUTED IT and nothing noticed that nothing had, which is why this is a
+# subcommand with a `checkpoint` tripwire behind it and not another paragraph.
+#
+# The rules below are not negotiable, and they are the whole reason teardown is
+# safe to mechanise:
+#
+#   * plain `git worktree remove <path>` ONLY. It is the one teardown that
+#     validates the target really is a worktree and REFUSES one holding
+#     uncommitted work. That refusal IS the dirty-tree check — retire
+#     deliberately does not pre-check cleanliness, because a `git status`
+#     pre-flight races the agent that is still writing in the tree.
+#   * NEVER --force, NEVER `worktree move`, NEVER `rm -rf` of a worktree path.
+#     All three are blocked by hooks/git-guard.py, and --force discards exactly
+#     the uncommitted work the plain form exists to protect.
+#   * a refusal is a FINDING, not an obstacle: report it, leave the tree
+#     standing, and escalate. Same for a TIMEOUT — a 16 GB teardown once died at
+#     two minutes (exit 143), and the answer to that is a second `retire`, never
+#     a bigger hammer.
+#   * ANCESTOR OF main, never merged-into-integration. On the live run fix
+#     agents re-entered a ticket's worktree AFTER adjudication and
+#     re-verification ran at the new tips; a tree retired at integration-merge
+#     would have taken the fix with it.
+
+WORKTREE_IDLE_DEFAULT = 900     # seconds of quiet before a tree counts unattended
+WORKTREE_REMOVE_TIMEOUT = 120   # per `git worktree remove` (a 16 GB one hit 143 at 120s)
+WORKTREE_DU_TIMEOUT = 60        # `retire` sizing bound; 14.7 GB measured at ~38s cold
+WORKTREE_DU_CHECKPOINT = 3      # `checkpoint` sizing bound — it runs every cycle boundary
+
+
+def _worktree_root_abs(root, state):
+    """The run's recorded worktree root, absolute. Same fallback `resume` uses."""
+    return os.path.normpath(os.path.join(
+        root, state.get("worktree_root") or f"{STATE_DIR}/worktrees"))
+
+
+def _base_branch(state, explicit=None):
+    return explicit or state.get("base_branch") or "main"
+
+
+def _wt_records(root):
+    """`git worktree list --porcelain` -> [{"path","branch","flags"}], PRIMARY FIRST.
+
+    Parsed line-by-line off the `worktree ` sentinel rather than by splitting on
+    blank lines: a `locked <reason>` line carries arbitrary operator text, and
+    the record separator is not something to bet a deletion on. [] when git
+    cannot answer, which every caller reads as 'retire nothing'.
+    """
+    out = _git(root, "worktree", "list", "--porcelain")
+    if out.returncode != 0:
+        return []
+    recs, cur = [], None
+    for line in (out.stdout or "").splitlines():
+        if line.startswith("worktree "):
+            if cur:
+                recs.append(cur)
+            cur = {"path": line[len("worktree "):].strip(), "branch": None, "flags": set()}
+        elif cur is None or not line.strip():
+            continue
+        elif line.startswith("branch "):
+            cur["branch"] = line[len("branch "):].strip()
+        else:
+            cur["flags"].add(line.split(" ", 1)[0].strip())
+    if cur:
+        recs.append(cur)
+    return recs
+
+
+def _short_branch(branch):
+    if not branch:
+        return None
+    return branch[len("refs/heads/"):] if branch.startswith("refs/heads/") else branch
+
+
+def _ticket_of_branch(branch):
+    """'refs/heads/task/T-014' -> 'T-014'; None for anything not a task branch."""
+    short = _short_branch(branch)
+    if short and short.startswith("task/"):
+        return short[len("task/"):] or None
+    return None
+
+
+def _is_ancestor(root, ref, base):
+    """True / False / None. None means git could not answer (a ref that is gone,
+    an unborn base) and is deliberately NOT folded into False — 'unknown' must
+    keep a tree, and False must be reportable as 'this work did not land'."""
+    out = _git(root, "merge-base", "--is-ancestor", ref, base)
+    if out.returncode == 0:
+        return True
+    if out.returncode == 1:
+        return False
+    return None
+
+
+def _wt_admin_dir(path):
+    """A linked worktree's admin dir ($GIT_COMMON_DIR/worktrees/<name>), read out
+    of its `.git` FILE. One open() instead of a `git rev-parse` subprocess,
+    because this is called per tree from `checkpoint`."""
+    p = os.path.join(path, ".git")
+    try:
+        if os.path.isdir(p):
+            return p                       # the primary checkout
+        with open(p) as f:
+            line = f.read().strip()
+    except OSError:
+        return None
+    if line.startswith("gitdir:"):
+        return os.path.normpath(os.path.join(path, line.split(":", 1)[1].strip()))
+    return None
+
+
+def _wt_last_activity(path):
+    """Newest mtime among cheap agent-driven signals in a worktree; None = unknown.
+
+    Deliberately NOT a walk of the tree. A provisioned worktree carries a .venv
+    and node_modules — `du -sk` of the live run's thirteen took 38 seconds — and
+    this runs from `checkpoint`. These few stat() calls cost nothing and move for
+    exactly the events that matter: a commit (logs/HEAD, COMMIT_EDITMSG), a
+    checkout (HEAD, ORIG_HEAD), an index refresh (index), and any file created or
+    deleted at the top of the tree (the directory itself).
+    """
+    newest = None
+    cands = [path]
+    admin = _wt_admin_dir(path)
+    if admin:
+        cands += [os.path.join(admin, n) for n in
+                  ("index", "HEAD", "ORIG_HEAD", "logs/HEAD", "COMMIT_EDITMSG")]
+    for c in cands:
+        try:
+            m = os.lstat(c).st_mtime
+        except OSError:
+            continue
+        if newest is None or m > newest:
+            newest = m
+    return newest
+
+
+def _dispatch_holder(open_recs, path, branch):
+    """An OPEN dispatch record that plausibly still owns this worktree, or None.
+
+    The ledger is OPTIONAL: the live run has no dispatch.jsonl at all, so
+    _open_dispatches returns [] and this contributes nothing rather than
+    exploding. When the ledger IS kept it is the best live-agent signal there is,
+    because it says so in words instead of being inferred from a timestamp.
+    """
+    npath = os.path.normpath(path)
+    tid = _ticket_of_branch(branch)
+    short = _short_branch(branch)
+    for r in open_recs:
+        rp = str(r.get("worktree") or "").strip()
+        if rp and os.path.normpath(rp) == npath:
+            return r
+        subj = str(r.get("subject") or "")
+        if short and short in subj:
+            return r
+        if tid and re.search(r"(?<![A-Za-z0-9_])" + re.escape(tid) + r"(?![A-Za-z0-9_])", subj):
+            return r
+    return None
+
+
+def _retire_scan(root, state, base, idle_seconds, now=None):
+    """Classify this run's worktrees. -> (worktree_root, candidates, kept)
+
+    candidates  retirable: the branch has LANDED on `base` and nothing is holding
+                the tree. Cleanliness is NOT tested here on purpose — see the
+                section header.
+    kept        [(rec, reason)] for everything this run owns that is not
+                retirable. A reason is always a sentence an operator can act on.
+
+    Worktrees this run does not own are not reported at all. Ownership uses the
+    SAME union `resume` uses — the recorded root, the legacy in-tree path, or any
+    tree sitting on a refs/heads/task/ branch — because Phase 4 moved worktrees
+    to a sibling directory and matching a single spelling made every run on the
+    other layout invisible. (resume still carries that rule inline; fold the two
+    together when there is no live build invoking this file by path.)
+    """
+    now = time.time() if now is None else now
+    wt_root = _worktree_root_abs(root, state)
+    recs = _wt_records(root)
+    open_recs = _open_dispatches(sd(root))
+    base_ok = _git(root, "rev-parse", "--verify", "--quiet",
+                   base + "^{commit}").returncode == 0
+    nroot = os.path.normpath(root)
+    cands, kept = [], []
+    for i, rec in enumerate(recs):
+        path = rec["path"]
+        npath = os.path.normpath(path)
+        # The primary checkout is excluded STRUCTURALLY (git always lists it
+        # first) and again by path. It is where the frozen metric commands run,
+        # and it is the one tree whose loss would end the run.
+        if i == 0 or npath == nroot or "bare" in rec["flags"]:
+            continue
+        owned = (npath.startswith(wt_root + os.sep)
+                 or f"{STATE_DIR}/worktrees" in path
+                 or bool(rec["branch"] and rec["branch"].startswith("refs/heads/task/")))
+        if not owned:
+            continue
+        short = _short_branch(rec["branch"])
+        if not base_ok:
+            kept.append((rec, "cannot resolve base ref '%s' — nothing here is provably "
+                              "landed, so nothing is retirable" % base))
+            continue
+        if "prunable" in rec["flags"]:
+            kept.append((rec, "git reports this worktree prunable (its directory is gone) — "
+                              "`git worktree prune` clears the stale record; retire does not "
+                              "guess at half-deleted trees"))
+            continue
+        if "locked" in rec["flags"]:
+            kept.append((rec, "LOCKED (`git worktree lock`) — someone claimed this tree "
+                              "deliberately; unlock it yourself if that claim is stale"))
+            continue
+        if not rec["branch"]:
+            kept.append((rec, "detached HEAD — there is no branch to test against %s, so "
+                              "nothing proves this work landed" % base))
+            continue
+        anc = _is_ancestor(root, rec["branch"], base)
+        if anc is None:
+            kept.append((rec, "git could not compare %s to %s" % (short, base)))
+            continue
+        if not anc:
+            kept.append((rec, "%s has NOT landed on %s — merged into an integration branch "
+                              "is NOT landed. Rejected or in-flight work keeps its diff in "
+                              "this tree for the retry packet" % (short, base)))
+            continue
+        holder = _dispatch_holder(open_recs, path, rec["branch"])
+        if holder:
+            kept.append((rec, "an OPEN dispatch still owns this tree: %s (%s) — "
+                              "`dispatch --close %s` when that agent is collected"
+                              % (holder.get("agent_ref"), holder.get("subject"),
+                                 holder.get("agent_ref"))))
+            continue
+        if idle_seconds > 0:
+            last = _wt_last_activity(path)
+            if last is not None and (now - last) < idle_seconds:
+                kept.append((rec, "touched %ds ago (idle guard: %ds) — a fix agent re-entering "
+                                  "an adjudicated ticket's tree is exactly how landed work gets "
+                                  "retired too early. Re-run with --idle-seconds 0 once every "
+                                  "agent for this tree is collected"
+                                  % (int(now - last), idle_seconds)))
+                continue
+        cands.append(rec)
+    return wt_root, cands, kept
+
+
+def _worktree_remove(root, path, timeout):
+    """Plain `git worktree remove`. -> (True, "") or (False, reason).
+
+    There is no --force path in this function and there must never be one: the
+    plain form's refusal of a dirty tree is the only thing standing between an
+    agent's uncommitted work and a mechanical loop that runs every cycle.
+    """
+    try:
+        out = subprocess.run(["git", "worktree", "remove", path],
+                             capture_output=True, text=True, cwd=root, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, ("`git worktree remove` did not finish within %ds — treated as a "
+                       "REFUSAL. A 16 GB teardown timed out at two minutes once already; "
+                       "removal is resumable, so re-run retire (with a larger --timeout if "
+                       "the tree really is that big). NEVER escalate a timeout to --force"
+                       % timeout)
+    except OSError as e:
+        return False, "could not run git: %s" % e
+    if out.returncode == 0:
+        return True, ""
+    msg = " ".join(((out.stderr or "") + " " + (out.stdout or "")).split())
+    return False, msg or ("git worktree remove exited %d" % out.returncode)
+
+
+def _landed_branches(root, base, assume_removed=()):
+    """task/* and integration/* branches that are ancestors of `base` and are
+    checked out NOWHERE. Ancestor-of-base is what makes `git branch -D` lossless:
+    every commit on the branch is already reachable from base. A branch that is
+    NOT an ancestor is a rejected or in-flight ticket and keeps its diff."""
+    out = _git(root, "for-each-ref", "--format=%(refname)",
+               "refs/heads/task", "refs/heads/integration")
+    if out.returncode != 0:
+        return []
+    gone = set(assume_removed)
+    live = set(r["branch"] for r in _wt_records(root) if r["branch"]) - gone
+    landed = []
+    for ref in (out.stdout or "").splitlines():
+        ref = ref.strip()
+        if not ref or ref in live:
+            continue
+        if _is_ancestor(root, ref, base) is True:
+            landed.append(_short_branch(ref))
+    return sorted(landed)
+
+
+def _du_kb(path, timeout):
+    """(kilobytes, note). Always bounded: `du -sk` of the live run's 14.7 GB
+    worktree root took 38 seconds cold, which is why no caller ever runs it
+    unbounded and `checkpoint` gives it three seconds and a cached fallback."""
+    if timeout <= 0:
+        return None, "sizing skipped"
+    if not os.path.isdir(path):
+        return None, "no worktree root on disk"
+    try:
+        out = subprocess.run(["du", "-sk", path], capture_output=True, text=True,
+                             timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, "du exceeded %ds" % timeout
+    except OSError as e:
+        return None, "du unavailable (%s)" % e
+    if out.returncode != 0:
+        return None, "du failed"
+    try:
+        return int((out.stdout or "").split()[0]), ""
+    except (ValueError, IndexError):
+        return None, "du output not understood"
+
+
+def _human_kb(kb):
+    if kb is None:
+        return "?"
+    v = float(kb)
+    for unit in ("K", "M", "G", "T"):
+        if v < 1024.0 or unit == "T":
+            return "%.1f%s" % (v, unit)
+        v /= 1024.0
+
+
+def _print_stale_worktree_warning(root, d, state):
+    """checkpoint's teardown tripwire. Prints NOTHING when nothing is stale.
+
+    This is the half of the change that matters. Retiring worktrees was already
+    documented and already correct; what was missing was any way for the run to
+    notice it had been skipped. checkpoint runs at every cycle boundary, so this
+    is where an accumulating worktree root becomes visible in the run's OWN
+    OUTPUT instead of only on the disk. Advisory by construction: it prints and
+    returns, and it must never gain the power to end a run — a full disk is a
+    cost, not a corrupted result.
+
+    Scanned with idle_seconds=0 ON PURPOSE, which is the one place this differs
+    from `retire`. The idle guard protects a REMOVAL — it is what stops a tree a
+    fix agent re-entered from being deleted. A printed line cannot hurt a busy
+    tree, and running the warning under the guard made it go silent for fifteen
+    minutes after every wave landed: precisely the moment a batch of finished
+    trees hits the disk, and precisely the thing this exists to make visible.
+    Each line instead says whether `retire` would currently hold that tree back.
+    """
+    base = _base_branch(state)
+    wt_root, cands, _kept = _retire_scan(root, state, base, 0)
+    if not cands:
+        return
+    now = time.time()
+    open_recs = _open_dispatches(d)
+    holds = []
+    for rec in cands:
+        holder = _dispatch_holder(open_recs, rec["path"], rec["branch"])
+        if holder:
+            holds.append("  (open dispatch %s — retire holds this one)" % holder.get("agent_ref"))
+            continue
+        last = _wt_last_activity(rec["path"])
+        if last is not None and (now - last) < WORKTREE_IDLE_DEFAULT:
+            holds.append("  (touched %ds ago — retire holds this one)" % int(now - last))
+        else:
+            holds.append("")
+    size_kb, note = _du_kb(wt_root, WORKTREE_DU_CHECKPOINT)
+    if size_kb is not None:
+        disk = _human_kb(size_kb)
+    else:
+        cached = state.get("worktree_root_size_kb")
+        if cached:
+            disk = ("%s as of %s (cached by the last retire; this checkpoint's own du: %s)"
+                    % (_human_kb(cached), state.get("worktree_root_size_at") or "?", note))
+        else:
+            disk = "not measured (%s) — `retire --dry-run` reports it" % note
+    bar = "-" * 74
+    print(bar)
+    print("WORKTREE TEARDOWN OVERDUE: %d worktree(s) have LANDED on %s and are still on disk"
+          % (len(cands), base))
+    for rec, hold in zip(cands, holds):
+        print("  %-26s %s%s" % (_short_branch(rec["branch"]) or "DETACHED", rec["path"], hold))
+    print("  worktree root : %s" % wt_root)
+    print("  disk          : %s" % disk)
+    print("  A provisioned worktree costs about a GIGABYTE (.venv + node_modules), so the")
+    print("  scaling law of fan-out is DISK, not context. Reclaim them now:")
+    print("      swarmloop.py retire")
+    if all(h for h in holds):
+        print("  (every one is held back right now for the reason noted beside it — once")
+        print("   those agents are collected, `retire --idle-seconds 0` reclaims them)")
+    print("  (advisory only — this never changes checkpoint's exit code)")
+    print(bar)
+
+
+def cmd_retire(args):
+    """Reclaim every worktree of this run whose work has LANDED on the base branch."""
+    root = repo_root()
+    d = sd(root)
+    spath = os.path.join(d, STATE_FILE)
+    state = load_json(spath, "state")
+    base = _base_branch(state, args.base)
+    idle = max(0, args.idle_seconds)
+    timeout = max(1, args.timeout)
+    wt_root, cands, kept = _retire_scan(root, state, base, idle)
+
+    retired, refused = [], []
+    if not args.dry_run:
+        for rec in cands:
+            ok, why = _worktree_remove(root, rec["path"], timeout)
+            (retired if ok else refused).append((rec, why))
+
+    # Branch cleanup. In --dry-run the candidate trees have NOT been removed, so
+    # their branches still read as checked out; assume_removed keeps the dry run
+    # honest about what the real run would delete.
+    branches_deleted, branches_planned, branches_failed = [], [], []
+    if not args.keep_branches:
+        assume = [r["branch"] for r in (cands if args.dry_run else [x[0] for x in retired])
+                  if r["branch"]]
+        landed = _landed_branches(root, base, assume)
+        if args.dry_run:
+            branches_planned = landed
+        else:
+            for b in landed:
+                if _git(root, "branch", "-D", b).returncode == 0:
+                    branches_deleted.append(b)
+                else:
+                    branches_failed.append(b)
+
+    size_kb, size_note = _du_kb(wt_root, max(0, args.du_seconds))
+    after = _wt_records(root)
+    remaining = max(0, len(after) - 1)      # the primary checkout is not "remaining"
+
+    # State is bookkeeping, never the point of the command: --dry-run writes
+    # nothing at all, and a failed write is a note rather than a failure.
+    if not args.dry_run:
+        try:
+            with _state_lock(d):
+                st = load_json(spath, "state")
+                st["last_retire_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+                if size_kb is not None:
+                    st["worktree_root_size_kb"] = size_kb
+                    st["worktree_root_size_at"] = st["last_retire_at"]
+                save_json(spath, st)
+        except Exception as e:              # noqa: BLE001
+            if not args.as_json:
+                print("retire: note: could not record the size in %s/%s (%s)"
+                      % (STATE_DIR, STATE_FILE, e))
+
+    if args.as_json:
+        def _rows(pairs):
+            return [{"path": r["path"], "branch": _short_branch(r["branch"]),
+                     "ticket": _ticket_of_branch(r["branch"]), "reason": why}
+                    for r, why in pairs]
+        print(json.dumps({
+            "worktree_root": wt_root,
+            "base": base,
+            "dry_run": bool(args.dry_run),
+            "idle_seconds": idle,
+            "retirable": [{"path": r["path"], "branch": _short_branch(r["branch"]),
+                           "ticket": _ticket_of_branch(r["branch"])} for r in cands],
+            "retired": _rows(retired),
+            "refused": _rows(refused),
+            "kept": _rows(kept),
+            "branches_deleted": branches_deleted,
+            "branches_would_delete": branches_planned,
+            "branches_delete_failed": branches_failed,
+            "worktrees_remaining": remaining,
+            "root_size_kb": size_kb,
+            "root_size": _human_kb(size_kb) if size_kb is not None else None,
+            "root_size_note": size_note,
+        }, indent=2, sort_keys=True))
+        sys.exit(1 if refused else 0)
+
+    print("retire: base %s · worktree root %s%s"
+          % (base, wt_root, "  [DRY RUN — nothing will be touched]" if args.dry_run else ""))
+    if not cands and not kept:
+        print("  nothing to retire — this run owns no worktrees")
+    for rec in cands if args.dry_run else []:
+        print("  WOULD RETIRE  %-24s %s"
+              % (_short_branch(rec["branch"]) or "DETACHED", rec["path"]))
+    for rec, _why in retired:
+        print("  RETIRED       %-24s %s"
+              % (_short_branch(rec["branch"]) or "DETACHED", rec["path"]))
+    for rec, why in refused:
+        print("  REFUSED       %-24s %s"
+              % (_short_branch(rec["branch"]) or "DETACHED", rec["path"]))
+        print("                %s" % why)
+    for rec, why in kept:
+        print("  kept          %-24s %s"
+              % (_short_branch(rec["branch"]) or "DETACHED", rec["path"]))
+        print("                %s" % why)
+    if branches_planned:
+        print("  branches that WOULD be deleted (landed on %s): %s"
+              % (base, ", ".join(branches_planned)))
+    if branches_deleted:
+        print("  branches deleted (landed on %s): %s" % (base, ", ".join(branches_deleted)))
+    if branches_failed:
+        print("  branches git refused to delete: %s" % ", ".join(branches_failed))
+    print("  summary: %d retired · %d REFUSED · %d kept · %d worktree(s) still on disk"
+          % (len(retired), len(refused), len(kept), remaining))
+    print("  worktree root size: %s%s"
+          % (_human_kb(size_kb) if size_kb is not None else "unmeasured",
+             "" if size_kb is not None else " (%s)" % size_note))
+    if refused:
+        print("  A REFUSAL IS A FINDING, NOT AN OBSTACLE. The tree is still standing and its")
+        print("  uncommitted work is intact. Do NOT reach for --force or rm -rf (both are")
+        print("  blocked by git-guard, and --force discards exactly what the refusal saved).")
+        print("  Record each one so a sleeping operator sees it:")
+        for rec, why in refused:
+            print('      swarmloop.py escalate --kind harness --subject "%s" \\' % rec["path"])
+            print('          --reason "%s"' % _oneline(why, 160))
+        sys.exit(1)
+    sys.exit(0)
+
+
 def cmd_status(args):
     root = repo_root()
     d = sd(root)
@@ -4981,6 +5509,32 @@ def main():
     s.add_argument("--list", action="store_true", dest="do_list",
                    help="print dispatches that were never closed")
     s.set_defaults(func=cmd_dispatch)
+
+    s = sub.add_parser("retire", help="reclaim worktrees whose work has LANDED on the base "
+                                      "branch (plain `git worktree remove`, never --force)")
+    s.add_argument("--dry-run", action="store_true",
+                   help="report the plan and mutate NOTHING — no removal, no branch delete, "
+                        "no state write")
+    s.add_argument("--json", action="store_true", dest="as_json",
+                   help="machine-readable report instead of the human one")
+    s.add_argument("--base", default=None, metavar="REF",
+                   help="the branch work must have LANDED on before its tree is retirable "
+                        "(default: state's base_branch, else main). Merged into an integration "
+                        "branch is NOT landed")
+    s.add_argument("--idle-seconds", type=int, default=WORKTREE_IDLE_DEFAULT, metavar="N",
+                   help="keep any tree whose git activity is newer than N seconds — the guard "
+                        "against retiring a tree a fix agent re-entered after adjudication "
+                        f"(default {WORKTREE_IDLE_DEFAULT}; 0 disables it)")
+    s.add_argument("--timeout", type=int, default=WORKTREE_REMOVE_TIMEOUT, metavar="SEC",
+                   help="seconds allowed for ONE `git worktree remove`; a timeout is reported "
+                        "as a REFUSAL and never escalated to --force (default "
+                        f"{WORKTREE_REMOVE_TIMEOUT})")
+    s.add_argument("--du-seconds", type=int, default=WORKTREE_DU_TIMEOUT, metavar="SEC",
+                   help="bound on sizing the worktree root; 0 skips it (default "
+                        f"{WORKTREE_DU_TIMEOUT} — 14.7 GB measured at ~38s)")
+    s.add_argument("--keep-branches", action="store_true",
+                   help="retire the worktrees but delete no branches")
+    s.set_defaults(func=cmd_retire)
 
     s = sub.add_parser("resume", help="reconstruct run state after an interrupted session")
     s.set_defaults(func=cmd_resume)
