@@ -58,6 +58,11 @@ BLOB = "A" * 20001
 # ---------------------------------------------------------------------------
 
 MUST_BLOCK = [
+    # force-spellings the flag/cluster scans never reached (docstring claimed blocked)
+    ("branch-force-move-M","git branch -M old new"),
+    ("branch-force-copy",  "git branch -C old new"),
+    ("branch-mf-cluster",  "git branch -mf old new"),
+
     # -- multi-line: the destructive op is not on line 1 ---------------------
     ("nl-basic",              "git status\ngit stash"),
     ("nl-cd",                 "cd /repo\ngit reset --hard"),
@@ -452,6 +457,9 @@ MUST_BLOCK = [
 # ---------------------------------------------------------------------------
 
 MUST_ALLOW = [
+    ("branch-rename-plain", "git branch -m old new"),
+    # the neighbours proving the force fix did not over-block
+
     # -- the loop's own worktree / merge protocol ----------------------------
     ("wt-add",                "git worktree add .swarm-loop/worktrees/t1 -b task/t1 main"),
     ("wt-teardown",           "git worktree remove .swarm-loop/worktrees/t1 && git worktree prune && git branch -D task/t1"),
@@ -908,6 +916,17 @@ MUST_ALLOW = [
 # ---------------------------------------------------------------------------
 
 PAYLOAD_CASES = [
+    # `--force`/`-f` forces EVERY refspec, so `src:dst` is then exactly as
+    # destructive as `+src:dst`. check_fetch skipped every dash-token, so it
+    # never saw the flag. Pinned to a repo cwd on purpose: outside one, git
+    # cannot resolve whether the destination branch exists and the command
+    # would fail anyway, so ALLOW there is correct, not a miss.
+    ("fetch-force-flag-in-repo", BLOCK,
+     {"tool_name": "Bash", "cwd": "{REPO}",
+      "tool_input": {"command": "git fetch --force origin main:main"}}),
+    ("fetch-force-short-in-repo", BLOCK,
+     {"tool_name": "Bash", "cwd": "{REPO}",
+      "tool_input": {"command": "git fetch -f origin main:main"}}),
     # -- cwd. Reproduced against the live hook before the fix: payload
     #    byte-identical, always declaring the worktree; hook process cwd =
     #    primary -> ALLOWED, hook process cwd = worktree -> BLOCKED. The control

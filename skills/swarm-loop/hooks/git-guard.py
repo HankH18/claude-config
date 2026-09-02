@@ -1157,7 +1157,11 @@ def check_branch(rest: list[str]) -> str | None:
     -m/-c/-u/-t take values that can attach, so the cluster scan stops there."""
     if long_opt_abbrev(rest, "--delete") or short_flag_has(rest, "dD", "umcMC"):
         return None
-    if long_opt_abbrev(rest, "--force") or short_flag_has(rest, "f", "umcMC"):
+    if long_opt_abbrev(rest, "--force") or short_flag_has(rest, "fMC", "ut"):
+        # -M is --move --force and -C is --copy --force; the old scan stopped
+        # at M/C as if they took attached values, so the standard force-rename
+        # spelling walked through while --move --force was blocked. Only -u/-t
+        # actually take a value that can attach.
         return ("`git branch -f/--force` moves an existing branch to another "
                 "commit, orphaning everything reachable only from where it was — "
                 "the same effect as the `git update-ref` this guard blocks.\n"
@@ -1170,11 +1174,15 @@ def check_fetch(rest: list[str]) -> str | None:
     (or a tag) that way is the ORDINARY default refspec and must stay allowed;
     fetching into a LOCAL branch overwrites it with no merge and no reflog
     warning, which is `git reset --hard` for the ref."""
+    # `--force`/`-f` forces every refspec on the line, so a plain `src:dst` is
+    # then exactly as destructive as `+src:dst`. The old loop skipped every
+    # dash-token, so it never saw the flag and only ever caught the `+` form.
+    forced = long_opt_abbrev(rest, "--force") or short_flag_has(rest, "f", "ou")
     for a in rest:
         if a.startswith("-") or ":" not in a:
             continue
         s, _, d = a.partition(":")
-        if not s.startswith("+"):
+        if not s.startswith("+") and not forced:
             continue
         d = d.strip()
         if not d or d.startswith("refs/remotes/") or d.startswith("refs/tags/"):
