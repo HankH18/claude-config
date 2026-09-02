@@ -4342,6 +4342,284 @@ def cmd_check_wave(args):
           "overlaps them")
 
 
+# ------------------------------------------------- findings -> tickets
+
+FINDINGS_FILE = "findings.jsonl"
+
+# Ranked so a threshold comparison is an integer comparison and never a string
+# one. UNKNOWN is deliberately absent: an unrecognised severity is an error, not
+# a silent skip, because a severity nobody recognises is exactly how a HIGH gets
+# filtered out of its own report.
+SEVERITY_RANK = {"BLOCKER": 5, "CRITICAL": 5, "HIGH": 4,
+                 "MEDIUM": 3, "LOW": 2, "INFO": 1}
+
+
+def _finding_digest(rec):
+    """Stable identity for a finding: severity + location + defect, verbatim."""
+    payload = json.dumps({k: rec.get(k) for k in ("severity", "location", "defect")},
+                         sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _finding_scope(location):
+    """The FILE a location names, with a trailing line range removed and NOTHING else.
+
+    The live defect this exists to make impossible: the in-session formatter did
+    `str(x.get('location')).split('/')[-1][:60]` — keep the basename, throw the
+    directory away — so `fixtures/generator/__init__.py:175` was recorded as
+    `__init__.py:175`, and four of eight minted tickets pointed at a file that
+    does not contain the defect. A ticket naming the wrong file is worse than no
+    ticket: it sends a worker to read code that is fine, and the real defect
+    keeps its cover. There is no '/' split in this function and there must never
+    be one.
+    """
+    loc = str(location or "").strip()
+    if not loc:
+        return None
+    m = re.match(r"^(.*?):(\d+)(?:-(\d+))?$", loc)
+    return ((m.group(1) if m else loc).strip()) or None
+
+
+def _read_findings(path):
+    """[records] from a JSON array, a {"findings": [...]} object, or JSONL.
+
+    Accepts all three because the producer is a checker subagent whose output
+    shape the harness does not own, and refusing the shape is how a report ends
+    up pasted into a commit message instead."""
+    try:
+        raw = sys.stdin.read() if path == "-" else open(path).read()
+    except OSError as e:
+        die(f"cannot read findings from {path!r}: {e}")
+    raw = raw.strip()
+    if not raw:
+        die(f"no findings in {path!r} — an empty report is not a clean report; if the "
+            "checkers genuinely returned nothing, say so in the cycle report rather than "
+            "recording an empty file")
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        data = []
+        for i, line in enumerate(raw.splitlines(), 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data.append(json.loads(line))
+            except ValueError as e:
+                die(f"{path}: line {i} is neither part of a JSON document nor a JSONL "
+                    f"record: {e}")
+    if isinstance(data, dict):
+        data = data.get("findings") or data.get("results") or [data]
+    if not isinstance(data, list):
+        die(f"{path}: expected a list of finding records, or an object with a "
+            f"'findings' list — got {type(data).__name__}")
+    out = []
+    for i, rec in enumerate(data):
+        if not isinstance(rec, dict):
+            die(f"{path}: entry {i} is a {type(rec).__name__}, not a finding object")
+        out.append(rec)
+    return out
+
+
+def cmd_findings(args):
+    """Record checker findings durably, THEN mint tickets from them.
+
+    Two live defects, one command, and the order is the whole point.
+
+    (1) Five checkers returned six HIGH defects as structured records. The
+        MEDIUMs were persisted as tickets; the HIGHs were written to no repo
+        artifact at all — not escalations, not the backlog, not a report — and
+        survived only in a subagent journal and two commit messages. The
+        severity filter was, in effect, inverted: the band that most needed a
+        ticket got nothing. So EVERY record is appended verbatim to
+        findings.jsonl BEFORE any threshold is applied, and the reconciliation
+        between what was recorded and what was minted is printed every run and
+        asserted at the end. A finding can be judged not worth a ticket; it can
+        no longer be judged out of existence.
+
+    (2) The formatter that minted the tickets basename-split `location` and
+        never read `reproduction`, so half the tickets pointed at the wrong
+        file. Both fields are now carried verbatim — see _finding_scope.
+
+    The harness offered nothing for this step, so every run re-invented it and
+    re-invented the bugs. That is why this is a subcommand and not a paragraph
+    in references/: the last three things that were only a paragraph were the
+    worktree teardown that never ran, the LEARNED.md append that never happened,
+    and this."""
+    root = repo_root()
+    d = sd(root)
+    os.makedirs(d, exist_ok=True)
+    records = _read_findings(args.file)
+
+    # --- validate BEFORE writing anything: a half-recorded batch is worse than
+    #     a refused one, because the operator cannot tell which half landed.
+    threshold = SEVERITY_RANK[args.min_severity.strip().upper()]
+    bad = []
+    for i, rec in enumerate(records):
+        sev = str(rec.get("severity") or "").strip().upper()
+        if sev not in SEVERITY_RANK:
+            bad.append(f"  entry {i}: severity {rec.get('severity')!r} is not one of "
+                       + "/".join(sorted(SEVERITY_RANK, key=lambda k: -SEVERITY_RANK[k])))
+        if not str(rec.get("defect") or "").strip():
+            bad.append(f"  entry {i}: no 'defect' text — a finding with no statement of "
+                       "the defect cannot become a ticket anyone can act on")
+    if bad:
+        print("REFUSED: the finding report is malformed, and nothing has been written:")
+        for b in bad:
+            print(b)
+        die("fix the report and re-run; an unrecognised severity is how a HIGH gets "
+            "silently dropped, which is the defect this command exists to prevent")
+
+    # --- 1. record EVERY finding, verbatim, at every severity, first.
+    fpath = os.path.join(d, FINDINGS_FILE)
+    seen = set()
+    if os.path.exists(fpath):
+        try:
+            with open(fpath) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        seen.add(json.loads(line).get("finding_id"))
+                    except ValueError:
+                        continue
+        except OSError:
+            seen = set()
+
+    stamped, fresh = [], 0
+    for rec in records:
+        fid = _finding_digest(rec)
+        out = dict(rec)                     # the producer's fields, untouched
+        out["finding_id"] = fid
+        out["severity"] = str(rec.get("severity")).strip().upper()
+        out.setdefault("recorded_at", time.strftime("%Y-%m-%dT%H:%M:%S"))
+        if args.cycle is not None:
+            out.setdefault("cycle", args.cycle)
+        stamped.append(out)
+        if fid not in seen:
+            fresh += 1
+    if not args.dry_run:
+        with open(fpath, "a") as f:
+            for out in stamped:
+                if out["finding_id"] not in seen:
+                    f.write(json.dumps(out, sort_keys=True, ensure_ascii=False) + "\n")
+
+    by_sev = {}
+    for out in stamped:
+        by_sev.setdefault(out["severity"], []).append(out)
+    order = sorted(by_sev, key=lambda s: -SEVERITY_RANK[s])
+    print(f"findings: {len(stamped)} record(s) read, {fresh} new"
+          + ("  [DRY RUN — nothing written]" if args.dry_run else
+             f" appended to {STATE_DIR}/{FINDINGS_FILE}"))
+    for sev in order:
+        print(f"  {sev:<8} {len(by_sev[sev])}")
+
+    if args.no_tickets:
+        print(f"--no-tickets: recorded only. Every severity is on disk; nothing was minted.")
+        return
+
+    # --- 2. mint tickets, carrying location and reproduction VERBATIM.
+    try:
+        with open(os.path.join(d, STATE_FILE)) as _sf:
+            _state = json.load(_sf)
+    except (OSError, ValueError):
+        _state = {}                      # a graph passed by --graph needs no state
+    gpath, tickets = _load_graph(root, _state, args.graph, required=True)
+    idx, _dupes = _graph_index(tickets)
+    already = {str(t.get("finding_id") or "") for t in tickets if isinstance(t, dict)}
+
+    nums = []
+    for tid in idx:
+        m = re.match(r"^([A-Za-z]+-)(\d+)$", tid)
+        if m and m.group(1) == args.prefix:
+            nums.append(int(m.group(2)))
+    nxt = (max(nums) + 1) if nums else 1
+    width = max(3, max((len(str(n)) for n in nums), default=3))
+
+    minted, below, dup = [], [], []
+    for out in stamped:
+        if out["finding_id"] in already:
+            dup.append(out)
+            continue
+        if SEVERITY_RANK[out["severity"]] < threshold:
+            below.append(out)
+            continue
+        defect = str(out.get("defect")).strip()
+        title = defect.splitlines()[0].strip()
+        loc = str(out.get("location") or "").strip()
+        scope = _finding_scope(loc)
+        tid = f"{args.prefix}{nxt:0{width}d}"
+        nxt += 1
+        t = {
+            "id": tid,
+            "title": title,
+            # A placeholder that FAILS red-check on purpose. `true` would pass
+            # vacuously and let an ungated ticket dispatch; this exits non-zero
+            # with zero tests selected, which red-check scores WEAK and refuses.
+            # The ticket is not dispatchable until someone writes a real gate.
+            "verify": "false  # NO GATE YET — write one that fails on this finding first",
+            "scope": [scope] if scope else [],
+            "depends_on": [],
+            "source": "finding",
+            "severity": out["severity"],
+            # Verbatim. Not basenamed, not truncated.
+            "location": loc,
+            "defect": defect,
+            "finding_id": out["finding_id"],
+        }
+        repro = out.get("reproduction")
+        if repro not in (None, ""):
+            t["reproduction"] = repro      # the field the old formatter never read
+        if not scope and loc:
+            t["scope_note"] = ("location did not name a file — declare ownership by hand "
+                               "before this ticket joins a wave")
+        minted.append(t)
+
+    # --- 3. the reconciliation. Every recorded finding is minted, deliberately
+    #     below the threshold, or already present. Anything else is a bug in
+    #     this command, and it dies rather than reporting a clean run.
+    accounted = len(minted) + len(below) + len(dup)
+    if accounted != len(stamped):
+        die(f"INTERNAL: {len(stamped)} findings recorded but only {accounted} accounted for "
+            f"({len(minted)} minted, {len(below)} below threshold, {len(dup)} already "
+            "ticketed). Refusing to report a clean run over an unexplained gap — this is "
+            "exactly the shape of the defect this command exists to prevent")
+
+    if args.dry_run:
+        print(f"\n[DRY RUN] would mint {len(minted)} ticket(s) into "
+              f"{os.path.relpath(gpath, root)}:")
+    else:
+        # Re-read and write back through the SAME shape the project uses: the
+        # graph is a project file whose schema this harness does not own, so a
+        # bare list stays a bare list and {"tickets": [...]} keeps its siblings
+        # (version, project) rather than being flattened out from under them.
+        with open(gpath) as _gf:
+            full = json.load(_gf)
+        if isinstance(full, list):
+            save_json(gpath, full + minted)
+        else:
+            full["tickets"] = list(full.get("tickets") or []) + minted
+            save_json(gpath, full)
+        print(f"\nminted {len(minted)} ticket(s) into {os.path.relpath(gpath, root)}:")
+    for t in minted:
+        print(f"  {t['id']:<9} {t['severity']:<8} {t['location'] or '(no location)'}")
+        print(f"            {t['title'][:96]}")
+    if below:
+        print(f"\n{len(below)} finding(s) BELOW --min-severity {args.min_severity} — recorded, "
+              "not ticketed. They are on disk and can be ticketed later by lowering the "
+              "threshold; they were not discarded:")
+        for out in below:
+            print(f"  {out['severity']:<8} {str(out.get('location') or '')[:70]}")
+    if dup:
+        print(f"\n{len(dup)} finding(s) already carry a ticket — skipped.")
+    print(f"\nEVERY severity band is accounted for: {len(minted)} minted + {len(below)} "
+          f"below threshold + {len(dup)} already ticketed = {len(stamped)} recorded.")
+    if minted:
+        print("Each minted ticket's `verify` is a PLACEHOLDER that red-check refuses. Write a "
+              "gate that fails on the finding before dispatching it.")
+
+
 def _collected_count(text):
     """How many tests pytest actually SELECTED to run. None when it says none.
 
@@ -5860,6 +6138,25 @@ def main():
     s.add_argument("--base", default="main")
     s.add_argument("--json", action="store_true", help="machine-readable output")
     s.set_defaults(func=cmd_frontier)
+
+    s = sub.add_parser("findings", help="record checker findings durably, then mint tickets "
+                                       "from them (location and reproduction carried verbatim)")
+    s.add_argument("--file", default="-", metavar="PATH",
+                   help="JSON array, {\"findings\": [...]} object, or JSONL. '-' (default) "
+                        "reads stdin. Each record: severity, location, defect, reproduction")
+    s.add_argument("--graph", default=None, metavar="PATH")
+    s.add_argument("--min-severity", default="MEDIUM",
+                   choices=["BLOCKER", "CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"],
+                   help="mint tickets at or above this severity. Everything BELOW it is "
+                        "still recorded verbatim — the threshold decides what gets a ticket, "
+                        "never what gets remembered (default: MEDIUM)")
+    s.add_argument("--prefix", default="T-", help="minted ticket id prefix (default: T-)")
+    s.add_argument("--cycle", type=int, default=None, help="stamp the records with this cycle")
+    s.add_argument("--no-tickets", action="store_true",
+                   help="record only; mint nothing")
+    s.add_argument("--dry-run", action="store_true",
+                   help="show what would be recorded and minted; write nothing")
+    s.set_defaults(func=cmd_findings)
 
     s = sub.add_parser("check-wave", help="refuse a wave whose members could own the same file")
     s.add_argument("tickets", nargs="+", metavar="T-0xx")

@@ -2935,6 +2935,92 @@ ck_has "(r) it says plainly that it cannot see the skill memory" "LEARNED.md"
 
 
 # ===========================================================================
+# (s) findings -> tickets. Two live defects, one command. Five checkers
+#     returned six HIGH defects; the MEDIUMs became tickets and the HIGHs
+#     reached NO repo artifact at all — the severity filter was in effect
+#     inverted. And the formatter that minted the survivors did
+#     `location.split('/')[-1]`, so four of eight tickets pointed at a file
+#     that does not contain the defect.
+# ===========================================================================
+section "(s) findings record + mint  [repo: findg]"
+mk_repo findg
+cat > tickets.json <<'EOF'
+{"version": 1, "project": "e2e", "tickets": [
+ {"id": "T-129", "title": "prior", "verify": "true", "scope": ["src/**"], "depends_on": []}
+]}
+EOF
+cat > findings.json <<'EOF'
+[
+ {"severity":"HIGH","location":"apps/trust/src/ledger/__init__.py:175","defect":"ledger replays a foreign principal","reproduction":"pytest e2e/test_trust.py::test_identity_leak"},
+ {"severity":"HIGH","location":"checkout/domain.py:47-48","defect":"authorize_discount bypasses approval"},
+ {"severity":"MEDIUM","location":"fixtures/generator/__init__.py:175","defect":"generator seeds a shared RNG","reproduction":"pytest -k generator_seed"},
+ {"severity":"LOW","location":"docs/runbook.md","defect":"runbook names a dead flag"}
+]
+EOF
+sl findings --file findings.json --min-severity MEDIUM
+ck_exit "(s) findings runs" 0 "$RC"
+# Assert against the GRAPH, not stdout: the below-threshold listing prints the
+# same "SEVERITY  location" shape as the minted listing, so a stdout match here
+# stays green while HIGHs are being dropped — which is the live defect itself.
+ck "(s) both HIGH findings became TICKETS — the band that vanished live" "2" \
+   "$(jget tickets.json "len([t for t in d['tickets'] if t.get('severity') == 'HIGH'])")"
+ck "(s) and the HIGH ticket carries its full location" "apps/trust/src/ledger/__init__.py:175" \
+   "$(jget tickets.json "sorted(t['location'] for t in d['tickets'] if t.get('severity') == 'HIGH')[0]")"
+ck_has "(s) every severity band is reconciled out loud" "EVERY severity band is accounted for"
+ck_has "(s) 3 minted + 1 below threshold = 4 recorded" "3 minted + 1 below threshold + 0 already ticketed = 4 recorded"
+ck_has "(s) the sub-threshold finding is recorded, not discarded" "not ticketed"
+
+# THE formatter defect: the directory must survive
+ck "(s) location is carried VERBATIM, never basenamed" "fixtures/generator/__init__.py:175" \
+   "$(jget tickets.json "[t['location'] for t in d['tickets'] if t.get('finding_id') and 'generator' in t['location']][0]")"
+ck "(s) scope is the FULL path, not the basename" "fixtures/generator/__init__.py" \
+   "$(jget tickets.json "[t['scope'][0] for t in d['tickets'] if t.get('finding_id') and 'generator' in t['location']][0]")"
+ck "(s) reproduction is carried — the field the old formatter never read" "pytest -k generator_seed" \
+   "$(jget tickets.json "[t.get('reproduction') for t in d['tickets'] if t.get('finding_id') and 'generator' in t['location']][0]")"
+ck "(s) a finding with no reproduction simply omits it" "False" \
+   "$(jget tickets.json "any('reproduction' in t for t in d['tickets'] if 'domain.py' in str(t.get('location')))")"
+ck "(s) the graph's own siblings survive the write" "['version', 'project']" \
+   "$(jget tickets.json "sorted([k for k in d if k != 'tickets'], key=lambda k: ['version','project'].index(k))")"
+ck "(s) every recorded finding is on disk at EVERY severity" "4" \
+   "$(grep -c . .swarm-loop/findings.jsonl)"
+ck "(s) including the LOW one that got no ticket" "1" \
+   "$(grep -c '\"severity\": \"LOW\"' .swarm-loop/findings.jsonl)"
+
+# the placeholder gate must be refused, not silently dispatchable
+gq add -A; gq commit -qm findings
+MINTED="$(jget tickets.json "[t['id'] for t in d['tickets'] if t.get('finding_id')][0]")"
+sl red-check --ticket "$MINTED"
+ck_exit "(s) red-check REFUSES a minted ticket's placeholder gate" 1 "$RC"
+
+# idempotence: the same report twice must not double the graph
+sl findings --file findings.json --min-severity MEDIUM
+ck_exit "(s) re-running the same report is safe" 0 "$RC"
+ck_has "(s) it says the findings already carry tickets" "already carry a ticket"
+ck "(s) and mints nothing new" "4" \
+   "$(jget tickets.json "len(d['tickets'])")"
+
+# an unrecognised severity is the exact shape of a silently-dropped HIGH
+BEFORE="$(grep -c . .swarm-loop/findings.jsonl)"
+echo '[{"severity":"URGENT","location":"a.py:1","defect":"x"}]' > bad.json
+sl findings --file bad.json
+ck_exit "(s) an unrecognised severity is REFUSED" 1 "$RC"
+ck_has "(s) the refusal names the offending value" "'URGENT' is not one of"
+ck_has "(s) and says nothing was written" "nothing has been written"
+ck "(s) and NOTHING was in fact written" "$BEFORE" "$(grep -c . .swarm-loop/findings.jsonl)"
+
+# a finding with no defect text cannot become an actionable ticket
+echo '[{"severity":"HIGH","location":"a.py:1","defect":"  "}]' > nodefect.json
+sl findings --file nodefect.json
+ck_exit "(s) a finding with no defect text is refused" 1 "$RC"
+ck_has "(s) and says why" "cannot become a ticket anyone can act on"
+
+# --no-tickets still records every severity
+sl findings --file findings.json --no-tickets
+ck_exit "(s) --no-tickets exits 0" 0 "$RC"
+ck_has "(s) --no-tickets records without minting" "Every severity is on disk"
+
+
+# ===========================================================================
 cd / 2>/dev/null || true
 ELAPSED=$(( $(date +%s) - START_TS ))
 echo
