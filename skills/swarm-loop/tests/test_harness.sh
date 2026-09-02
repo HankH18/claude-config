@@ -3021,6 +3021,67 @@ ck_has "(s) --no-tickets records without minting" "Every severity is on disk"
 
 
 # ===========================================================================
+# (t) check-wave and reads must REFUSE a graph that does not parse as one.
+#     frontier has always validated and exited 1; these two unpacked `dupes`
+#     and threw it away. _graph_index keeps the LAST entry for a repeated id,
+#     so check-wave was answering "no two members can own the same file" — the
+#     one safety property it exists for — from whichever definition happened to
+#     come second.
+# ===========================================================================
+section "(t) graph validation in check-wave and reads  [repo: gdup]"
+mk_repo gdup
+cat > tickets.json <<'EOF'
+{"tickets": [
+ {"id": "T-001", "title": "first", "verify": "true", "scope": ["src/a/**"], "depends_on": []},
+ {"id": "T-001", "title": "second, same id, DIFFERENT ownership", "verify": "true",
+  "scope": ["src/b/**"], "depends_on": []},
+ {"id": "T-002", "title": "other", "verify": "true", "scope": ["src/c/**"], "depends_on": []}
+]}
+EOF
+sl frontier
+ck_exit "(t) frontier refuses a duplicate ticket id (it always did)" 1 "$RC"
+sl check-wave T-001 T-002
+ck_exit "(t) check-wave now refuses the SAME graph" 1 "$RC"
+ck_has "(t) the refusal names the duplicate id" "duplicate ticket id: T-001"
+ck_has "(t) and says what would have been computed over it" "ownership overlap"
+# The other half of the severity split: skipped junk entries are ADVISORY here.
+# frontier refuses on them because its whole output is the ticket set; check-wave
+# and reads are asked about NAMED tickets and answer those correctly, so refusing
+# would be a false block on a graph this harness deliberately survives (B-def).
+ck_hasnt "(t) it must NOT report the wave OK" "check-wave: OK"
+sl reads
+ck_exit "(t) reads refuses it too — it gates freeze" 1 "$RC"
+ck_has "(t) reads says what it gates" "gates 'freeze' on"
+
+# a dangling dependency is the other half of _graph_validate
+cat > tickets.json <<'EOF'
+{"tickets": [
+ {"id": "T-001", "title": "a", "verify": "true", "scope": ["src/a/**"], "depends_on": []},
+ {"id": "T-002", "title": "b", "verify": "true", "scope": ["src/b/**"], "depends_on": ["T-999"]}
+]}
+EOF
+sl check-wave T-001 T-002
+ck_exit "(t) check-wave refuses a dangling dependency" 1 "$RC"
+ck_has "(t) naming the dep that can never close" "T-999"
+
+# CONTROL — the whole point is that a VALID graph is untouched. A false refusal
+# here blocks the loop's own dispatch step, which is strictly worse than the gap.
+cat > tickets.json <<'EOF'
+{"tickets": [
+ {"id": "T-001", "title": "a", "verify": "true", "scope": ["src/a/**"], "depends_on": []},
+ {"id": "T-002", "title": "b", "verify": "true", "scope": ["src/b/**"], "depends_on": ["T-001"]}
+]}
+EOF
+sl check-wave T-001 T-002
+ck_exit "(t) CONTROL: a valid graph still passes check-wave" 0 "$RC"
+ck_has "(t) CONTROL: and is still reported OK" "check-wave: OK"
+sl reads
+ck_exit "(t) CONTROL: a valid graph still passes reads" 0 "$RC"
+sl frontier
+ck_exit "(t) CONTROL: and frontier" 0 "$RC"
+
+
+# ===========================================================================
 cd / 2>/dev/null || true
 ELAPSED=$(( $(date +%s) - START_TS ))
 echo

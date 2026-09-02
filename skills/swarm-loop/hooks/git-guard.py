@@ -2254,8 +2254,7 @@ def non_git_reason(seg: list[str]) -> str | None:
 # re-scanned the token's interior. Bash does NOT expand it inside single quotes,
 # and posix tokenization has already thrown the quote characters away — so this
 # only fires on tokens shlex produced from a DOUBLE-quoted or bare region, which
-# is what `unquoted_substitutions` below establishes from the raw string.
-DOLLAR_SUBST_RE = re.compile(r"\$\(")
+# is what `expandable_substitutions` below establishes from the raw string.
 
 
 def _balanced_subst(text: str, start: int) -> tuple[str, int] | None:

@@ -3878,6 +3878,45 @@ def _graph_unusable(tickets):
     return out
 
 
+def _graph_refuse_if_invalid(root, path, tickets, idx, dupes, what):
+    """Refuse to reason about a graph that does not parse as one.
+
+    `frontier` has always validated and exited 1; `check-wave` and `reads`
+    unpacked `dupes` and threw it away, so both ran clean over a graph carrying
+    a duplicate ticket id. That is not cosmetic for check-wave in particular:
+    _graph_index keeps the LAST entry for a repeated id, so a wave was checked
+    against whichever definition happened to come second, and the command still
+    printed "no two members can own the same file" — the one safety property it
+    exists to guarantee, answered from an ambiguous ownership map. Measured: a
+    three-ticket graph with T-001 defined twice made frontier exit 1 and
+    check-wave exit 0, reporting the second T-001's scope as if it were the only
+    one."""
+    # The two halves are NOT the same severity, and conflating them was a false
+    # block on a graph this harness deliberately survives.
+    #
+    # _graph_unusable reports entries _graph_index SKIPPED — a stray string or a
+    # trailing null from a hand edit. Skipping keeps the tools alive and saying so
+    # keeps a dropped ticket from passing as a closed one; `frontier` refuses on it
+    # because its whole output is the ticket set, but check-wave and reads are
+    # asked about NAMED tickets and answer them correctly regardless. Advisory here.
+    #
+    # _graph_validate reports a graph that contradicts itself — a duplicate id, a
+    # dangling dep, a cycle. A duplicate id is the one that matters most here:
+    # _graph_index keeps the LAST entry, so the ownership map check-wave vetoes on
+    # is read from whichever definition happened to come second, and it still
+    # printed "no two members can own the same file". That is a refusal.
+    for note in _graph_unusable(tickets):
+        print(f"  advisory: {note}")
+    errors = _graph_validate(idx, dupes)
+    if not errors:
+        return
+    print(f"REFUSED: {os.path.relpath(path, root)} contradicts itself, so "
+          f"{what} would be computed over an ambiguous graph:")
+    for e in errors:
+        print(f"  {e}")
+    die("fix the graph and re-run — 'frontier' refuses the same graph for the same reason")
+
+
 def _graph_validate(idx, dupes):
     """[error strings] — duplicate ids, dangling depends_on, dependency cycles.
 
@@ -4196,6 +4235,8 @@ def cmd_check_wave(args):
     state = load_json(os.path.join(d, STATE_FILE), "state")
     path, tickets = _load_graph(root, state, args.graph)
     idx, dupes = _graph_index(tickets)
+    _graph_refuse_if_invalid(root, path, tickets, idx, dupes,
+                             "the ownership overlap this command vetoes on")
     wave = []
     for raw in args.tickets:
         for tid in re.split(r"[,\s]+", raw):
@@ -5266,6 +5307,8 @@ def cmd_reads(args):
     state = load_json(os.path.join(d, STATE_FILE), "state")
     path, tickets = _load_graph(root, state, args.graph)
     idx, dupes = _graph_index(tickets)
+    _graph_refuse_if_invalid(root, path, tickets, idx, dupes,
+                             "the read edges this command gates 'freeze' on")
     res = _scan_read_edges(root, state, idx, args.tests, _closed_from_args(root, args))
 
     if args.json:

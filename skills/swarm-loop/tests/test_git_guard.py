@@ -282,6 +282,14 @@ MUST_BLOCK = [
     ("plumb-rm-dot",          "git rm -r ."),
     ("plumb-rm-repo-root",    "git rm -r :/"),
     ("plumb-rm-glob",         "git rm '*.py'"),
+    # A line-coverage trace over all 2776 cases found `rm_repo_wide`'s
+    # first-segment-all-wildcards branch and `check_checkout`'s two-operand veto
+    # executed by NO case — both documented headline blocks, both live (probed
+    # exit 2 by hand). Untested, not dead. Covered now.
+    ("plumb-rm-glob-deep",    "git rm '**/*.py'"),
+    ("plumb-rm-glob-seg",     "git rm -r '*/src'"),
+    ("checkout-treeish-path", "git checkout HEAD src/b.py"),
+    ("checkout-treeish-multi","git checkout HEAD~2 src/a.py src/b.py"),
     ("plumb-apply-R",         "git apply -R patch.diff"),
     ("plumb-apply-reverse",   "git apply --reverse patch.diff"),
 
@@ -1088,9 +1096,14 @@ PAYLOAD_CASES = [
      {"tool_name": "Bash", "cwd": "{ELSEWHERE}",
       "tool_input": {"command": "cd {OUTSIDE} && rm -rf T-010"}}),
 
-    # -- non-Bash tools. The registration matcher is `Bash`-only today, so the
-    #    guard ALSO self-exempted: widening the matcher alone would have changed
-    #    nothing. Measured then: Bash exit 2, Edit/Write/NotebookEdit exit 0.
+    # -- non-Bash tools. HISTORICAL, and the comment used to state the old state
+    #    of the world as current: the registration matcher was once `Bash`-only
+    #    AND the guard self-exempted non-Bash tools, so widening the matcher
+    #    alone would have changed nothing. Measured then: Bash exit 2,
+    #    Edit/Write/NotebookEdit exit 0. Both halves are fixed now — the guard
+    #    handles the file-writing tools, and claude-build installs the full
+    #    matcher, which main() asserts against REQUIRED_MATCHER so the two
+    #    cannot drift apart again silently. These cases are what pins it.
     ("edit-ledger-state", BLOCK,
      {"tool_name": "Edit", "cwd": "{REPO}",
       "tool_input": {"file_path": ".swarm-loop/state.json"}}),
@@ -1725,6 +1738,34 @@ def main():
             print("TEST_GIT_GUARD: duplicate case names: %s" % ", ".join(dupes))
             return 1
 
+        # OPEN §1d: bin/claude-build HAND-COPIES the PreToolUse matcher, and
+        # git-guard.py's REQUIRED_MATCHER — the constant that states what it
+        # must be — was read by nothing at all. The two drifted apart once
+        # already: claude-build installed a Bash-only matcher while the guard
+        # documented the file-writing tools too, and every Edit/Write went
+        # unguarded with no test to notice. Asserting they agree is what makes
+        # the constant load-bearing; deleting it as "dead" would have removed
+        # the only written statement of the correct value.
+        static_failures = []
+        _mm = re.search(r'^REQUIRED_MATCHER\s*=\s*"([^"]+)"',
+                        open(HOOK).read(), re.M)
+        if not _mm:
+            static_failures.append("git-guard.py no longer defines REQUIRED_MATCHER")
+        else:
+            _want = _mm.group(1)
+            _build = os.path.join(os.path.dirname(HOOK), os.pardir, "bin", "claude-build")
+            if not os.path.isfile(_build):
+                static_failures.append("bin/claude-build not found at %s" % _build)
+            else:
+                _installed = re.findall(r'"matcher":\s*"([^"]+)"', open(_build).read())
+                if not _installed:
+                    static_failures.append("bin/claude-build installs no PreToolUse matcher")
+                for _got in _installed:
+                    if _got != _want:
+                        static_failures.append(
+                            "matcher DRIFT: bin/claude-build installs %r but "
+                            "git-guard.py REQUIRED_MATCHER is %r" % (_got, _want))
+
         jobs = build_matrix(repo, root)
         jobs += [(n, bash_payload(fill_paths(c, repo, root), repo), want,
                   "nogit" if nogit else "env")
@@ -1741,6 +1782,8 @@ def main():
             results = list(pool.map(run_one, jobs))
 
         passed, failures = 0, []
+        for _sf in static_failures:
+            failures.append(("matcher-agreement", "(static check)", _sf))
         by_kind = {}
         for (name, payload, want, kind), (got, stderr) in zip(jobs, results):
             by_kind[kind] = by_kind.get(kind, 0) + 1

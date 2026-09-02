@@ -122,8 +122,6 @@ The premise: worktrees moved conflicts from silent runtime corruption to visible
        print(<newpkg>.__file__, m.version('<newpkg>'))"      # the effect, asserted
    ```
 
-   The same obligation applies at dispatch, per worktree (SKILL.md Phase 4): the installer runs there too, and there too its exit code proves nothing.
-
    **The same obligation applies per-worktree at dispatch** (cross-reference SKILL.md Phase 4): a fresh worktree contains only *tracked* files, so every gitignored dependency or build directory is missing, and how that missing dependency presents depends on where the worktree sits. Beside the repo (the default) it is a loud `MODULE_NOT_FOUND` — a blocked worker, but a visible one. Under the in-tree fallback it is silent and worse: Node's resolver climbs UP out of the nested worktree into the primary tree's `node_modules` and, under workspaces, into MAIN's source, so an unprovisioned worktree quietly tests main's code while the worker believes it is testing its own. Either way the fix is the same and it is the dispatcher's job: provision each worktree's environment as an explicit dispatch step, never as the worker's first guess.
 
 9. **Land it — rebase onto `main` FIRST, then fast-forward:**
