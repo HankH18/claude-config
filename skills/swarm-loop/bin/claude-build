@@ -78,7 +78,7 @@ def has_guard(entries):
 if has_guard(pre):
     note.append("git-guard hook already present (left as-is)")
 else:
-    pre.append({"matcher": "Bash", "hooks": [{"type": "command", "command": cmd}]})
+    pre.append({"matcher": "Bash|Edit|Write|NotebookEdit|MultiEdit", "hooks": [{"type": "command", "command": cmd}]})
     note.append("added git-guard PreToolUse hook")
 
 perms = data.setdefault("permissions", {})
