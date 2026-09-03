@@ -5278,6 +5278,291 @@ ck "(y) THE SUITE NEVER TOUCHED THE INSTALLED LEARNED.md" \
 
 
 # ===========================================================================
+# reachable — the wiring check as a command instead of a habit
+#
+# The defect these cover: two commits recovered from a killed agent, both
+# claiming progress in prose. Commit A's function had ZERO call sites, was in
+# neither __all__, and carried docstrings asserting a behaviour that existed
+# nowhere — 0% effective, with the suite GREEN over a live HIGH-severity defect.
+# Commit B's function was wired at two independent points and its claim held.
+# The messages did not distinguish them; a call-site grep did, in ten seconds.
+#
+# So the fixture below is that incident, in miniature: one wired symbol, one
+# with no call sites, one reached only by its own tests, one reached only by
+# other dead code, one reached only through getattr. What is pinned is that the
+# five come back as five DIFFERENT verdicts — a checker that could not tell
+# commit A from commit B is the thing being replaced, and a checker that called
+# everything suspicious would be worse than none.
+# ===========================================================================
+section "reachable: the five wiring verdicts  [repo: rwire]"
+mk_repo rwire
+
+verdict_of() {  # verdict_of <symbol> -> the verdict on that symbol's header line
+  awk -v s="$1" '$1==s && NF>1 {$1=""; sub(/^ +/,""); print; exit}' "$OUT"
+}
+
+mkdir -p pkg tests node_modules/vendored docs
+cat > pkg/__init__.py <<'EOF'
+from .core import wired_ref
+
+__all__ = ["wired_ref"]
+EOF
+cat > pkg/core.py <<'EOF'
+def wired_ref(x):
+    return x + 1
+
+
+def scoped_ref(x):
+    """Commit A: a docstring asserting a behaviour that exists nowhere."""
+    return x - 1
+
+
+def suite_ref(x):
+    return x * 2
+
+
+def accept_ref(x):
+    return x
+
+
+def dead_ref(x):
+    return x
+
+
+def orphan(x):
+    return dead_ref(x)
+
+
+def dyn_ref(x):
+    return x
+
+
+def loop_ref(n):
+    if n <= 0:
+        return 0
+    return loop_ref(n - 1)
+
+
+class Widget:
+    def paint(self):
+        return wired_ref(1)
+EOF
+cat > pkg/cli.py <<'EOF'
+from . import core
+from .core import Widget, wired_ref
+
+
+def dyn():
+    return getattr(core, "dyn_ref")(1)
+
+
+def main():
+    Widget().paint()
+    return wired_ref(1) + dyn()
+
+
+if __name__ == "__main__":
+    main()
+EOF
+cat > tests/test_pkg.py <<'EOF'
+from pkg.core import suite_ref, loop_ref
+
+
+def test_a():
+    assert suite_ref(2) == 4
+
+
+def test_b():
+    assert loop_ref(3) == 0
+EOF
+# NOT named test_*: the only thing making this a test file is that it lives
+# under the protected acceptance directory, which is what this pins.
+cat > .swarm-loop/acceptance/helpers.py <<'EOF'
+from pkg.core import accept_ref
+
+
+def use():
+    return accept_ref(1)
+EOF
+cat > node_modules/vendored/copy.py <<'EOF'
+def scoped_ref(x):
+    return x
+EOF
+echo "notes" > docs/readme.md
+
+# --- the headline case: defined, and nothing reaches it -------------------
+sl reachable --symbol scoped_ref
+ck_exit "a symbol with a definition and no callers exits 1" 1 "$RC"
+ck "...and the verdict is the unmissable one" "NO CALL SITES" "$(verdict_of scoped_ref)"
+ck_has "...naming where it IS defined, with the line" "defined    pkg/core.py:5  (function)"
+ck_has "...and saying plainly that nothing references it" \
+       "callers    NONE — zero references outside its own body"
+ck_has "...and that it is on no public surface" "exported   NO — in no __all__"
+ck_has "...with the diagnosis tying it to the recovered commit" \
+       "This is the recovered commit's exact shape"
+
+# --- the counterpart: a genuinely wired symbol comes back clean -----------
+# Without this the checker above is satisfied by one that flags everything.
+sl reachable --symbol wired_ref
+ck_exit "a wired symbol exits 0" 0 "$RC"
+ck "...and reads WIRED" "WIRED" "$(verdict_of wired_ref)"
+ck_has "...with its product call sites enumerated" "callers    2 (2 product, 0 test)"
+ck_has "...one of which is an ATTRIBUTE call through a method" \
+       "pkg/core.py:38  in pkg.core.Widget.paint"
+ck_has "...and both export routes named" "package __init__ (pkg/__init__.py:1)"
+ck_has "...including __all__" "__all__ (pkg/__init__.py:3)"
+
+# --- called only by its own tests: green suite, dead product path ---------
+sl reachable --symbol suite_ref
+ck_exit "a symbol whose only callers are tests exits 1" 1 "$RC"
+ck "...and is not confused with WIRED" "TESTS ONLY" "$(verdict_of suite_ref)"
+ck_has "...with the split spelled out" "callers    1 (0 product, 1 test)"
+ck_has "...and the caller marked as a test" "tests/test_pkg.py:5  in tests.test_pkg.test_a  [TEST]"
+
+# --- a caller under the frozen acceptance directory is a TEST caller ------
+# helpers.py is not named test_*; only its location makes it one.
+sl reachable --symbol accept_ref
+ck "a caller under .swarm-loop/acceptance counts as a test caller" \
+   "TESTS ONLY" "$(verdict_of accept_ref)"
+ck_has "...and is shown as such" ".swarm-loop/acceptance/helpers.py:5  in"
+
+# --- 'called from somewhere' is NOT 'reachable from the entry point' -----
+# The same symbol, the same tree, two different questions. If these two ever
+# return the same answer the reachability layer has stopped existing.
+sl reachable --symbol dead_ref
+ck_exit "dead_ref has a product caller, so the caller layer alone passes it" 0 "$RC"
+ck "...reading WIRED with no --from" "WIRED" "$(verdict_of dead_ref)"
+ck_has "...and the report says so out loud rather than implying reachability" \
+       "NO --from WAS GIVEN, so nothing was checked for reachability"
+sl reachable --symbol dead_ref --from pkg/cli.py
+ck_exit "...but with a real entry point named it exits 1" 1 "$RC"
+ck "...because its only caller is itself unreached" "UNREACHED" "$(verdict_of dead_ref)"
+ck_has "...and the reachable line says NO against the entry point" \
+       "reachable  NO from pkg/cli.py"
+sl reachable --symbol wired_ref --from pkg/cli.py
+ck_exit "the same entry point passes the symbol that IS on the path" 0 "$RC"
+ck_has "...with reachable YES" "reachable  YES from pkg/cli.py"
+
+# --- an entry point may also be named as a bare symbol -------------------
+sl reachable --symbol dead_ref,wired_ref --from main
+ck_exit "--from accepts a bare symbol name as the entry scope" 1 "$RC"
+ck "...and grades the unreached one" "UNREACHED" "$(verdict_of dead_ref)"
+ck "...and the reached one" "WIRED" "$(verdict_of wired_ref)"
+
+# --- getattr: the verdict is NOT upgraded on a string literal -------------
+# Erring toward 'reachable' here would produce exactly the false OK this
+# command exists to prevent, so the hint is printed and the verdict stands.
+sl reachable --symbol dyn_ref
+ck_exit "a symbol reached only through getattr still exits 1" 1 "$RC"
+ck "...the verdict is not upgraded by the string literal" \
+   "NO CALL SITES" "$(verdict_of dyn_ref)"
+ck_has "...but the string IS reported so the human can settle it" \
+       "the bare name appears as a STRING at pkg/cli.py:6"
+ck_has "...and the report says the verdict was not upgraded on it" \
+       "The verdict above is NOT upgraded on this."
+
+# --- recursion is not a call site ----------------------------------------
+# Positive counterpart first: the scanner DOES see loop_ref's test caller.
+sl reachable --symbol loop_ref
+ck "the scanner sees loop_ref's one real caller" "TESTS ONLY" "$(verdict_of loop_ref)"
+sl reachable --symbol loop_ref --path pkg
+ck_exit "with the tests out of scope, a self-call is not a caller" 1 "$RC"
+ck "...so recursion alone reads as no call sites" "NO CALL SITES" "$(verdict_of loop_ref)"
+ck_has "...and --path really narrowed the scan" "3 python file(s) under pkg"
+
+# --- a symbol that is not there at all ------------------------------------
+sl reachable --symbol never_written
+ck_exit "a claimed symbol that does not exist exits 1" 1 "$RC"
+ck "...with its own verdict, not 'no callers'" "UNDEFINED" "$(verdict_of never_written)"
+ck_has "...and says where it looked" "defined    NOWHERE in the"
+
+# --- vendored copies are not scanned unless asked for ---------------------
+sl reachable --symbol scoped_ref
+ck_hasnt "an unqualified scan skips node_modules/" "node_modules"
+ck_hasnt "...so the vendored duplicate does not make it AMBIGUOUS" \
+         "AMBIGUOUS  2 definitions"
+sl reachable --symbol scoped_ref --path node_modules/vendored
+ck_has "...but a --path that names it IS honoured (the file is really there)" \
+       "defined    node_modules/vendored/copy.py:1"
+
+# --- everything at once: the summary line ---------------------------------
+sl reachable --symbol wired_ref,scoped_ref,suite_ref,dead_ref,never_written --from pkg/cli.py
+ck_exit "a mixed run exits 1 when any symbol is not wired" 1 "$RC"
+ck_has "the summary counts every verdict class" \
+       "summary: 1 WIRED · 1 NO CALL SITES · 1 TESTS ONLY · 1 UNREACHED · 1 UNDEFINED"
+
+# --- the limits ship WITH the answer, including a clean one ---------------
+# The whole value of this command is that its OK can be trusted; a blind spot
+# the reader has to already know about is not a stated limit.
+sl reachable --symbol wired_ref
+ck_exit "an all-clean report still exits 0" 0 "$RC"
+ck_has "...and still prints what it cannot see" \
+       "WHAT THIS CANNOT SEE — a clean report is not proof of wiring"
+ck_has "...naming the dynamic-dispatch blind spot" \
+       "getattr(), a registry dict, a decorator table or a plugin loader"
+ck_has "...naming the name-matching blind spot and its DIRECTION" \
+       "it over-counts"
+ck_has "...and that it is Python-only" "Python only."
+
+# --- --no-fail reports without failing ------------------------------------
+sl reachable --symbol scoped_ref --no-fail
+ck_exit "--no-fail exits 0" 0 "$RC"
+ck "...while the verdict is unchanged" "NO CALL SITES" "$(verdict_of scoped_ref)"
+
+# --- --json ---------------------------------------------------------------
+sl reachable --symbol scoped_ref,wired_ref --from pkg/cli.py --json
+ck_exit "--json exits 1 the same way" 1 "$RC"
+ck "json: the verdict is a field" "NO CALL SITES" \
+   "$(jget "$OUT" "d['symbols'][0]['verdict']")"
+ck "json: the definition is located" "pkg/core.py:5" \
+   "$(jget "$OUT" "d['symbols'][0]['definitions'][0]['file'] + ':' + str(d['symbols'][0]['definitions'][0]['line'])")"
+ck "json: product call sites are counted separately" "2" \
+   "$(jget "$OUT" "d['symbols'][1]['product_call_sites']")"
+ck "json: not_wired names exactly the failing symbol" "['scoped_ref']" \
+   "$(jget "$OUT" "d['not_wired']")"
+ck "json: the limits travel with the machine-readable answer too" "True" \
+   "$(jget "$OUT" "any('cannot see' in x.lower() for x in d['limits'])")"
+
+# --- an entry point that resolves to nothing must be LOUD -----------------
+# Otherwise every symbol comes back UNREACHED from an empty graph and the
+# operator reads a typo as a finding.
+sl reachable --symbol wired_ref --from no_such_entry
+ck_exit "an unresolvable entry point exits 1" 1 "$RC"
+ck_has "...and is named" "ENTRY POINT DID NOT RESOLVE: no_such_entry"
+ck_has "...and the resulting UNREACHED is called an artefact, not a finding" \
+       "reporting about an EMPTY graph"
+
+# --- a scan that found no Python at all may not be read as evidence -------
+sl reachable --symbol wired_ref --path docs
+ck_exit "scanning a directory with no .py exits 1 rather than reporting clean" 1 "$RC"
+ck_has "...and refuses to be read as evidence about another language" \
+       "NO PYTHON FILES WERE SCANNED"
+
+# --- usage --------------------------------------------------------------
+sl reachable
+ck_exit "reachable with no --symbol is a usage error (exit 3, never terminal)" 3 "$RC"
+
+# --- a second definition of the same name is declared AMBIGUOUS ----------
+# Name-keyed matching reads generously here, which is the false-OK direction,
+# so it must be said rather than absorbed.
+cat > pkg/alt.py <<'EOF'
+def wired_ref(y):
+    return y
+EOF
+sl reachable --symbol wired_ref
+ck_has "two definitions of one name are flagged AMBIGUOUS" "AMBIGUOUS  2 definitions share this name"
+ck_has "...and both definitions are listed" "defined    pkg/alt.py:1"
+
+# --- a file that does not parse is a hole in the ANSWER, and says so -----
+printf 'def oops(\n' > pkg/broken.py
+sl reachable --symbol wired_ref
+ck_has "an unparsable file is reported next to the verdicts" "COULD NOT PARSE pkg/broken.py"
+ck_has "...as a blind spot in this answer, not a footnote" \
+       "its call sites are invisible to this answer"
+ck "...and the rest of the scan still answers" "WIRED" "$(verdict_of wired_ref)"
+ck_hasnt "...with no traceback escaping the parse failure" "Traceback"
+
+# ===========================================================================
 cd / 2>/dev/null || true
 ELAPSED=$(( $(date +%s) - START_TS ))
 echo
