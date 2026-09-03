@@ -3827,6 +3827,162 @@ ck_has "W48c-7 --help names last-verdict-wins for the ledger" \
 
 
 # ===========================================================================
+# (y) push-gate — the Phase 7 gate that no epoch could ever satisfy.
+#
+# D-1: the gate's last condition was "everything .swarm-loop/ holds is
+# committed", evaluated inside Phase 7 — while Phase 7's own four commands write
+# into .swarm-loop/ (measure appends history.csv, analyze writes
+# analysis/cycle-N.json, checkpoint rewrites state.json). The condition was false
+# the instant the sequence finished, in every epoch of every run, forever, and
+# the failure was SILENT: an orchestrator that never pushes prints nothing about
+# not pushing, so the run's only offsite copy was withheld by a gate nobody could
+# satisfy. The prose now fires the push at the END of Phase 8; this battery pins
+# the mechanical half, including the two rungs the command deliberately REFUSES
+# to score.
+# ===========================================================================
+section "(y) push-gate: the gate no epoch could satisfy  [repo: pgate]"
+mk_repo pgate
+sl freeze
+gq add -A; gq commit -qm freeze
+sl measure --cycle 1 --timeout 60
+ck_exit "(y) cycle 1 measures" 0 "$RC"
+sl analyze --cycle 1
+sl checkpoint --cycle 1
+ck_exit "(y) cycle 1 checkpoints" 0 "$RC"
+
+sl push-gate --cycle 1
+ck_exit "(y) D-1 REPRODUCED: the gate refuses straight after Phase 7's commands" 1 "$RC"
+ck_has "(y) naming the rung that cannot be met inside Phase 7" "swarm-committed"
+ck_has "(y) and the file measure just appended" ".swarm-loop/history.csv"
+ck_has "(y) and the file analyze just wrote" "analysis/cycle-1.json"
+ck_has "(y) verdict is unambiguous" "push-gate: DO NOT PUSH"
+# Pin the per-rung STATUS, not just the prose beside it. Asserting on the detail
+# text alone is green whichever verdict the rung reached — the same defect this
+# file catalogues, one layer down.
+ck_has "(y) the committed rung is marked FAIL" \
+       'FAIL          everything `.swarm-loop/` holds is committed'
+ck_has "(y) and the rungs Phase 7 CAN satisfy are marked PASS" \
+       'PASS          `verify` passed this epoch'
+ck_has "(y) including the analysis rung" 'PASS          `analyze` did not exit 1'
+ck_has "(y) and the tracked-file rung" "PASS          this epoch's tracked-file count"
+
+# The same command, same cycle, after Phase 8's ledger commit. This is the whole
+# claim of the reorder: the condition is satisfiable HERE and nowhere earlier.
+gq add .swarm-loop; gq commit -qm "epoch 1 ledger"
+sl push-gate --cycle 1
+ck_exit "(y) and CLEARS after Phase 8's ledger commit — same cycle, same gate" 0 "$RC"
+ck_has "(y) saying only the mechanical conditions are met" "the mechanical conditions are MET"
+ck_has "(y) exit 0 is explicitly not permission" "This is not permission to push"
+# The two conditions no command can answer are printed on the PASS path too. A
+# gate that scores five of seven while LOOKING like seven is the defect class
+# this whole file exists to catch.
+ck_has "(y) the unscorable integration condition is printed on the PASS path" \
+       "OPERATOR      this epoch's integrations landed green"
+ck_has "(y) so is the unscorable findings condition" \
+       "OPERATOR      no rung-2 verifier finding invalidates"
+ck_has "(y) and the count of what WAS scored is stated" \
+       "5 of the gate's conditions are mechanical"
+
+# A cycle that never happened must not pass vacuously.
+sl push-gate --cycle 2
+ck_exit "(y) a cycle nobody measured cannot push" 1 "$RC"
+ck_has "(y) naming the missing analysis" "analysis/cycle-2.json does not exist"
+ck_has "(y) and the missing checkpoint" "has no entry in state.json head_history"
+ck_has "(y) the analysis rung is marked FAIL, not merely mentioned" \
+       'FAIL          `analyze` did not exit 1'
+ck_has "(y) and so is the tracked-file rung" \
+       "FAIL          this epoch's tracked-file count"
+
+# Rung 2 is async: an outstanding verifier is an unmet condition, not a pass.
+sl dispatch --agent V-1 --kind verifier --subject "batch e1-b1"
+gq add .swarm-loop; gq commit -qm dispatched
+sl push-gate --cycle 1
+ck_exit "(y) an outstanding rung-2 verifier blocks the push" 1 "$RC"
+ck_has "(y) naming the verifier that has not returned" "V-1"
+ck_has "(y) as the rung it is" "rung2-returned"
+
+# The counterpart, and it is the load-bearing half: dispatch is ROLLING, so an
+# open TICKET dispatch is the normal state of a wide swarm. Blocking on every
+# open dispatch would rebuild the unsatisfiable gate in a new place.
+sl dispatch --close V-1
+sl dispatch --agent W-9 --kind ticket --subject T-900
+gq add .swarm-loop; gq commit -qm "rolling dispatch"
+sl push-gate --cycle 1
+ck_exit "(y) an open TICKET dispatch does NOT block — dispatch is rolling" 0 "$RC"
+ck_has "(y) it is reported as context instead of a veto" "not a push blocker"
+
+# A violated harness voids the scores, so there is no number to have read.
+echo "def test_injected(): assert True" >> .swarm-loop/acceptance/test_feature.py
+sl push-gate --cycle 1
+ck_exit "(y) a violated harness blocks the push" 1 "$RC"
+ck_has "(y) named as an integrity violation, not a bookkeeping miss" "harness VIOLATED"
+ck_has "(y) with the verify rung marked FAIL, not merely annotated" \
+       'FAIL          `verify` passed this epoch'
+write_acceptance_test
+sl verify
+ck_exit "(y) control: verify is green again once the frozen bytes are back" 0 "$RC"
+
+# A stale metric: 'analyze' exits 1, the table is not a verdict on the cycle,
+# and the epoch has no values for a push to be carrying.
+gq rm -q score.txt
+gq commit -qm "break the measuring stick"
+sl measure --cycle 2 --timeout 60
+ck_exit "(y) measure exits 1 when a metric command fails" 1 "$RC"
+sl analyze --cycle 2
+ck_exit "(y) analyze exits 1 on a stale metric" 1 "$RC"
+sl checkpoint --cycle 2
+gq add .swarm-loop; gq commit -qm "epoch 2 ledger"
+sl push-gate --cycle 2
+ck_exit "(y) a stale metric blocks the push" 1 "$RC"
+ck_has "(y) naming the metric with no row this cycle" "no measurement at cycle 2 for: accept"
+ck_has "(y) carried by the analysis rung's own FAIL" 'FAIL          `analyze` did not exit 1'
+
+# --push-remote never: the honest answer to "may I push?" is no, and the text
+# has to say that is a configuration rather than a failed condition.
+set_state push_remote '"never"'
+sl push-gate --cycle 2
+ck_exit "(y) --push-remote never answers no" 1 "$RC"
+ck_has "(y) and says it is configuration, not a failure" "NOT APPLICABLE"
+ck_hasnt "(y) scoring nothing at all in that mode" "OPERATOR"
+
+# ===========================================================================
+# (y2) The tracked-file rung, against checkpoint's OWN arithmetic — the two
+#      sites must not disagree about what "sharp" means.
+# ===========================================================================
+section "(y2) push-gate: the tracked-file drop rung  [repo: pgdrop]"
+mk_repo pgdrop
+sl freeze
+gq add -A; gq commit -qm freeze
+sl measure --cycle 1 --timeout 60
+sl analyze --cycle 1
+sl checkpoint --cycle 1
+mkdir -p bulk
+i=1
+while [ "$i" -le 60 ]; do echo "x" > "bulk/f$i.txt"; i=$((i + 1)); done
+gq add -A; gq commit -qm bulk
+sl measure --cycle 2 --timeout 60
+sl analyze --cycle 2
+sl checkpoint --cycle 2
+gq add .swarm-loop; gq commit -qm "epoch 2 ledger"
+sl push-gate --cycle 2
+ck_exit "(y2) control: a tree that GREW pushes fine" 0 "$RC"
+ck_has "(y2) with the rung marked PASS" "PASS          this epoch's tracked-file count"
+ck_has "(y2) and both numbers printed" "tracked files"
+
+gq rm -r -q bulk
+gq commit -qm "index wipe shape"
+sl measure --cycle 3 --timeout 60
+sl analyze --cycle 3
+sl checkpoint --cycle 3
+ck_has "(y2) checkpoint's own tripwire fires on the drop" "TRACKED FILE COUNT DROPPED SHARPLY"
+gq add .swarm-loop; gq commit -qm "epoch 3 ledger"
+sl push-gate --cycle 3
+ck_exit "(y2) and the push gate REFUSES on the same arithmetic" 1 "$RC"
+ck_has "(y2) naming the rung" "tracked-files"
+ck_has "(y2) marked FAIL, not merely reported" "FAIL          this epoch's tracked-file count"
+ck_has "(y2) citing checkpoint's own threshold, not a second opinion" "max(25, 10%)"
+
+# ===========================================================================
 cd / 2>/dev/null || true
 ELAPSED=$(( $(date +%s) - START_TS ))
 echo

@@ -19,6 +19,7 @@ Subcommands:
   escalate    Ask the USER to change something frozen/blocked (records ONLY)
   frontier    Ready set from the ticket graph (readiness + blast radius)
   check-wave  Refuse a wave whose members could own the same file
+  push-gate   Score the mechanical rungs of the Phase 7 push gate
   reads       Read edges the graph does not declare (gates freeze)
   findings    Record checker findings durably, then mint tickets from them
   red-check   Prove each ticket's verify command FAILS before it is built
@@ -6620,6 +6621,290 @@ def cmd_retire(args):
     sys.exit(0)
 
 
+# ------------------------------------------------------------------ push gate
+#
+# D-1, reproduced on a fresh fixture before a line of this was written. SKILL.md's
+# Phase 7 push gate required that "everything .swarm-loop/ currently holds is
+# committed" — while Phase 7's OWN four commands write into .swarm-loop/:
+# `measure` appends history.csv, `analyze` writes analysis/cycle-N.json,
+# `checkpoint` rewrites state.json. After the sequence the tree reads
+# `M .swarm-loop/history.csv`, `M .swarm-loop/state.json`, `?? .swarm-loop/
+# analysis/`, so the condition was false the instant it was evaluated — in every
+# epoch, of every run, forever — and the failure was SILENT, because an
+# orchestrator that never pushes prints nothing about not pushing. The one and
+# only offsite copy of the run's evidence was withheld by a gate nobody could
+# satisfy. The prose now fires the push at the END of Phase 8, after the ledger
+# commit, which is the only ordering under which that bullet's own rationale is
+# true; this is the mechanical half, because a prose ordering forces nothing and
+# prose invariants in this skill have a measured 100% failure rate.
+#
+# It is deliberately INCOMPLETE and says so on every run. SKILL.md's six bullets
+# are seven conditions once the rung-2 bullet is split into its mechanical half
+# (has the verifier returned) and its judgement half (does its finding invalidate
+# a merged branch); this command scores five and cannot score two. A gate that
+# quietly answers five of seven while LOOKING like it answered seven is the exact
+# defect class this file keeps producing, so the other two are printed as an
+# operator checklist — on the pass path as loudly as on the fail path.
+
+# The two conditions no command can answer, verbatim in the gate's own terms.
+PUSH_GATE_OPERATOR = (
+    ("integrations-green",
+     "this epoch's integrations landed green on `main`",
+     "The suite that proves it ran in the primary checkout at merge time "
+     "(merge-protocol step 4), and left no artifact this command can read. "
+     "Re-reading a green from a log is not the same claim."),
+    ("rung2-findings",
+     "no rung-2 verifier finding invalidates a branch merged into this epoch's "
+     "`main`",
+     "Whether a finding invalidates a merged branch is a judgement about the "
+     "finding's content. The command can only see THAT a verifier is still "
+     "outstanding, which is the half above."),
+)
+
+
+def _swarm_dirty(root):
+    """Uncommitted paths under .swarm-loop/, or None if git could not answer.
+
+    -uall on purpose: git collapses an untracked DIRECTORY to a single entry,
+    and `?? .swarm-loop/analysis/` was the exact shape of the D-1 reproduction —
+    the directory tells an operator less than the cycle file inside it. Ignored
+    paths (worktrees/, archive/, tool caches) are absent by construction, which
+    is why this is a usable gate condition at all.
+    """
+    out = _git(root, "status", "--porcelain", "-uall", "--", STATE_DIR)
+    if out.returncode != 0:
+        return None
+    return [ln for ln in (out.stdout or "").splitlines() if ln.strip()]
+
+
+def _push_gate_analysis(d, cycle):
+    """(status, detail) for the 'analyze did not exit 1' rung."""
+    jpath = os.path.join(d, ANALYSIS_DIR, "cycle-%d.json" % cycle)
+    rel = "%s/%s/cycle-%d.json" % (STATE_DIR, ANALYSIS_DIR, cycle)
+    if not os.path.exists(jpath):
+        return "FAIL", ("%s does not exist — cycle %d was never analyzed, so this "
+                        "epoch has no values to have read before pushing. Run "
+                        "'analyze --cycle %d'." % (rel, cycle, cycle))
+    try:
+        with open(jpath) as f:
+            a = json.load(f)
+    except (OSError, ValueError) as e:
+        return "FAIL", "%s will not parse (%s) — treat it as no analysis at all" % (rel, e)
+    if a.get("cycle") is not None and int(a["cycle"]) != cycle:
+        return "FAIL", ("%s records cycle %s, not %d — the file was hand-edited or "
+                        "copied; re-run 'analyze --cycle %d'"
+                        % (rel, a.get("cycle"), cycle, cycle))
+    stale = list(a.get("stale_metrics") or [])
+    if stale:
+        return "FAIL", ("no measurement at cycle %d for: %s. 'analyze' exits 1 on this, "
+                        "and the table it printed is not a verdict on this cycle — "
+                        "re-measure before pushing" % (cycle, ", ".join(stale)))
+    if a.get("harness_integrity") == "VIOLATED":
+        return "FAIL", ("%s was written while the frozen harness read VIOLATED — the "
+                        "numbers in it are void whatever 'verify' says now" % rel)
+    return "PASS", ("%s exists, records cycle %d, and no metric is stale" % (rel, cycle))
+
+
+def _push_gate_tracked(state, cycle):
+    """(status, detail) for the tracked-file-drop rung, using checkpoint's own
+    arithmetic — drop > max(25, 10% of previous) — so the two sites cannot
+    disagree about what 'sharp' means."""
+    hist = state.get("head_history") or []
+    entry = prev = None
+    for h in hist:
+        try:
+            c = int(h.get("cycle"))
+        except (TypeError, ValueError):
+            continue
+        if c == cycle:
+            entry = h
+        elif c < cycle:
+            if prev is None or c > int(prev.get("cycle", -1)):
+                prev = h
+    if entry is None:
+        return "FAIL", ("cycle %d has no entry in state.json head_history — "
+                        "'checkpoint --cycle %d' has not run, so the tracked-file "
+                        "number this rung is sourced from does not exist. A condition "
+                        "nobody sources a number for passes vacuously every epoch."
+                        % (cycle, cycle))
+    if prev is None:
+        return "PASS", ("cycle %d is the first checkpoint of this run — %s tracked "
+                        "files, nothing earlier to drop from"
+                        % (cycle, entry.get("tracked_files", "?")))
+    if "tracked_files" not in entry or "tracked_files" not in prev:
+        return "UNANSWERABLE", ("state.json predates the tracked_files key on cycle %d "
+                                "or %s — the count cannot be compared. Read "
+                                "`git ls-tree -r HEAD --name-only | wc -l` against the "
+                                "epoch report by hand." % (cycle, prev.get("cycle")))
+    now, was = entry["tracked_files"], prev["tracked_files"]
+    drop = was - now
+    if drop > max(25, 0.10 * was):
+        return "FAIL", ("tracked files fell %d (cycle %s: %d -> cycle %d: %d), past "
+                        "checkpoint's own max(25, 10%%) line. That is the index-wipe "
+                        "signature; explain the drop in the epoch report before the "
+                        "push, or do not push."
+                        % (drop, prev.get("cycle"), was, cycle, now))
+    return "PASS", ("tracked files %d -> %d since cycle %s (no sharp drop)"
+                    % (was, now, prev.get("cycle")))
+
+
+def cmd_push_gate(args):
+    """Score the mechanically checkable rungs of SKILL.md's Phase 7 push gate.
+
+    Runs at the END of Phase 8, after the ledger commit — see the D-1 note above
+    for why nowhere earlier can satisfy it. A false refusal here is CHEAP by
+    construction: the prescribed response to any unmet condition is already
+    "name it in the epoch report and carry it to the next epoch's gate", and this
+    command sits nowhere near dispatch, where a false refusal would wedge the run.
+    A false PASS is the expensive direction, so every rung that cannot be answered
+    is printed as unanswered rather than counted.
+
+    Exit 0 = every mechanical rung passed (the two operator rungs are still
+    yours). Exit 1 = do not push. Never exit 2: this is not a terminal signal.
+    """
+    root = repo_root()
+    d = sd(root)
+    state = load_json(os.path.join(d, STATE_FILE), "state")
+    cycle = args.cycle
+    mode = state.get("push_remote", "when-clean")
+    conds = []
+
+    def add(cid, ref, status, detail):
+        conds.append({"id": cid, "condition": ref, "status": status, "detail": detail})
+
+    if mode == "never":
+        # The honest answer to "may I push?" is no, so this is exit 1 — but it is
+        # a configuration, not a failed gate, and the text has to say which.
+        out = {"cycle": cycle, "verdict": "no-remote", "push_remote": mode,
+               "conditions": [], "operator_checklist": []}
+        if args.as_json:
+            print(json.dumps(out, indent=2))
+        else:
+            print("push-gate cycle %d: NOT APPLICABLE — this run was initialized "
+                  "--push-remote never." % cycle)
+            print("  The loop never touches a remote. Skip the push step entirely; there is "
+                  "no condition here to satisfy and nothing to carry to the next epoch.")
+            print("  Exit 1 because the answer to 'may I push?' is no — not because "
+                  "anything failed.")
+        sys.exit(1)
+
+    # (1) verify — the live integrity oracle, not a remembered one.
+    status, bad, notes = _verify_quiet(root, d, state)
+    if status == "intact":
+        add("verify", "`verify` passed this epoch", "PASS",
+            "frozen manifest re-hashed and authenticated: intact")
+    elif status == "not frozen":
+        add("verify", "`verify` passed this epoch", "FAIL",
+            "goals were never frozen — there are no locked targets for a measurement "
+            "to have been against, so there is no number this push would be carrying")
+    else:
+        add("verify", "`verify` passed this epoch", "FAIL",
+            "harness VIOLATED (%d finding(s), first: %s) — a violated harness voids the "
+            "scores, so there is no number to have read"
+            % (len(bad), bad[0] if bad else "?"))
+    for n in notes:
+        add("verify-note", "`verify` passed this epoch", "NOTE", n)
+
+    # (2) analyze produced values for THIS cycle.
+    st, detail = _push_gate_analysis(d, cycle)
+    add("analysis", "`analyze` did not exit 1 — no metric is stale", st, detail)
+
+    # (3) tracked-file count, sourced from checkpoint's own recorded number.
+    st, detail = _push_gate_tracked(state, cycle)
+    add("tracked-files", "this epoch's tracked-file count is not an unexplained drop",
+        st, detail)
+
+    # (4) rung-2 verifiers returned. ONLY dispatches of kind 'verifier' block.
+    # Blocking on every open dispatch would make the gate unsatisfiable in the
+    # healthy case the skill is built around — dispatch is rolling, so one
+    # epoch's merges and the next epoch's builds overlap by design, and an open
+    # TICKET dispatch is the normal state of a wide swarm, not a push blocker.
+    # That would have re-created D-1 in a new place.
+    open_recs = _open_dispatches(d)
+    verifiers = [r for r in open_recs if (r.get("kind") or "") == "verifier"]
+    others = [r for r in open_recs if (r.get("kind") or "") != "verifier"]
+    if verifiers:
+        add("rung2-returned", "every rung-2 verifier dispatched for this epoch has returned",
+            "FAIL",
+            "%d verifier dispatch(es) still open in %s/%s: %s. A verdict still outstanding "
+            "is an unmet condition, not a pass — wait for it, or carry the push to the next "
+            "epoch's gate."
+            % (len(verifiers), STATE_DIR, DISPATCH_FILE,
+               ", ".join(str(r.get("agent_ref")) for r in verifiers)))
+    else:
+        add("rung2-returned", "every rung-2 verifier dispatched for this epoch has returned",
+            "PASS",
+            "no open dispatch of kind 'verifier' in %s/%s%s"
+            % (STATE_DIR, DISPATCH_FILE,
+               "" if not others else
+               " (%d other dispatch(es) open — rolling dispatch, not a push blocker: %s)"
+               % (len(others), ", ".join(str(r.get("agent_ref")) for r in others))))
+
+    # (5) .swarm-loop/ committed — the rung D-1 was about.
+    dirty = _swarm_dirty(root)
+    if dirty is None:
+        add("swarm-committed", "everything `.swarm-loop/` holds is committed", "UNANSWERABLE",
+            "git status failed — check the repository by hand before pushing")
+    elif dirty:
+        add("swarm-committed", "everything `.swarm-loop/` holds is committed", "FAIL",
+            "%d uncommitted path(s) under %s/: %s. Phase 8's ledger commit "
+            "(`git add %s && git commit`) has not run — a push of a main carrying none of "
+            "the epoch's evidence is what makes 'resume' on a fresh clone useless, and "
+            "this push is the run's only offsite copy of it."
+            % (len(dirty), STATE_DIR, "; ".join(x.strip() for x in dirty[:8])
+               + (" ..." if len(dirty) > 8 else ""), STATE_DIR))
+    else:
+        add("swarm-committed", "everything `.swarm-loop/` holds is committed", "PASS",
+            "%s/ is clean at HEAD" % STATE_DIR)
+
+    failed = [c for c in conds if c["status"] == "FAIL"]
+    unans = [c for c in conds if c["status"] == "UNANSWERABLE"]
+    scored = [c for c in conds if c["status"] in ("PASS", "FAIL")]
+
+    if args.as_json:
+        print(json.dumps({
+            "cycle": cycle,
+            "verdict": "blocked" if failed else "clear",
+            "push_remote": mode,
+            "mechanical_conditions": len(scored),
+            "gate_conditions_total": len(scored) + len(unans) + len(PUSH_GATE_OPERATOR),
+            "conditions": conds,
+            "operator_checklist": [{"id": i, "condition": c, "why_unmechanizable": w}
+                                   for i, c, w in PUSH_GATE_OPERATOR],
+        }, indent=2))
+        sys.exit(1 if failed else 0)
+
+    print("push-gate cycle %d (push-remote %s): %d of the gate's conditions are mechanical "
+          "and were scored here" % (cycle, mode, len(scored)))
+    for c in conds:
+        if c["status"] == "NOTE":
+            print("      note: %s" % _oneline(c["detail"], 200))
+            continue
+        print("  %-13s %s" % (c["status"], c["condition"]))
+        print("      %s" % _oneline(c["detail"], 400))
+    # Printed on the PASS path too, and it is the whole point of printing it: a
+    # gate that answers a strict subset while looking complete is how a green
+    # gets manufactured.
+    print("  --- NOT ANSWERED HERE — %d condition(s) only you can score:"
+          % len(PUSH_GATE_OPERATOR))
+    for _i, cond, why in PUSH_GATE_OPERATOR:
+        print("  OPERATOR      %s" % cond)
+        print("      %s" % why)
+    if unans:
+        print("  --- %d mechanical condition(s) this command could NOT answer (above, "
+              "UNANSWERABLE) — they are not passes." % len(unans))
+    if failed:
+        print("push-gate: DO NOT PUSH — %d condition(s) unmet: %s"
+              % (len(failed), ", ".join(c["id"] for c in failed)))
+        print("Name each in the epoch report with why, and carry the push to the next "
+              "epoch's gate. Do not push a subset and do not push anyway.")
+        sys.exit(1)
+    print("push-gate: the mechanical conditions are MET. This is not permission to push — "
+          "score the operator conditions above first, then push and verify each remote's "
+          "SHA (the verify-the-deploy skill), never the command's exit code.")
+    sys.exit(0)
+
+
 def cmd_status(args):
     root = repo_root()
     d = sd(root)
@@ -6862,6 +7147,15 @@ def main():
                         "EXISTING member branch has drifted behind it (report only, "
                         "never a veto)")
     s.set_defaults(func=cmd_check_wave)
+
+    s = sub.add_parser("push-gate", help="score the mechanical rungs of the Phase 7 push gate "
+                                        "(run at the END of Phase 8, after the ledger commit; "
+                                        "exit 1 = do not push)")
+    s.add_argument("--cycle", type=int, required=True,
+                   help="the epoch being closed — the cycle measure/analyze/checkpoint just ran")
+    s.add_argument("--json", action="store_true", dest="as_json",
+                   help="machine-readable report, same exit codes")
+    s.set_defaults(func=cmd_push_gate)
 
     s = sub.add_parser("red-check", help="prove each ticket's verify command FAILS before it "
                                          "is built (exit 1 on VACUOUS, WEAK, NO GATE or "
