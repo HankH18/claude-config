@@ -75,7 +75,25 @@ The premise: worktrees moved conflicts from silent runtime corruption to visible
    git checkout -b integration/<epoch>-<batch> main   # e.g. integration/e3-b2
    ```
 
-3. **Order the merges.** Most foundational first: shared types/interfaces → data layer → services/logic → routes/UI → tests/docs. Dependencies merge before dependents. Each successful merge shrinks the conflict surface for the rest.
+3. **Order the merges — and ask git which pairs actually collide, before you order anything:**
+   ```bash
+   python3 <skill>/scripts/swarmloop.py conflicts T-101,T-102,T-103 --base main
+   ```
+   Most foundational first: shared types/interfaces → data layer → services/logic → routes/UI → tests/docs. Dependencies merge before dependents. Each successful merge shrinks the conflict surface for the rest. That ordering heuristic is about *design*; `conflicts` is about *text*, and until it existed nothing in this skill compared two task branches to each other at all — `check-wave` reasons about the ownership globs the tickets **declared**, so it can only ever be as right as the declarations.
+
+   `git merge-tree --write-tree` answers each pair without touching a working tree, so the whole batch costs one command. Three verdicts, and the middle one is the reason to run it:
+
+   | Verdict | What it means | What to do |
+   |---|---|---|
+   | **VETO** | the pair conflicts textually; the conflicted paths are named | merge them one at a time in dependency order and resolve on the integration branch (step 5), or return the later one to the backlog |
+   | **ADVISORY** | merges clean, **but both sides changed the same file** | read both diffs. This is the first check anywhere that compares the files a branch **touched** against the globs its ticket **declared**, so it is where a wrong ownership map surfaces — after the fact, but before the merge. Textual mergeability is not agreement |
+   | **CLEAN** | disjoint file sets, merges clean | nothing owed |
+
+   Branches it could not answer about — a ref that does not resolve, a lane with zero commits — are **named**, never dropped, and make the exit code 1: at this point in the protocol an empty lane is a task that delivered nothing, and a shorter list read as a clean list is this command's whole failure mode. Exit 1 also covers a pair `merge-tree` could not judge, reported `UNKNOWN` rather than folded into CLEAN.
+
+   **Its blind spot, which it prints on every run: it compares branches to EACH OTHER, never to the base.** `merge-tree` is unaffected by a stale base — two branches forked 27 commits ago both come back clean and then die at `git merge --ff-only` with exit 128 (reproduced; it is the same finding step 9 exists for). The command names every branch that is behind the base, out of the same commit counts `check-branch` and `check-wave` print — but that line is beside the verdict, never inside it. A clean pairwise verdict is never permission to land.
+
+   **Do not move this check earlier.** SKILL.md Phase 4 makes `check-wave` a precondition of *spawning*, so at check-wave time every lane holds **zero commits**: run there, this command reports `0 comparable branches` with every member `UNANSWERABLE`, and a variant that printed tidy pairwise verdicts over empty branches would be a clean green about work that does not exist yet.
 
 4. **Merge one branch at a time, verify after each:**
    ```bash

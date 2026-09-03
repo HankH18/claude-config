@@ -19,6 +19,7 @@ Subcommands:
   escalate    Ask the USER to change something frozen/blocked (records ONLY)
   frontier    Ready set from the ticket graph (readiness + blast radius)
   check-wave  Refuse a wave whose members could own the same file
+  conflicts   Pairwise TEXTUAL conflict between task branches (git merge-tree)
   push-gate   Score the mechanical rungs of the Phase 7 push gate
   reads       Read edges the graph does not declare (gates freeze)
   findings    Record checker findings durably, then mint tickets from them
@@ -6621,7 +6622,7 @@ def cmd_retire(args):
     sys.exit(0)
 
 
-# ------------------------------------------------------------------ push gate
+# ------------------------------------------------------- push gate / conflicts
 #
 # D-1, reproduced on a fresh fixture before a line of this was written. SKILL.md's
 # Phase 7 push gate required that "everything .swarm-loop/ currently holds is
@@ -6905,6 +6906,215 @@ def cmd_push_gate(args):
     sys.exit(0)
 
 
+OID_RE = re.compile(r"^[0-9a-f]{40,64}$")
+
+
+def _merge_tree_pair(root, a, b):
+    """(verdict, [detail]) — 'clean' | 'conflict' | 'unknown'. Needs git 2.38+.
+
+    Touches no working tree and needs no worktree, which is why this can be asked
+    of a whole batch at once.
+
+    MEASURED, because the documented mapping is wrong in a way that manufactures
+    a confident false VETO: `git merge-tree` exits 1 both for a real conflict AND
+    for a ref it cannot resolve ("merge-tree: nosuch - not something we can
+    merge", stdout EMPTY). Read as the docs describe it, a typo'd branch name
+    comes back as a conflict naming zero files. The tell is stdout: a real
+    conflict writes the merged tree's OID on line 0 and the conflicted paths
+    after it. No OID, no answer. Unrelated histories exit 128 and a git too old
+    for --write-tree exits 129; both are 'unknown', never 'clean'.
+    """
+    r = _git(root, "merge-tree", "--write-tree", "--name-only", "--no-messages", a, b)
+    lines = [x for x in (r.stdout or "").splitlines()]
+    if r.returncode == 0 and lines and OID_RE.match(lines[0].strip()):
+        return "clean", []
+    if r.returncode == 1 and lines and OID_RE.match(lines[0].strip()):
+        return "conflict", [x.strip() for x in lines[1:] if x.strip()]
+    msg = ((r.stderr or "").strip() or (r.stdout or "").strip()
+           or "exit %d with no output" % r.returncode)
+    return "unknown", ["git merge-tree could not answer (exit %d): %s"
+                       % (r.returncode, msg.splitlines()[0])]
+
+
+def _resolve_branch(root, ref):
+    """(resolved_ref, sha) or (None, None). A bare ticket id also tries task/<id>."""
+    cands = [ref] if ref.startswith("task/") else [ref, "task/" + ref]
+    for cand in cands:
+        r = _git(root, "rev-parse", "--verify", "--quiet", cand + "^{commit}")
+        sha = (r.stdout or "").strip()
+        if r.returncode == 0 and sha:
+            return cand, sha
+    return None, None
+
+
+def _branch_files(root, base, ref):
+    """Files `ref` changed since it forked from `base`, or None if git failed.
+
+    --no-renames -z -- for the reasons check-branch spells out: default rename
+    detection prints only a rename's destination, and a non-ASCII path comes back
+    \\-escaped and quoted without -z.
+    """
+    r = _git(root, "diff", "--no-renames", "--name-only", "-z",
+             "%s...%s" % (base, ref), "--")
+    if r.returncode != 0:
+        return None
+    return set(p for p in (r.stdout or "").split("\0") if p.strip())
+
+
+def cmd_conflicts(args):
+    """Pairwise TEXTUAL conflict between task branches, answered by git.
+
+    D-2: `merge-tree` appeared four times in this skill and all four were prose.
+    check-wave's ownership veto reasons about DECLARED globs and can only ever be
+    as right as the declarations; nothing anywhere compared two branches' actual
+    content to each other.
+
+    NOT a pre-dispatch check, and it must never be moved into check-wave. Phase 4
+    makes check-wave a precondition of SPAWNING, so at check-wave time every lane
+    holds zero commits — measured at exactly that moment this command reports
+    "0 comparable branches", and a variant that printed a tidy pairwise verdict
+    over empty branches would be read as a green about work that does not exist
+    yet. This belongs at Phase 5 / merge-protocol step 3, where every branch
+    carries its final commits.
+
+    The ADVISORY verdict is the higher-value half. A pair that merges clean while
+    both sides touched the same file is the first thing anywhere that compares
+    ACTUAL touched files against check-wave's DECLARED globs, which is how a
+    wrong ownership map is caught after the fact. Textual mergeability is not
+    agreement.
+    """
+    root = repo_root()
+    base = args.base
+    if _resolve_branch(root, base)[0] is None:
+        die("base ref %r does not resolve — nothing to compare branches against" % base)
+
+    wanted = []
+    for raw in args.branches:
+        for b in re.split(r"[,\s]+", raw):
+            if b.strip() and b.strip() not in wanted:
+                wanted.append(b.strip())
+
+    live, skipped, files = [], [], {}
+    for b in wanted:
+        ref, _sha = _resolve_branch(root, b)
+        if ref is None:
+            skipped.append((b, "no such branch (nor task/%s) — nothing to compare" % b))
+            continue
+        lane = _lane_commits(root, base, ref)
+        if lane is None:
+            skipped.append((ref, "git could not count commits against %s" % base))
+            continue
+        if lane["ahead"] == 0:
+            skipped.append((ref, "0 commits ahead of %s — an EMPTY lane. At merge time "
+                                 "that is a task that delivered nothing, and a clean "
+                                 "answer about it is an answer about nothing" % base))
+            continue
+        touched = _branch_files(root, base, ref)
+        if touched is None:
+            # Never substitute an empty set here. Empty makes every pair look
+            # like disjoint file sets and prints CLEAN — a confident wrong
+            # verdict manufactured out of a failed subprocess.
+            skipped.append((ref, "git could not list the files it changed since %s, so "
+                                 "whether its file set is disjoint from anything cannot "
+                                 "be checked" % base))
+            continue
+        live.append((ref, lane))
+        files[ref] = touched
+
+    pairs = []
+    for i, (a, _la) in enumerate(live):
+        for b, _lb in live[i + 1:]:
+            verdict, detail = _merge_tree_pair(root, a, b)
+            shared = sorted(files[a] & files[b])
+            if verdict == "conflict":
+                pairs.append({"a": a, "b": b, "verdict": "VETO", "files": detail,
+                              "shared": shared})
+            elif verdict == "unknown":
+                pairs.append({"a": a, "b": b, "verdict": "UNKNOWN", "files": [],
+                              "shared": shared, "why": detail[0]})
+            elif shared:
+                pairs.append({"a": a, "b": b, "verdict": "ADVISORY", "files": [],
+                              "shared": shared})
+            else:
+                pairs.append({"a": a, "b": b, "verdict": "CLEAN", "files": [],
+                              "shared": []})
+
+    stale = [{"branch": ref, "behind": lane["behind"], "fork": lane["fork"]}
+             for ref, lane in live if lane["behind"]]
+    veto = [p for p in pairs if p["verdict"] == "VETO"]
+    unknown = [p for p in pairs if p["verdict"] == "UNKNOWN"]
+    advisory = [p for p in pairs if p["verdict"] == "ADVISORY"]
+    clean = [p for p in pairs if p["verdict"] == "CLEAN"]
+    # A shorter list read as a clean list is this command's failure mode, so an
+    # unanswerable BRANCH is exit 1 exactly like an unanswerable PAIR. At the one
+    # place this is meant to run — ordering a collected batch's merges — a
+    # missing ref is a typo and an empty lane is a failed task, and neither is a
+    # reason to hand back exit 0. Nothing here is on the dispatch path, so a
+    # false refusal costs a reread, not a wedged run.
+    bad = bool(veto or unknown or skipped)
+
+    if args.as_json:
+        print(json.dumps({
+            "base": base,
+            "comparable": [ref for ref, _l in live],
+            "unanswerable": [{"branch": b, "why": w} for b, w in skipped],
+            "pairs": pairs,
+            "stale_base": stale,
+            "verdict": "veto" if veto else ("unknown" if unknown else
+                                            ("advisory" if advisory else "clean")),
+            "blind_spot": "merge-tree says nothing about base staleness: a branch forked "
+                          "27 commits ago merges clean pairwise and still dies at "
+                          "`merge --ff-only`. See stale_base.",
+        }, indent=2))
+        sys.exit(1 if bad else 0)
+
+    print("conflicts: %d comparable branch(es) against base %s" % (len(live), base))
+    for b, why in skipped:
+        print("  UNANSWERABLE  %s: %s" % (b, why))
+    if len(live) < 2:
+        print("conflicts: nothing to compare — fewer than two branches carry commits")
+        sys.exit(1 if bad else 0)
+
+    if veto:
+        print("VETO: these branch PAIRS conflict textually — they cannot both land unattended:")
+        for p in veto:
+            print("  %s <-> %s" % (p["a"], p["b"]))
+            for f_ in p["files"]:
+                print("      ! %s" % f_)
+        print("  Merge them one at a time in dependency order and resolve on the integration")
+        print("  branch (merge-protocol step 5), or return the later one to the backlog.")
+    for p in unknown:
+        print("  UNKNOWN   %s <-> %s: %s" % (p["a"], p["b"], p.get("why")))
+        print("      Not a clean answer. Do not read it as one.")
+    if advisory:
+        print("ADVISORY (merges clean) — the same file changed by BOTH sides:")
+        for p in advisory:
+            print("  %s <-> %s   via  %s" % (p["a"], p["b"], ", ".join(p["shared"])))
+        print("  Textual mergeability is not agreement: two clean hunks in one file are how")
+        print("  the ownership map gets contradicted without anything failing. These files")
+        print("  were TOUCHED; check-wave only ever saw what the tickets DECLARED.")
+    for p in clean:
+        print("  CLEAN     %s <-> %s   (disjoint file sets, merges clean)" % (p["a"], p["b"]))
+
+    # The blind spot, printed every run including the all-clean one. A clean
+    # pairwise answer is not permission to land: merge-tree is unaffected by a
+    # stale base, and both stale branches in the fixture merged clean (exit 0)
+    # while `git merge --ff-only` died with exit 128.
+    print("  BLIND SPOT: this command compares branches to EACH OTHER, never to the base.")
+    print("  A branch forked long ago merges clean pairwise and still fails "
+          "`merge --ff-only`;")
+    print("  merge-protocol step 9 rebases the batch onto %s first for exactly that reason."
+          % base)
+    if stale:
+        for s in stale:
+            print("      STALE BASE  %s: %d commit(s) behind %s (forked at %s)"
+                  % (s["branch"], s["behind"], base, s["fork"][:12]))
+    else:
+        print("      (no branch here is behind %s right now — that can change before you "
+              "merge)" % base)
+    sys.exit(1 if bad else 0)
+
+
 def cmd_status(args):
     root = repo_root()
     d = sd(root)
@@ -7147,6 +7357,17 @@ def main():
                         "EXISTING member branch has drifted behind it (report only, "
                         "never a veto)")
     s.set_defaults(func=cmd_check_wave)
+
+    s = sub.add_parser("conflicts", help="pairwise TEXTUAL conflict between task branches, "
+                                        "answered by git merge-tree rather than by declared "
+                                        "globs (Phase 5 / merge-protocol step 3)")
+    s.add_argument("branches", nargs="+", metavar="BRANCH",
+                   help="comma- or space-separated; a bare ticket id also resolves task/<id>")
+    s.add_argument("--base", default="main",
+                   help="the ref every branch forked from (default: main)")
+    s.add_argument("--json", action="store_true", dest="as_json",
+                   help="machine-readable report, same exit codes")
+    s.set_defaults(func=cmd_conflicts)
 
     s = sub.add_parser("push-gate", help="score the mechanical rungs of the Phase 7 push gate "
                                         "(run at the END of Phase 8, after the ledger commit; "

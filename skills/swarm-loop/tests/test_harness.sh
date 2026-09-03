@@ -3983,6 +3983,150 @@ ck_has "(y2) marked FAIL, not merely reported" "FAIL          this epoch's track
 ck_has "(y2) citing checkpoint's own threshold, not a second opinion" "max(25, 10%)"
 
 # ===========================================================================
+# (z) conflicts — pairwise TEXTUAL conflict between task branches, answered by
+#     git rather than by declared globs.
+#
+# D-2: `merge-tree` appeared four times in this skill and all four were prose.
+# check-wave's veto reasons about the ownership globs a ticket DECLARED and can
+# only ever be as right as the declarations; nothing anywhere compared two
+# branches' actual content. This is deliberately NOT a pre-dispatch check —
+# at check-wave time every lane holds zero commits, so a tidy pairwise verdict
+# there would be a green about work that does not exist yet.
+# ===========================================================================
+section "(z) conflicts: pairwise merge-tree verdicts  [repo: cflct]"
+mk_repo cflct
+printf 'A = 1\nB = 2\nC = 3\n' > shared.py
+gq add -A; gq commit -qm shared
+
+gq checkout -q -b task/T-101 main
+printf 'A = 111\nB = 2\nC = 3\n' > shared.py
+gq commit -qam T101
+gq checkout -q main
+gq checkout -q -b task/T-102 main
+printf 'A = 999\nB = 2\nC = 3\n' > shared.py
+gq commit -qam T102
+gq checkout -q main
+gq checkout -q -b task/T-103 main
+printf 'A = 1\nB = 2\nC = 333\n' > shared.py
+gq commit -qam T103
+gq checkout -q main
+gq checkout -q -b task/T-104 main
+echo "x = 1" > only_mine.py
+gq add -A; gq commit -qm T104
+gq checkout -q main
+gq branch task/T-105 main          # provisioned, never dispatched
+
+sl conflicts T-101,T-102 T-103 T-104 T-105 T-999
+ck_exit "(z) a conflicting pair takes the batch to exit 1" 1 "$RC"
+ck_has "(z) the conflicting PAIR is named" "task/T-101 <-> task/T-102"
+ck_has "(z) with the path git actually conflicted on" "! shared.py"
+ck_has "(z) clean-but-same-file is ADVISORY, never a veto" "ADVISORY (merges clean)"
+ck_has "(z) naming the file both sides touched" "task/T-101 <-> task/T-103   via  shared.py"
+ck_has "(z) a genuinely disjoint pair reads CLEAN" "CLEAN     task/T-101 <-> task/T-104"
+ck_has "(z) an EMPTY lane is named, never dropped" "task/T-105: 0 commits ahead"
+ck_has "(z) a branch that does not exist is named too" "T-999: no such branch"
+ck_has "(z) and the base-staleness blind spot is stated" "BLIND SPOT"
+ck_hasnt "(z) a VETOed pair is not ALSO reported clean" "CLEAN     task/T-101 <-> task/T-102"
+ck_hasnt "(z) nor advisory" "task/T-101 <-> task/T-102   via"
+
+# A wholly clean batch: the blind spot is printed here TOO, which is the point of
+# printing it — a clean pairwise answer is never permission to land.
+sl conflicts T-103 T-104
+ck_exit "(z) two disjoint branches exit 0" 0 "$RC"
+ck_hasnt "(z) with no veto" "VETO:"
+ck_has "(z) a bare ticket id resolves task/<id>" "CLEAN     task/T-103 <-> task/T-104"
+ck_has "(z) the blind spot prints on the all-clean path as well" "BLIND SPOT"
+
+# Base staleness is the half merge-tree structurally cannot see.
+echo "main moved" > src/app.py
+gq add -A; gq commit -qm "main moves"
+sl conflicts T-103 T-104
+ck_exit "(z) a stale base is not a veto" 0 "$RC"
+ck_has "(z) but it IS named, per branch" "STALE BASE  task/T-103"
+ck_has "(z) with the commit count behind base" "1 commit(s) behind main"
+
+# No merge base at all: not comparable, and it says so rather than guessing.
+gq checkout --orphan task/T-106
+gq reset -q
+echo "z = 1" > z.py
+gq add z.py; gq commit -qm orphan
+gq checkout -qf main
+sl conflicts T-103 T-106
+ck_exit "(z) a branch with no merge base is not comparable" 1 "$RC"
+ck_has "(z) and is reported, not silently dropped" "git could not count commits against main"
+
+sl conflicts T-101 T-102 --json
+ck_exit "(z) --json keeps the exit code" 1 "$RC"
+ck_has "(z) --json carries the verdict" '"verdict": "veto"'
+ck_has "(z) --json carries the blind spot too" '"blind_spot"'
+
+sl conflicts T-103 --base nope
+ck_exit "(z) an unresolvable base is a refusal, not a clean answer" 1 "$RC"
+ck_has "(z) named as such" "does not resolve"
+
+# The documented merge-tree mapping is WRONG in a way that manufactures a
+# confident false VETO, and this was measured before the command was written:
+# `git merge-tree` exits 1 both for a real conflict AND for a ref it cannot
+# resolve, with stdout EMPTY. Read as "exit 1 == conflicts", a typo'd branch
+# name comes back as a conflict naming zero files.
+: > "$OUT"
+python3 - > "$OUT" 2>&1 <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["SL_DIR"])
+import swarmloop
+r = os.getcwd()
+print("badref=%s"   % swarmloop._merge_tree_pair(r, "task/T-101", "nosuchref")[0])
+print("nomergebase=%s" % swarmloop._merge_tree_pair(r, "task/T-101", "task/T-106")[0])
+print("conflict=%s" % swarmloop._merge_tree_pair(r, "task/T-101", "task/T-102")[0])
+print("clean=%s"    % swarmloop._merge_tree_pair(r, "task/T-101", "task/T-104")[0])
+PY
+ck_has "(z) a ref merge-tree cannot resolve is UNKNOWN, never a conflict" "badref=unknown"
+ck_has "(z) unrelated histories are UNKNOWN, never clean" "nomergebase=unknown"
+ck_has "(z) a real conflict is still reported as one" "conflict=conflict"
+ck_has "(z) and a real clean merge as clean" "clean=clean"
+
+# A pair git could not judge must never be folded into the clean list — the
+# prototype's clean set was "everything not vetoed and not advisory", which
+# printed each UNKNOWN pair a second time as CLEAN.
+: > "$OUT"
+python3 - > "$OUT" 2>&1 <<'PY'
+import argparse, os, sys
+sys.path.insert(0, os.environ["SL_DIR"])
+import swarmloop
+swarmloop._merge_tree_pair = lambda root, a, b: ("unknown", ["stubbed: git refused"])
+try:
+    swarmloop.cmd_conflicts(argparse.Namespace(
+        branches=["T-103", "T-104"], base="main", as_json=False))
+except SystemExit as e:
+    print("exit=%d" % e.code)
+PY
+ck_has "(z) a pair git could not judge prints UNKNOWN" "UNKNOWN   task/T-103 <-> task/T-104"
+ck_hasnt "(z) and is NEVER also listed as clean" "CLEAN     task/T-103 <-> task/T-104"
+ck_has "(z) an unanswered pair is exit 1, not a green" "exit=1"
+
+# The other way a CLEAN can be manufactured: 'no shared files' is what an EMPTY
+# file set looks like, so a failed `git diff` coerced to set() prints CLEAN about
+# a pair nothing was compared for.
+: > "$OUT"
+python3 - > "$OUT" 2>&1 <<'PY'
+import argparse, os, sys
+sys.path.insert(0, os.environ["SL_DIR"])
+import swarmloop
+swarmloop._branch_files = lambda root, base, ref: None
+try:
+    swarmloop.cmd_conflicts(argparse.Namespace(
+        branches=["T-103", "T-104"], base="main", as_json=False))
+except SystemExit as e:
+    print("exit=%d" % e.code)
+PY
+ck_has "(z) a branch whose file list git refuses is UNANSWERABLE" \
+       "git could not list the files it changed"
+ck_hasnt "(z) never a CLEAN built from an empty file set" \
+       "CLEAN     task/T-103 <-> task/T-104"
+ck_has "(z) and that is exit 1" "exit=1"
+
+
+# ===========================================================================
 cd / 2>/dev/null || true
 ELAPSED=$(( $(date +%s) - START_TS ))
 echo
