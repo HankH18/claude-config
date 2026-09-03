@@ -7181,6 +7181,9 @@ import csv
 r = list(csv.DictReader(open(".swarm-loop/history.csv")))
 print(r[-1]["deselected"])')"
 
+sl analyze --cycle 0
+ck "V10 CONTROL: a PYTEST metric that deselected nothing reports 0, not unknown" "0" \
+   "$(jget .swarm-loop/analysis/cycle-0.json 'd["metrics"][0]["latest_deselected"]')"
 sl analyze --cycle 1
 ck_exit "V10 analyze does NOT signal all-targets-met over a post-freeze filter (exit 2 withheld)" 0 "$RC"
 # Asserted against the TERMINAL banner's own wording. The withholding notice
@@ -7232,6 +7235,15 @@ print(r[-1]["deselected"])')"
 sl analyze --cycle 0
 ck "V10 ...so it can never be reported as a selection regression" "0" \
    "$(jget .swarm-loop/analysis/cycle-0.json 'len(d["selection_regressions"])')"
+# THE DISTINCTION ITSELF, asserted rather than inferred. `len(regressions) == 0`
+# is true whether a blank column reads as UNKNOWN or as zero, so it cannot tell
+# them apart -- and reading blank as zero is what would give every non-pytest
+# metric a fabricated deselect baseline of 0 for the first pytest-shaped row to
+# regress from. analyze must SAY unknown.
+ck "V10 ...and analyze reports its selection as UNKNOWN, never as zero" "None" \
+   "$(jget .swarm-loop/analysis/cycle-0.json 'd["metrics"][0]["latest_deselected"]')"
+ck "V10 ...for both columns" "None" \
+   "$(jget .swarm-loop/analysis/cycle-0.json 'd["metrics"][0]["latest_selected"]')"
 
 # BACKWARD COMPATIBILITY: a history.csv written by a version with no selection
 # columns must still analyze, and must read as "unknown", not as zero.
