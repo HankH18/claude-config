@@ -4413,6 +4413,50 @@ ck_has "(z2) --json names it in the unanswerable array, not just in the exit cod
 ck_has "(z2) with the reason" "no such branch"
 ck_has "(z2) and the pair it COULD judge is still there" '"verdict": "CLEAN"'
 
+# ===========================================================================
+# (doc) The prose and the code must not contradict each other.
+#
+# The last pass at this reorder amended three sites and missed two, and a doc
+# claim that outlived its code is what F3/F6 were: merge-protocol.md documented
+# an ownership-glob comparison `conflicts` has never performed, and SKILL.md
+# still told an orchestrator mid-integration that the push happens in Phase 7.
+# Nothing executes prose, so nothing was red. These cases are the grep the last
+# pass did not run.
+# ===========================================================================
+section "(doc) SKILL.md and references must not contradict the code"
+SKILL_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$SKILL_ROOT" || exit 1
+
+: > "$OUT"; cat "$SKILL_ROOT/SKILL.md" >> "$OUT"
+ck_hasnt "(doc) Phase 6's body no longer puts the push in Phase 7" \
+         "any push all happen in Phase 7"
+ck_has "(doc) it says where the push actually fires" \
+       "the push fires at the END of Phase 8"
+ck_hasnt "(doc) nor does Phase 2 step 4 still say 'the push in Phase 7'" \
+         "the push in Phase 7 ships a"
+ck_has "(doc) the fail path tells you to COMMIT the amendment it asks for" \
+       "commit that amendment"
+ck_has "(doc) because the report was already committed when the gate ran" \
+       "written **and committed** before the gate answered"
+ck_has "(doc) and the terminal path covers a FINAL epoch that declined to push" \
+       "that refusal is the last thing this run records"
+ck_has "(doc) SKILL.md names the conflicts command at the step that runs it" \
+       "swarmloop.py conflicts <ids> --base main"
+
+: > "$OUT"; cat "$SKILL_ROOT/references/merge-protocol.md" >> "$OUT"
+ck_hasnt "(doc) merge-protocol no longer claims a comparison the code never makes" \
+         "compares the files a branch **touched** against the globs its ticket **declared**"
+ck_has "(doc) it states what ADVISORY actually reads" "loads no ticket graph"
+ck_has "(doc) and hands the declared-glob half to the operator" \
+       "check the named file against what each ticket **declared** it owns"
+ck_has "(doc) the zero-branch refusal is documented where the command is" \
+       "resolves to **zero** branch names"
+
+: > "$OUT"; cat "$SKILL_ROOT/scripts/swarmloop.py" >> "$OUT"
+ck_hasnt "(doc) and the docstring carries no copy of the retired claim" \
+         "ACTUAL touched files against check-wave's DECLARED globs"
+ck_has "(doc) it says plainly what ADVISORY is" \
+       "It is NOT a comparison against"
 
 # ===========================================================================
 cd / 2>/dev/null || true

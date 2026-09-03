@@ -7037,11 +7037,19 @@ def cmd_conflicts(args):
     yet. This belongs at Phase 5 / merge-protocol step 3, where every branch
     carries its final commits.
 
-    The ADVISORY verdict is the higher-value half. A pair that merges clean while
-    both sides touched the same file is the first thing anywhere that compares
-    ACTUAL touched files against check-wave's DECLARED globs, which is how a
-    wrong ownership map is caught after the fact. Textual mergeability is not
-    agreement.
+    The ADVISORY verdict is the higher-value half, and it is worth stating
+    exactly what it is and is not. It IS `files[a] & files[b]` — branch A's
+    touched files intersected with branch B's. It is NOT a comparison against
+    check-wave's declared globs: nothing here loads the ticket graph or reads a
+    ticket's `owns`/`scope`, and no ticket id appears in the output. This
+    docstring and merge-protocol.md both used to claim the glob comparison, and
+    the code never did it — the claim was the load-bearing justification for the
+    verdict, so it is corrected rather than softened. What ADVISORY actually
+    buys, which is real: it is the first check anywhere that compares two
+    branches' ACTUAL content to each other rather than to their declarations, so
+    a wrong ownership map becomes visible as two branches editing one file. The
+    operator does the second half — read both diffs against what those tickets
+    declared. Textual mergeability is not agreement.
     """
     root = repo_root()
     base = args.base
