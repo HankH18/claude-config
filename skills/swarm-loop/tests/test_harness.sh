@@ -2618,6 +2618,403 @@ sl status
 ck_exit "BC: status is unchanged by the new optional keys" 0 "$RC"
 
 # ===========================================================================
+# claude-build — the session-topology modifiers.
+#
+# Everything below runs against a FAKE skill tree inside $TMP with stub `claude`
+# and `tmux` binaries on PATH, so no case can start a session, write to the real
+# skill, or depend on what happens to be installed on the machine.
+# bin/claude-build resolves its skill from its own location, which is what makes
+# that possible.
+# ===========================================================================
+section "claude-build: value flags that used to die silently  [fake skill tree]"
+
+CB_SRC="$SCRIPT_DIR/../bin/claude-build"
+CBS="$TMP/fakeskill"; CBH="$TMP/fakehome"; CBBIN="$TMP/fakebin"; CBP="$TMP/cbproj"
+mkdir -p "$CBS/bin" "$CBS/hooks" "$CBS/scripts" "$CBS/templates" "$CBH" "$CBBIN" "$CBP"
+cp "$CB_SRC" "$CBS/bin/claude-build"
+printf '# stub guard\n'   > "$CBS/hooks/git-guard.py"
+printf '# stub harness\n' > "$CBS/scripts/swarmloop.py"
+cp "$SCRIPT_DIR/../templates/"*.md "$CBS/templates/" 2>/dev/null
+printf '#!/bin/sh\nexit 0\n' > "$CBBIN/claude"; chmod +x "$CBBIN/claude"
+printf '#!/bin/sh\nexit 0\n' > "$CBBIN/tmux";   chmod +x "$CBBIN/tmux"
+
+cb() {  # cb <args...>  — combined output in $OUT, exit code in $RC
+  HOME="$CBH" PATH="$CBBIN:$PATH" bash "$CBS/bin/claude-build" "$@" > "$OUT" 2>&1
+  RC=$?
+}
+
+# $TMPDIR is a symlink on macOS (/var -> /private/var), and claude-build
+# resolves the project with `pwd -P`, so assertions about paths in its output
+# have to compare against the resolved form or they fail for the wrong reason.
+CBP_R="$(cd "$CBP" && pwd -P)"
+
+# A PATH with every directory that holds a tmux removed. Deleting the stub is
+# not enough: the machine's real tmux is still on PATH and the preflight would
+# find it, so the case would pass for a reason unrelated to what it asserts.
+CB_PATH_NO_TMUX=""
+for _d in $(printf '%s\n' "$PATH" | tr ':' '\n'); do
+  [ -n "$_d" ] || continue
+  [ -x "$_d/tmux" ] && continue
+  CB_PATH_NO_TMUX="$CB_PATH_NO_TMUX:$_d"
+done
+CB_PATH_NO_TMUX="${CB_PATH_NO_TMUX#:}"
+
+cb_no_tmux() {  # same as cb(), with no tmux reachable anywhere on PATH
+  HOME="$CBH" PATH="$CB_PATH_NO_TMUX" bash "$CBS/bin/claude-build" "$@" > "$OUT" 2>&1
+  RC=$?
+}
+
+# The defect: `--spec` with nothing after it read "${2:-}" and then `shift 2`.
+# With $# == 1 the shift fails, and under `set -euo pipefail` the script died at
+# exit 1 having printed NOTHING AT ALL. A launcher with a silent verdict is the
+# same failure this suite keeps finding elsewhere.
+for f in --spec --audit-loops --max-cycles; do
+  cb "$f"
+  ck_exit "$f with no value exits nonzero" 1 "$RC"
+  ck_has  "$f with no value SAYS WHY" "needs a value"
+  ck_has  "...and names the flag ($f)" "$f"
+done
+
+# The nastier half: the value slot swallowed by the NEXT FLAG. `--spec --dry-run`
+# used to set SPEC="--dry-run" and silently drop the dry run.
+cb --spec --dry-run
+ck_exit "--spec eating the next flag is refused" 1 "$RC"
+ck_has  "...and names the flag it found instead" "the option '--dry-run'"
+cb --audit-loops --in-tree
+ck_exit "--audit-loops eating the next flag is refused" 1 "$RC"
+ck_has  "...and names it" "the option '--in-tree'"
+
+# None of the three values was validated either.
+cb --audit-loops 0
+ck_exit "--audit-loops 0 is refused" 1 "$RC"
+ck_has  "...as not a positive whole number" "positive whole number"
+cb --max-cycles abc
+ck_exit "--max-cycles abc is refused" 1 "$RC"
+ck_has  "...and quotes what it got" "got 'abc'"
+cb --audit-loops 3x
+ck_exit "--audit-loops 3x is refused" 1 "$RC"
+cb "$CBP" --spec does-not-exist.md --dry-run
+ck_exit "--spec pointing at nothing is refused" 1 "$RC"
+ck_has  "...and prints the paths it tried" "tried 'does-not-exist.md'"
+
+# A value that IS valid still works, and reaches the prompt.
+printf 'spec\n' > "$CBP/SPEC.md"
+cb "$CBP" --spec SPEC.md --audit-loops 2 --max-cycles 9 --dry-run
+ck_exit "valid values are accepted" 0 "$RC"
+ck_has  "--spec is resolved to an absolute path in the prompt" "$CBP_R/SPEC.md"
+ck_has  "--audit-loops still reaches the prompt" "Use 2 audit-fix loops"
+ck_has  "--max-cycles still reaches the prompt" "--max-cycles 9"
+
+# ===========================================================================
+section "claude-build: the topology modifiers parse  [fake skill tree]"
+
+# A bare word is normally swallowed by the arg loop's *) arm as the project
+# directory, so `claude-build watch` would create a directory called "watch".
+# The modifier arms must sit ABOVE both the -*) and the *) arm.
+for m in watch --watch; do
+  cb "$CBP" "$m" --dry-run
+  ck_exit "'$m' parses" 0 "$RC"
+  ck_has  "'$m' selects the watch topology" "6. Watchers (watch)"
+  ck_hasnt "'$m' is not taken as a directory" "would create directory"
+done
+for m in watch-fix --watch-fix; do
+  cb "$CBP" "$m" --dry-run
+  ck_exit "'$m' parses" 0 "$RC"
+  ck_has  "'$m' selects the watch-fix topology" "6. Watchers (watch-fix)"
+  ck_has  "'$m' also plans the fixer's copy" "would copy"
+done
+cb "$CBP" watch --dry-run
+ck_hasnt "the watch topology does NOT plan a fixer" "would copy"
+
+# A typo must still land on the unknown-option error rather than being taken as
+# a directory name — which is why both spellings are accepted.
+cb "$CBP" --wtch
+ck_exit "a misspelled modifier flag is an unknown option" 1 "$RC"
+ck_has  "...and says so" "unknown option: --wtch"
+
+cb "$CBP" watch watch-fix
+ck_exit "two different modifiers are refused" 1 "$RC"
+ck_has  "...naming both" "two topology modifiers given: watch and watch-fix"
+cb "$CBP" watch watch --dry-run
+ck_exit "the same modifier twice is harmless" 0 "$RC"
+
+# ===========================================================================
+section "claude-build: a modifier outside install mode  [fake skill tree]"
+
+# MODE is install|uninstall|uninstall-self and a modifier is orthogonal to it,
+# so it gets its own cross-flag check — the same shape as the --purge one.
+for m in watch watch-fix full-auto; do
+  cb "$CBP" --uninstall "$m"
+  ck_exit "$m with --uninstall is refused" 1 "$RC"
+  ck_has  "...naming the flag and the mode ($m)" "$m only means anything on a build run (you asked for: uninstall)"
+done
+cb --uninstall-self watch
+ck_exit "watch with --uninstall-self is refused" 1 "$RC"
+ck_has  "...naming that mode too" "(you asked for: uninstall-self)"
+cb "$CBP" --purge
+ck_exit "--purge outside --uninstall is refused" 1 "$RC"
+ck_has  "...in the same shape" "--purge only means anything with --uninstall (you asked for: install)"
+
+# ===========================================================================
+section "claude-build: full-auto refuses until its gate exists  [fake skill tree]"
+
+# full-auto's whole content is an authorization gate in hooks/git-guard.py. A
+# full-auto that started a CTO session without it would be a review step the
+# operator BELIEVES is happening and which is not.
+cb "$CBP" full-auto --dry-run
+ck_exit "full-auto refuses while the gate is missing" 3 "$RC"
+ck_has  "...naming the sentinel it looked for" "CLAUDE_BUILD_AUTHORIZATION_GATE"
+ck_has  "...and the file it looked in" "hooks/git-guard.py"
+ck_has  "...and what a CTO could authorize" "NON-DESTRUCTIVE"
+ck_has  "...and what it never could" "no \"ask the CTO\" path at all"
+ck_has  "...and that a user-level deny outranks it" "absolute"
+ck_has  "...and what to run instead today" "watch-fix"
+ck_hasnt "...and it starts NOTHING" "6. Watchers"
+
+# When the guard declares the sentinel, the refusal becomes a launch. That is
+# the whole seam: one grep.
+printf '# stub guard\n# CLAUDE_BUILD_AUTHORIZATION_GATE\n' > "$CBS/hooks/git-guard.py"
+cb "$CBP" full-auto --dry-run
+ck_exit "full-auto proceeds once the guard declares the sentinel" 0 "$RC"
+ck_has  "...as the watch-fix topology plus authority" "6. Watchers (full-auto)"
+ck_has  "...announcing the gate is armed" "the CTO authorization gate"
+ck_has  "...and it does plan the fixer" "would copy"
+printf '# stub guard\n' > "$CBS/hooks/git-guard.py"
+cb "$CBP" full-auto --dry-run
+ck_exit "removing the sentinel restores the refusal" 3 "$RC"
+
+# ===========================================================================
+section "claude-build: --dry-run writes nothing and starts nothing"
+
+rm -rf "$CBH/claude-build" "$CBP/.claude" "$CBP/.gitignore" "$CBP/.git"
+for m in watch watch-fix; do
+  cb "$CBP" "$m" --dry-run
+  ck_exit "$m --dry-run exits 0" 0 "$RC"
+  ck "...$m --dry-run created no run scaffolding" "absent" \
+     "$([ -e "$CBH/claude-build" ] && echo present || echo absent)"
+  ck "...$m --dry-run did not git-init the project" "absent" \
+     "$([ -e "$CBP/.git" ] && echo present || echo absent)"
+  ck "...$m --dry-run wrote no settings" "absent" \
+     "$([ -e "$CBP/.claude/settings.local.json" ] && echo present || echo absent)"
+  ck_has "...and says so in words" "nothing was written and no session was started"
+done
+
+# tmux is the launch primitive, so its absence must be a loud refusal at
+# preflight rather than a failure three steps later.
+ck "the no-tmux PATH really has no tmux on it" "" \
+   "$(PATH="$CB_PATH_NO_TMUX" command -v tmux)"
+cb_no_tmux "$CBP" watch --dry-run
+ck_exit "a modifier with no tmux is refused" 1 "$RC"
+ck_has  "...naming tmux and why" "tmux not on PATH"
+cb_no_tmux "$CBP" --dry-run
+ck_exit "...and a run WITHOUT a modifier does not need tmux at all" 0 "$RC"
+
+# ===========================================================================
+section "claude-build: the observer permission profiles"
+
+# The profile generator is executed for real, out of the launcher's own source,
+# so these assertions are about what actually ships rather than a paraphrase.
+CBGEN="$TMP/cbgen"; mkdir -p "$CBGEN"
+python3 - "$CB_SRC" "$CBGEN" <<'PYGEN' > /dev/null
+import os, subprocess, sys
+src, out = sys.argv[1], sys.argv[2]
+body, grab = [], False
+for line in open(src):
+    if line.startswith("read -r -d '' PY_WATCH_SETTINGS "):
+        grab = True; continue
+    if grab and line.startswith("PY_WATCH_SETTINGS_EOF"):
+        break
+    if grab:
+        body.append(line)
+open(os.path.join(out, "gen.py"), "w").write("".join(body))
+base = dict(os.environ)
+base.update(DIR="/p/proj", WT="/p/proj-worktrees", OBS="/p/obs",
+            STATE_DIR="/p/runs/r1", PROJECTS_DIR="/p/transcripts",
+            SKILL="/p/skill", GUARD="/p/skill/hooks/git-guard.py")
+for role in ("watchdog", "fixer"):
+    env = dict(base, ROLE=role, OUT_PATH=os.path.join(out, role + ".json"),
+               WORK_DIR=("/p/runs/r1/skill" if role == "fixer" else ""))
+    subprocess.run([sys.executable, os.path.join(out, "gen.py")], env=env, check=True)
+PYGEN
+ck "the profile generator runs for both roles" "2" \
+   "$(ls "$CBGEN"/watchdog.json "$CBGEN"/fixer.json 2>/dev/null | wc -l | tr -d ' ')"
+
+# THE COVERAGE CHECK. Derived from the two lists the launcher actually emits —
+# the --tools allowlist and the generated deny list — rather than hardcoded, so
+# adding a write-capable tool to --tools without a matching deny fails HERE
+# instead of silently widening an observer's profile in production.
+#
+# Measured, and the reason the deny list is spelled the way it is: Claude Code
+# matches file rules ONLY in the Edit(path) form. It rejects the alternatives at
+# startup — "Write(...) is not matched by file permission checks — only
+# Edit(path) rules are ... (Edit rules cover all file-editing tools)" and
+# "MultiEdit(...) matches no known tool". One Edit rule per protected path is
+# therefore the complete answer, verified end to end against a live session:
+# Write to a new path, Write over an existing file, Edit, `printf x > path`,
+# `cp a b` and `python3 -c open(...)` were ALL refused under every protected
+# path, and all succeeded in the observer's own notebook.
+ck "every tool in --tools is one this profile is known to bound" "" \
+   "$(python3 - "$CB_SRC" "$CBGEN" <<'PYCOV'
+import json, os, re, sys
+src, gen = sys.argv[1], sys.argv[2]
+text = open(src).read()
+
+tools = set()
+for m in re.finditer(r'--tools "([^"]+)"', text):
+    tools |= {t.strip() for t in m.group(1).split(",") if t.strip()}
+
+INERT = {"Read", "Glob", "Grep", "Monitor", "SendMessage", "ListAgents",
+         "TodoWrite", "WebFetch", "WebSearch"}
+BOUNDED_BY_EDIT_RULE = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
+BOUNDED_OTHERWISE = {"Bash"}
+
+problems = []
+if not tools:
+    problems.append("no --tools list found in the launcher at all")
+bad = sorted(tools - INERT - BOUNDED_BY_EDIT_RULE - BOUNDED_OTHERWISE)
+if bad:
+    problems.append("UNBOUNDED TOOL(S) IN --tools: " + ", ".join(bad))
+
+PROTECTED = ["/p/proj", "/p/proj-worktrees", "/p/transcripts", "/p/skill"]
+for role in ("watchdog", "fixer"):
+    d = json.load(open(os.path.join(gen, role + ".json")))
+    perms = d["permissions"]
+    deny, allow = set(perms["deny"]), set(perms["allow"])
+    if tools & BOUNDED_BY_EDIT_RULE:
+        for p in PROTECTED:
+            rule = "Edit(//" + p.lstrip("/") + "/**)"
+            if rule not in deny:
+                problems.append(role + " has no write deny for " + p)
+    for r in deny | allow:
+        if re.match(r"^(Write|MultiEdit|NotebookEdit)\(", r):
+            problems.append(role + " emits an unmatched path rule: " + r)
+    if "Bash" in tools:
+        for c in ("python3", "cp", "tee", "sh", "bash", "awk", "perl"):
+            if "Bash(" + c + ":*)" not in deny:
+                problems.append(role + " does not deny the interpreter " + c)
+        for c in ("rm", "mv", "git commit", "git push", "git reset"):
+            if "Bash(" + c + ":*)" not in deny:
+                problems.append(role + " does not deny the mutator " + c)
+    if perms.get("defaultMode") != "acceptEdits":
+        problems.append(role + " is not acceptEdits")
+    if d.get("disableAllHooks") is not False:
+        problems.append(role + " does not pin disableAllHooks false")
+    matcher = d["hooks"]["PreToolUse"][0]["matcher"]
+    if matcher != "Bash|Edit|Write|NotebookEdit|MultiEdit":
+        problems.append(role + " hook matcher drifted: " + matcher)
+print("; ".join(problems))
+PYCOV
+)"
+
+ck "the fixer may write its own copy of the skill" "True" \
+   "$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print('Edit(//p/runs/r1/skill/**)' in d['permissions']['allow'])" "$CBGEN/fixer.json")"
+ck "the watchdog may write the observation documents" "True" \
+   "$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print('Edit(//p/obs/**)' in d['permissions']['allow'])" "$CBGEN/watchdog.json")"
+ck "NEITHER observer may edit the live skill" "True" \
+   "$(python3 -c "
+import json,sys
+print(all('Edit(//p/skill/**)' in json.load(open(p))['permissions']['deny'] for p in sys.argv[1:]))" "$CBGEN/watchdog.json" "$CBGEN/fixer.json")"
+ck "the provisioned hook points at the launcher's OWN guard" "True" \
+   "$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d['hooks']['PreToolUse'][0]['hooks'][0]['command'].endswith('/p/skill/hooks/git-guard.py\"'))" "$CBGEN/watchdog.json")"
+
+# The live skill must not be one of the fixer's working directories: it has
+# `bash` denied but a working directory is still a file-tool address, and the
+# whole point is that a fix cannot reach the apparatus a build is running on.
+ck "the fixer's launch line does not --add-dir the live skill" "0" \
+   "$(sed -n '/fixer-launch.sh/,/LAUNCH_EOF/p' "$CB_SRC" | grep -c -- '--add-dir.*\$SKILL')"
+ck "the watchdog's launch line DOES (it must read the harness to report on it)" "1" \
+   "$(sed -n '/watchdog-launch.sh/,/LAUNCH_EOF/p' "$CB_SRC" | grep -c -- '--add-dir.*"\$SKILL"')"
+
+# ===========================================================================
+section "claude-build: the launch line cannot drift from the printed one"
+
+# --no-launch used to print one hand-written command string while `exec` used a
+# separate literal, so a flag added to one silently stopped describing the other.
+# Three exec lines: the build, and the two observer launch scripts the
+# launcher writes. Any fourth is a launch path nothing in here describes.
+ck "the launcher contains exactly three exec-claude lines" "3" \
+   "$(grep -c '^exec claude ' "$CB_SRC")"
+ck "...two of them are the observer launch scripts it generates" "2" \
+   "$(grep -c '^exec claude --restricted' "$CB_SRC")"
+ck "...and exactly one launches the BUILD, from the shared array" "1" \
+   "$(grep -c '^exec claude "\${LAUNCH_ARGS\[@\]}" "\$PROMPT"$' "$CB_SRC")"
+# `exec` replaces the process, so nothing after it runs — the observers have to
+# be started BEFORE it, and this is what keeps that true.
+ck "the build's exec is the LAST line of the script" "1" \
+   "$(tail -1 "$CB_SRC" | grep -c '^exec claude "\${LAUNCH_ARGS\[@\]}" "\$PROMPT"$')"
+ck "every watcher is started before it" "0" \
+   "$(awk '/^exec claude "\$\{LAUNCH_ARGS/{f=1} f && /tmux new-session/{n++} END{print n+0}' "$CB_SRC")"
+ck "...and the printed instructions are built from the same array" "1" \
+   "$(grep -c 'for a in "\${LAUNCH_ARGS\[@\]}"' "$CB_SRC")"
+ck "no second hand-written 'claude --add-dir' launch literal survives" "0" \
+   "$(grep -c 'claude --add-dir "\$WT"' "$CB_SRC")"
+
+# The frozen matcher: tests/test_git_guard.py scans for this literal and a
+# second one with any other value is a finding. The launcher now writes three
+# settings files, so every occurrence must carry the same string.
+ck "every matcher literal in the launcher is the frozen one" "0" \
+   "$(grep -o '"matcher": "[^"]*"' "$CB_SRC" | grep -vc '"matcher": "Bash|Edit|Write|NotebookEdit|MultiEdit"')"
+
+# ===========================================================================
+section "claude-build: the prompt templates render or fail loudly"
+
+ck "every template ships with the skill" "4" \
+   "$(ls "$SCRIPT_DIR/../templates/watchdog-prompt.md" \
+         "$SCRIPT_DIR/../templates/fixer-prompt.md" \
+         "$SCRIPT_DIR/../templates/obs-harness.md" \
+         "$SCRIPT_DIR/../templates/obs-build.md" 2>/dev/null | wc -l | tr -d ' ')"
+
+# A prompt rendered with a placeholder left in it would send an observer looking
+# for the build by mtime, which is the heuristic this whole feature retires. So
+# a missing template is a preflight refusal and an unset placeholder is a hard
+# failure, never a half-rendered file.
+mv "$CBS/templates/watchdog-prompt.md" "$CBS/templates/watchdog-prompt.hidden"
+cb "$CBP" watch --dry-run
+ck_exit "a missing template is refused at preflight" 1 "$RC"
+ck_has  "...naming the file" "missing template"
+mv "$CBS/templates/watchdog-prompt.hidden" "$CBS/templates/watchdog-prompt.md"
+
+ck "the renderer refuses an unset placeholder" "FATAL" \
+   "$(python3 - "$CB_SRC" <<'PYR'
+import os, subprocess, sys, tempfile
+src = sys.argv[1]
+body, grab = [], False
+for line in open(src):
+    if line.startswith("read -r -d '' PY_RENDER "):
+        grab = True; continue
+    if grab and line.startswith("PY_RENDER_EOF"):
+        break
+    if grab:
+        body.append(line)
+d = tempfile.mkdtemp()
+open(d + "/r.py", "w").write("".join(body))
+open(d + "/t.md", "w").write("hello @@NEVER_SET_ANYWHERE@@\n")
+env = dict(os.environ, TPL=d + "/t.md", OUT_PATH=d + "/o.txt")
+p = subprocess.run([sys.executable, d + "/r.py"], env=env, capture_output=True, text=True)
+ok = p.stdout.startswith("FATAL:") and p.returncode == 3 and not os.path.exists(d + "/o.txt")
+print("FATAL" if ok else "rc=%s out=%r" % (p.returncode, p.stdout))
+PYR
+)"
+
+# Every placeholder the templates use must be one claude-build exports, or the
+# render fails at launch time instead of here.
+ck "no template uses a placeholder the launcher never sets" "" \
+   "$(python3 - "$CB_SRC" "$SCRIPT_DIR/../templates" <<'PYP'
+import os, re, sys
+src, tpl = sys.argv[1], sys.argv[2]
+exported = set(re.findall(r"\bT_([A-Z0-9_]+)=", open(src).read()))
+missing = set()
+for fn in sorted(os.listdir(tpl)):
+    if not fn.endswith(".md"):
+        continue
+    for k in re.findall(r"@@([A-Z0-9_]+)@@", open(os.path.join(tpl, fn)).read()):
+        if k not in exported:
+            missing.add(fn + ":" + k)
+print(", ".join(sorted(missing)))
+PYP
+)"
+
+# ===========================================================================
 cd / 2>/dev/null || true
 ELAPSED=$(( $(date +%s) - START_TS ))
 echo
