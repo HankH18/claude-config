@@ -4345,6 +4345,74 @@ ck_has "(y5) but the ledger rung is clean again — no self-inflicted second fai
 ck_hasnt "(y5) and nothing invents a ledger failure" \
          'FAIL          everything `.swarm-loop/` holds is committed'
 
+# ===========================================================================
+# (z2) conflicts — zero branches, and one branch counted twice.
+#
+# ZERO branches is the maximal form of "a shorter list read as a clean list",
+# which this command's own comment names as its whole failure mode: `conflicts
+# ""` / `,` / `"  "` — an unset `"$IDS"` in `conflicts "$IDS" && git merge ...` —
+# printed "0 comparable branch(es) ... nothing to compare" and exited 0.
+# Separately, dedupe was on the raw ARGUMENT string, so the two spellings this
+# command advertises for one branch both entered the live set and the branch was
+# compared to ITSELF, printing an ADVISORY that a branch disagrees with itself.
+# ===========================================================================
+section "(z2) conflicts: zero branches, and a branch named twice  [repo: cflct2]"
+mk_repo cflct2
+printf 'A = 1\nB = 2\nC = 3\n' > shared.py
+gq add -A; gq commit -qm shared
+gq checkout -q -b task/T-103 main
+printf 'A = 1\nB = 2\nC = 333\n' > shared.py
+gq commit -qam T103
+gq checkout -q main
+gq checkout -q -b task/T-104 main
+echo "x = 1" > only_mine.py
+gq add -A; gq commit -qm T104
+gq checkout -q main
+
+# POSITIVE CONTROL first: a real argument list is still answered, so the new
+# refusal is not one that fires on everything.
+sl conflicts T-103 T-104
+ck_exit "(z2) control: a real two-branch batch still answers, exit 0" 0 "$RC"
+ck_has "(z2) control: with the pair judged" "CLEAN     task/T-103 <-> task/T-104"
+
+sl conflicts ""
+ck_exit "(z2) an EMPTY argument refuses — nothing compared is not a clean batch" 1 "$RC"
+ck_has "(z2) saying exactly what resolved to nothing" "resolved to ZERO branch names"
+ck_hasnt "(z2) and never prints a comparable-branch count for it" "comparable branch(es)"
+sl conflicts ","
+ck_exit "(z2) a comma-only argument refuses too" 1 "$RC"
+ck_has "(z2) same reason" "resolved to ZERO branch names"
+sl conflicts "   "
+ck_exit "(z2) whitespace-only refuses too" 1 "$RC"
+ck_has "(z2) same reason" "resolved to ZERO branch names"
+
+# And the line is drawn at ZERO, not at "few": one real branch cannot conflict
+# with a peer, so it stays exit 0 — but the text refuses to be read as a clean
+# verdict about a comparison that never happened.
+sl conflicts T-104
+ck_exit "(z2) ONE real branch is still exit 0 — nothing can conflict with a peer" 0 "$RC"
+ck_has "(z2) but it says no pair was judged" "no pair was formed, so no pair was judged"
+
+# One branch, two spellings, both advertised by --help.
+sl conflicts T-103 task/T-103 T-104
+ck_exit "(z2) the two spellings of one branch do not manufacture a third" 0 "$RC"
+ck_has "(z2) the branch count is the number of BRANCHES, not of arguments" \
+       "conflicts: 2 comparable branch(es)"
+ck_hasnt "(z2) and no branch is compared to itself" "task/T-103 <-> task/T-103"
+ck_hasnt "(z2) so no ADVISORY is raised about a branch disagreeing with itself" \
+         "ADVISORY (merges clean)"
+n=$(grep -c -F "CLEAN     task/T-103 <-> task/T-104" "$OUT")
+ck "(z2) the one genuine pair is judged exactly once" "1" "$n"
+
+# --json must carry the branches the human-readable path is tested to name, or a
+# machine reader can be blinded to exactly the ones that made the exit code 1.
+sl conflicts T-103 T-104 T-999 --json
+ck_exit "(z2) --json refuses on an unresolvable branch" 1 "$RC"
+ck_has "(z2) --json names it in the unanswerable array, not just in the exit code" \
+       '"branch": "T-999"'
+ck_has "(z2) with the reason" "no such branch"
+ck_has "(z2) and the pair it COULD judge is still there" '"verdict": "CLEAN"'
+
 
 # ===========================================================================
 cd / 2>/dev/null || true

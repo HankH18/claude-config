@@ -7054,12 +7054,35 @@ def cmd_conflicts(args):
             if b.strip() and b.strip() not in wanted:
                 wanted.append(b.strip())
 
+    # ZERO branches is the shortest possible version of this command's whole
+    # failure mode. argparse's nargs="+" only guarantees a non-empty ARGV, not a
+    # non-empty branch list: `conflicts ""`, `conflicts ,` and `conflicts "  "`
+    # all split to nothing, which is exactly what an unset shell variable
+    # expands to in `conflicts "$IDS" --base main && git merge ...`. That used to
+    # print "0 comparable branch(es)" and exit 0 — a green handed back for
+    # comparing nothing at all.
+    if not wanted:
+        die("the argument list resolved to ZERO branch names (%s) — nothing was compared, "
+            "and nothing compared is not a clean batch. An unset or empty shell variable "
+            "expanded into this command line is the usual cause. Name the branches."
+            % ", ".join(repr(x) for x in args.branches))
+
     live, skipped, files = [], [], {}
+    # Dedupe on the RESOLVED ref, not on the argument spelling. This command
+    # advertises that a bare ticket id also resolves task/<id>, so `conflicts
+    # T-103 task/T-103` used to put ONE branch into the live set twice and then
+    # compare it to itself — printing an ADVISORY that a branch disagrees with
+    # itself over the files it touched, a verdict that cannot reflect reality, at
+    # exactly the moment the operator is choosing merge order.
+    seen = set()
     for b in wanted:
         ref, _sha = _resolve_branch(root, b)
         if ref is None:
             skipped.append((b, "no such branch (nor task/%s) — nothing to compare" % b))
             continue
+        if ref in seen:
+            continue
+        seen.add(ref)
         lane = _lane_commits(root, base, ref)
         if lane is None:
             skipped.append((ref, "git could not count commits against %s" % base))
@@ -7132,7 +7155,9 @@ def cmd_conflicts(args):
     for b, why in skipped:
         print("  UNANSWERABLE  %s: %s" % (b, why))
     if len(live) < 2:
-        print("conflicts: nothing to compare — fewer than two branches carry commits")
+        print("conflicts: nothing to compare — fewer than two branches carry commits.")
+        print("  This is NOT a clean verdict about anything: no pair was formed, so no "
+              "pair was judged.")
         sys.exit(1 if bad else 0)
 
     if veto:
