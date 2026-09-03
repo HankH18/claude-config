@@ -206,13 +206,28 @@ failed, and what to do differently. Do not repeat the failed approach.>
   failure permanent instead of visible to the check above.
 - Never commit a provisioned directory (`node_modules/`, `.venv/`, `dist/`) or a
   lockfile — `git add -A` after provisioning is exactly how those land on a branch.
-- If the primary checkout has a `.codegraph/` index, use
-  `codegraph explore "<symbols or question>"` BEFORE grep/find or bulk
-  file-reading to understand the codebase — one query returns verbatim source,
-  call paths, and blast radius, including dynamic-dispatch hops grep misses.
-  Caveat: the index reflects the indexed primary tree (~1s lag behind its
-  writes), not your worktree's uncommitted edits — use it to understand the
-  base; read your own files directly when reviewing your own diff.
+- **Index-backed navigation is a PRIMARY-CHECKOUT capability. Inside your
+  worktree, navigate with `git grep` and direct reads.** A code index lives in a
+  gitignored directory, so it is not in your worktree — and the CLI does not say
+  so. It walks UP to the nearest index it can find and answers from whatever it
+  lands on. Measured on a live run: `.codegraph/` present in the primary
+  checkout, absent in **8 of 8** worktrees, and a query from a worktree resolved
+  to the index of the PARENT directory — 7,946 files across nine unrelated
+  projects, with `select count(*) from files where path like '<project>/%'`
+  returning **0**. Zero percent of any answer a worker got there could be about
+  the project it was building, and it came back confident and well-formed: the
+  same query returned 48 symbols across 3 correct files from the primary
+  checkout, and 25 symbols from a third-party library's internals from a
+  worktree. One lane noticed and fell back to direct reads; a lane that did not
+  would reason about another codebase believing it was reading its own.
+- **If you run an index CLI at all, verify that every path it returns is inside
+  your own tree before believing a word of it.** A result whose paths sit outside
+  your worktree is not a partial answer; it is an answer about other software.
+- **The general rule, because the next such tool will not be called CodeGraph:
+  any capability living in a gitignored directory is ABSENT inside a worktree,
+  and the ones that fail silently are the expensive ones.** A tool that errors is
+  cheap. A tool that answers confidently about the wrong code is the same failure
+  the wiring check below exists to catch, one level up.
 - Re-run your named acceptance tests and the project's fast checks
   (<lint/typecheck/unit command>) before finishing; do not report done with
   them failing unless you explain precisely why.
