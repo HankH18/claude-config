@@ -93,16 +93,25 @@ Blocked:
 
 Blocked on repo STATE rather than on the command string — one rule, and the only
 one in this file that reads the working tree to decide:
-  git push of the run's `main` while `<tree>/.swarm-loop` holds anything
-    uncommitted (modified OR untracked). Phase 7's last push condition —
-    "everything `.swarm-loop/` currently holds is committed" — was prose with no
-    mechanism, so a `main` carrying none of the epoch's evidence went to the
-    remote silently, and that push is the run's only offsite copy of the thing
-    `resume` reads. Narrow by construction: it fires only on the branch checked
-    out in the tree that CARRIES `.swarm-loop`, so a worker's `task/<id>` push
-    and a repo with no `.swarm-loop` are untouched, and `--dry-run` (the
-    pre-flight probe run-permissions.md prescribes) is exempt. Unanswerable —
-    no git, no repository, a `status` that errors or times out — allows.
+  git push of a branch whose tree has anything uncommitted under `.swarm-loop`
+    (modified OR untracked). Phase 7's last push condition — "everything
+    `.swarm-loop/` currently holds is committed" — was prose with no mechanism,
+    so a `main` carrying none of the epoch's evidence went to the remote
+    silently, and that push is the run's only offsite copy of the thing `resume`
+    reads. WHICH TREE is decided by BRANCH IDENTITY, never by iteration order:
+    `.swarm-loop` is tracked, so every worker worktree checks one out too, and
+    the first cut of this returned the first dirty tree in sorted order — an
+    alphabetically-earlier worktree then shadowed the primary and ALLOWED the
+    dirty-`main` push (measured, rc=0). The push publishes a branch; the ledger
+    that would be missing from it is the one in the tree holding that branch.
+    A push of a branch no tree has checked out, a repo with no `.swarm-loop`,
+    `--tags` (which publishes no branch), and `--dry-run` (the pre-flight probe
+    run-permissions.md prescribes) are all untouched. A WORKER's own
+    `task/<id>` push does block if that worktree's ledger is dirty — nothing in
+    the loop writes `.swarm-loop` from a worktree, so it is an anomaly — and the
+    refusal says that instead of quoting a phase the worker does not run.
+    Unanswerable — no git, no repository, a `status` that errors or times out —
+    allows.
 
 Blocked WITHOUT a git verb (rules keyed on the PATH, added after a live audit
 found the guard had no path awareness at all):
@@ -112,10 +121,22 @@ found the guard had no path awareness at all):
     <worktree-root>/` and takes every live worktree's uncommitted work — and
     the VARIABLE-ROOT/LITERAL-TAIL form beside it, `rm -rf "$WT/T-010"`, which
     collapses to a harmless-looking `/T-010` and so walked past the rule above
-    while naming a live worktree out loud. NOTE the residual limit: an operand
-    with a variable root has no path to resolve FROM, so this one rule is still
-    answered from the effective directory — it fires from the repo or the
-    worktrees parent and not from an unrelated directory
+    while naming a live worktree out loud. This one used to be the file's one
+    DIRECTORY-DEPENDENT path rule: a variable-rooted operand has no path to
+    resolve FROM, so it was answered from the command's own directory, and the
+    old note here — "it fires from the repo or the worktrees parent and not
+    from an unrelated directory" — described the limit but never asserted it.
+    Measured, same operand, one fixture: BLOCK from the repo, the worktrees
+    parent AND the worktree; ALLOW from an unrelated directory, while the
+    LITERAL absolute path blocked from all four. So the limit was never
+    "outside a repository" (the worktrees parent is outside every repository
+    and blocked fine) — it was "outside anything leading back to the run".
+    Closed by anchoring THAT rule, and only that rule, to `_SESSION_ROOT`, the
+    directory this hook process was launched in, which the SCOPE section below
+    pins to the run's repo. It can only add trees carrying `.swarm-loop`, and a
+    wrong assumption finds nothing, so the widening fails OPEN. All four cells
+    plus the literal controls are pinned in tests/test_git_guard.py
+    (`var-tail-cwd-*`, `lit-tail-cwd-*`)
   rm -r of `<repo>/.git` or `<worktree>/.git` — the admin directory is not
     "under" the root by the ancestor test, and deleting it detaches every
     linked worktree and takes all refs, history and the reflog
@@ -784,6 +805,24 @@ except Exception:                      # cwd deleted out from under the process
 # bash's OLDPWD, tracked so `cd -` means what it means to bash.
 _CWD_PREV: str | None = None
 
+# WHERE THIS HOOK PROCESS WAS LAUNCHED, captured at import — before `_main`
+# chdir's to the payload's `cwd` and `_init_cwd()` overwrites `_CWD`.
+#
+# It is the SESSION's directory, which for this guard means the run's repository:
+# the hook is registered in exactly one place, `<repo>/.claude/settings.local.json`
+# (see SCOPE), so a process that this hook is attached to at all was started
+# there. That makes it the one anchor to the run that survives a command whose
+# own directory has nothing to do with the run.
+#
+# Used by exactly ONE rule — `var_tail_reason` — and deliberately not by the
+# others, which already resolve from the operand and are cwd-independent. It
+# cannot widen the protected set beyond the run's own trees: every probe that is
+# not `_CWD` is gated by `_is_this_run`, and from an unrelated directory the
+# session family is empty, so only a tree CARRYING `.swarm-loop` gets through.
+# If the assumption is wrong and this is some other directory, the probe finds
+# nothing and the rule behaves exactly as it did — the failure mode is fail-OPEN.
+_SESSION_ROOT: str = _CWD
+
 
 def _init_cwd() -> None:
     global _CWD
@@ -1247,22 +1286,32 @@ def check_push_ledger(rest: list[str]) -> str | None:
     `--tags` publishes refs/tags and NO branch at all, so it has no evidence to
     be missing and is allowed. Both directions are pinned as cases.
 
-    Fails OPEN on every uncertainty — see `swarm_ledger_dirty`."""
+    WHICH TREE IS ASKED is decided by BRANCH IDENTITY, never by iteration order.
+    `.swarm-loop` is tracked, so every worker worktree checks one out too, and
+    the first version of this — "return the first dirty tree in the family" —
+    let an alphabetically-earlier worktree shadow the primary and ALLOW the very
+    push the rule exists to refuse (measured; see `swarm_ledger_status`). The
+    push publishes a BRANCH, and the uncommitted ledger that would be missing
+    from it lives in whichever tree has that branch checked out. So: find that
+    tree, ask that tree, and let the directory names fall where they may.
+
+    Fails OPEN on every uncertainty — see `swarm_ledger_status`."""
     # `--dry-run`/`-n` publishes nothing, so there is no evidence to be missing.
     if long_opt_abbrev(rest, "--dry-run") or short_flag_has(rest, "n", "o"):
         return None
-    dirty = swarm_ledger_dirty()
-    if dirty is None:
+    try:
+        fam = sorted(_session_family())
+    except Exception:
         return None
-    tree, status = dirty
-    run_main = _current_branch(tree)
-    if not run_main:
-        return None            # detached HEAD, or git declined to say -> allow
+    if not fam:
+        return None
     here = _current_branch(_CWD)
     refs = push_local_refs(rest)
+    every_branch = False
     if refs is None:
         if long_opt_abbrev(rest, "--all", "--branches"):
-            refs = [run_main]      # every local branch, so the run's `main` too
+            every_branch = True    # every local branch, whichever tree holds it
+            refs = []
         elif long_opt_abbrev(rest, "--tags"):
             refs = []              # refs/tags only — no branch is published
         else:
@@ -1276,15 +1325,50 @@ def check_push_ledger(rest: list[str]) -> str | None:
             r = r[len("refs/heads/"):]
         if r:
             names.add(r)
-    if run_main not in names:
+    if not names and not every_branch:
         return None
-    return ("`git push` of `" + run_main + "` while this run's ledger is DIRTY — "
-            "uncommitted under `" + os.path.join(tree, SWARM_DIR) + "`:\n"
-            + status + "\n"
+    for tree in fam:
+        branch = _current_branch(tree)
+        if not branch:
+            continue           # detached HEAD there -> that tree is not asked
+        if not every_branch and branch not in names:
+            continue
+        status = swarm_ledger_status(tree)
+        if status:
+            return _ledger_refusal(tree, branch, status)
+    return None
+
+
+def _ledger_refusal(tree: str, branch: str, status: str) -> str:
+    """The refusal, in the register of whoever is reading it.
+
+    Two audiences, and the wrong text for either is a message that gets ignored.
+    The PRIMARY tree pushing its own branch is Phase 7, and the operator is the
+    orchestrator: name the phase and the epoch-boundary commit. A LINKED
+    WORKTREE is a worker, which does not run Phase 7 at all and would be reading
+    about a phase it has never heard of — for it the dirty ledger is an anomaly,
+    because nothing in the loop writes `.swarm-loop` from a worktree and this
+    guard blocks such writes. Told apart by `_is_linked_worktree`, which is
+    already how this file distinguishes the two and costs no git call."""
+    head = ("`git push` of `" + branch + "` while the `.swarm-loop` ledger in the "
+            "tree that holds that branch is DIRTY — uncommitted under `"
+            + os.path.join(tree, SWARM_DIR) + "`:\n" + status + "\n"
+            "A push ships COMMITS, so none of the above goes with it.\n")
+    if _is_linked_worktree(tree):
+        return (head +
+                "That tree is a WORKER WORKTREE, and nothing in the loop writes `"
+                + SWARM_DIR + "` from one — this guard blocks such writes, and "
+                "Phase 7's push of `main` from the primary tree is the loop's only "
+                "push. So this is an anomaly to look at, not something to commit.\n"
+                "FIX — see what changed it, then put it back:\n"
+                "  git -C " + tree + " status --porcelain -- " + SWARM_DIR + "\n"
+                "  git -C " + tree + " checkout -- " + SWARM_DIR
+                + "   # unless you know why it differs")
+    return (head +
             "That is Phase 7's last push condition, and it is not a style rule: "
             "`history.csv`, `state.json` and `analysis/` are what `resume` reads, "
             "and this push is the run's only offsite copy of them. Pushing now "
-            "ships a `" + run_main + "` carrying none of this epoch's evidence.\n"
+            "ships a `" + branch + "` carrying none of this epoch's evidence.\n"
             "FIX — commit the ledger first (Phase 8's epoch-boundary commit), "
             "then push:\n"
             "  git -C " + tree + " add " + SWARM_DIR + "\n"
@@ -1713,13 +1797,21 @@ def _is_this_run(root: str | None, wts: list) -> bool:
     return False
 
 
-def _resolve(ap: str | None, scan_below: bool = False) -> tuple:
+def _resolve(ap: str | None, scan_below: bool = False,
+             also: str | None = None) -> tuple:
     """(repo roots, worktree roots, determined) relevant to operand `ap`.
 
-    Three probe points, deliberately a UNION rather than a replacement:
+    Probe points, deliberately a UNION rather than a replacement:
       - `_CWD`, so no verdict that already worked can be lost;
       - the operand's own nearest existing directory — the fix;
-      - for a recursive delete, the linked worktrees BELOW it.
+      - for a recursive delete, the linked worktrees BELOW it;
+      - `also`, an extra anchor the CALLER supplies. Exactly one caller does
+        (`var_tail_reason`, with `_SESSION_ROOT`), because that rule has an
+        operand there is nothing to resolve FROM. It is a parameter and not a
+        fourth unconditional probe on purpose: every other rule asks git about
+        the operand and is already directory-independent, and widening
+        resolution for all of them is how "every git repository on the machine
+        is undeletable" happened once.
     """
     roots: list[str] = []
     wts: list[str] = []
@@ -1728,6 +1820,8 @@ def _resolve(ap: str | None, scan_below: bool = False) -> tuple:
     probes = [_CWD, base]
     if scan_below:
         probes.extend(_linked_worktrees_under(base))
+    if also:
+        probes.append(also)
     seen = set()
     for d in probes:
         if not d or d in seen:
@@ -1782,7 +1876,7 @@ def collapse_unexpanded(op: str) -> str:
     return "/".join(out)
 
 
-def swarm_dirs(ap: str | None) -> list[str]:
+def swarm_dirs(ap: str | None, also: str | None = None) -> list[str]:
     """`<repo-root>/.swarm-loop` for every repo root in scope for this operand.
     Plural because the operand and the cwd can name different repositories —
     `> <repo>/.swarm-loop/state.json` issued from the worktrees parent is the
@@ -1792,7 +1886,7 @@ def swarm_dirs(ap: str | None) -> list[str]:
     inside a worker's worktree `rev-parse --show-toplevel` answers with the
     WORKTREE, so the main tree — where the run's real `.swarm-loop` lives —
     only ever shows up in the worktree list."""
-    roots, wts, _det = _resolve(ap, scan_below=True)
+    roots, wts, _det = _resolve(ap, scan_below=True, also=also)
     seen, out = set(), []
     for r in roots + wts:
         sd = os.path.join(r, SWARM_DIR)
@@ -1818,22 +1912,32 @@ def _current_branch(d: str | None) -> str | None:
 MAX_LEDGER_STATUS_LINES = 10
 
 
-def swarm_ledger_dirty() -> tuple:
-    """(tree, indented `git status --porcelain` lines) for a tree of THIS RUN
-    whose `.swarm-loop` holds uncommitted changes — otherwise None.
+def swarm_ledger_status(tree: str) -> str | None:
+    """The indented `git status --porcelain` lines for `<tree>/.swarm-loop` when
+    that ledger holds uncommitted changes — otherwise None.
 
-    Asked of the SESSION FAMILY (the tree the command runs in, plus every
-    worktree of it), not of an operand: a push names no path, and the run's
-    `.swarm-loop` lives in the PRIMARY tree, which from inside a worker's
-    worktree only ever appears in the worktree list.
+    ASKED OF ONE NAMED TREE, which is the whole shape of the fix behind it. The
+    first version of this asked the SESSION FAMILY and returned the first dirty
+    tree it found in sorted order, and iteration order then decided the verdict:
+    `.swarm-loop` is tracked, so every worker worktree checks one out too, and a
+    worktree whose path sorts before the primary shadowed the primary entirely.
+    Measured on a two-tree fixture with both ledgers dirty and the worktree
+    named to sort first (`<root>/AAA-T-042` vs `<root>/proj`):
+
+        rc=0  cwd=<primary, on main>   git push origin main   <- the MISS
+        rc=2  same push, after cleaning ONLY the worktree's ledger
+
+    An unrelated directory's NAME silently disarmed the rule on the exact push
+    it was built for. The caller now picks the tree by branch identity and asks
+    only that one.
 
     None means every outcome that is not "definitely dirty", and they are
-    deliberately indistinguishable to the caller: clean, no `.swarm-loop`
-    anywhere in the family, not a repository, git missing, `status` erroring or
-    timing out past the retry. This rule FAILS OPEN like every rule in this file
-    but one — the fail-CLOSED exception is and stays the recursive `rm` whose
-    target could not be classified. A push blocked because the guard could not
-    answer wedges the unattended run it exists to protect.
+    deliberately indistinguishable to the caller: clean, no `.swarm-loop` there,
+    git missing, `status` erroring or timing out past the retry. This rule FAILS
+    OPEN like every rule in this file but one — the fail-CLOSED exception is and
+    stays the recursive `rm` whose target could not be classified. A push
+    blocked because the guard could not answer wedges the unattended run it
+    exists to protect.
 
     Untracked content counts as dirty, and that is the point rather than an
     accident: `analyze` writes `.swarm-loop/analysis/cycle-N.json` into a
@@ -1841,29 +1945,24 @@ def swarm_ledger_dirty() -> tuple:
     `?? .swarm-loop/analysis/` and nothing else. A rule that only noticed
     MODIFIED tracked files would miss it."""
     try:
-        fam = sorted(_session_family())
+        if not os.path.isdir(os.path.join(tree, SWARM_DIR)):
+            return None
     except Exception:
         return None
-    for t in fam:
-        try:
-            if not os.path.isdir(os.path.join(t, SWARM_DIR)):
-                continue
-        except Exception:
-            continue
-        # Scoped to the one pathspec so this stays cheap on a big working tree;
-        # an unanswerable `status` is skipped, never guessed at.
-        p = _git_at(t, ["status", "--porcelain", "--", SWARM_DIR])
-        if p is None or p.returncode != 0:
-            continue
-        lines = [ln.rstrip() for ln in p.stdout.splitlines() if ln.strip()]
-        if lines:
-            shown = lines[:MAX_LEDGER_STATUS_LINES]
-            more = len(lines) - len(shown)
-            body = "\n".join("  " + ln for ln in shown)
-            if more > 0:
-                body += "\n  ... and %d more" % more
-            return t, body
-    return None
+    # Scoped to the one pathspec so this stays cheap on a big working tree;
+    # an unanswerable `status` is skipped, never guessed at.
+    p = _git_at(tree, ["status", "--porcelain", "--", SWARM_DIR])
+    if p is None or p.returncode != 0:
+        return None
+    lines = [ln.rstrip() for ln in p.stdout.splitlines() if ln.strip()]
+    if not lines:
+        return None
+    shown = lines[:MAX_LEDGER_STATUS_LINES]
+    more = len(lines) - len(shown)
+    body = "\n".join("  " + ln for ln in shown)
+    if more > 0:
+        body += "\n  ... and %d more" % more
+    return body
 
 
 def in_swarm_tree(op: str) -> bool:
@@ -2014,11 +2113,14 @@ def _component_matches(pat: str, name: str) -> bool:
         return False
 
 
-def _protected_paths(ap: str | None = None) -> list[str]:
+def _protected_paths(ap: str | None = None, also: str | None = None) -> list[str]:
     """The concrete directories the path rules protect, as seen from the operand.
     Ancestors are reached by TRIMMING these, so `../worktree*` still resolves to
-    "contains worktrees"."""
-    roots, wts, _det = _resolve(ap, scan_below=True)
+    "contains worktrees".
+
+    `also` is passed straight through to `_resolve`/`swarm_dirs` — one extra
+    anchor, one definition, no second copy of "where the run state lives"."""
+    roots, wts, _det = _resolve(ap, scan_below=True, also=also)
     out: list[str] = []
     for r in roots + wts:
         if r and r not in out:
@@ -2026,7 +2128,7 @@ def _protected_paths(ap: str | None = None) -> list[str]:
     # via swarm_dirs(), not a second join, so "where the run state lives" has
     # exactly one definition. It was two, and the copy here silently covered
     # for the other — which is how a rule ends up shipped and never exercised.
-    for sd in swarm_dirs(ap):
+    for sd in swarm_dirs(ap, also=also):
         if sd not in out:
             out.append(sd)
     return out
@@ -2125,7 +2227,31 @@ def var_tail_reason(op: str) -> str | None:
     operand states it verbatim. If the literal tail is the tail of a protected
     path, then every value of `$WT` that makes the command mean anything at all
     is a value that makes it destructive; the variable is not hiding the target,
-    only its prefix."""
+    only its prefix.
+
+    THE DIRECTORY THIS IS ANSWERED FROM was, uniquely in this file, the
+    command's own — every other path rule asks git about the OPERAND, and a
+    variable-rooted operand has no path to resolve from. Measured before the
+    `also=_SESSION_ROOT` probe below, same operand, one fixture, five cwds:
+
+        BLOCK  cwd=<repo>                 rm -rf "$WT/T-010"
+        BLOCK  cwd=<worktrees parent>     rm -rf "$WT/T-010"
+        BLOCK  cwd=<the worktree>         rm -rf "$WT/T-010"
+        ALLOW  cwd=<unrelated dir>        rm -rf "$WT/T-010"      <- the gap
+        ALLOW  cwd=<unrelated dir>/deep   rm -rf "$WT/T-010"
+
+    while the LITERAL absolute path naming the same worktree blocked from all
+    five. So the limit was never "outside a repository", which is what the old
+    docstring implied — the worktrees parent is outside every repository and
+    blocks fine. It was "outside anything that leads back to the run".
+
+    `_SESSION_ROOT` is what leads back: the hook is registered in one place,
+    `<repo>/.claude/settings.local.json`, so the process was launched in the
+    run's repo. Probing it here can only ADD the run's own trees — a non-`_CWD`
+    probe is gated by `_is_this_run`, and from an unrelated directory the
+    session family is empty, so only a tree carrying `.swarm-loop` survives the
+    gate. Wrong assumption -> nothing found -> the rule behaves as before, which
+    is why this is a fail-OPEN widening and not a new fail-closed rule."""
     comps = op.split("/")
     k = None
     for idx, c in enumerate(comps):
@@ -2137,7 +2263,7 @@ def var_tail_reason(op: str) -> str | None:
     if not tail or any("$" in c or GLOB_META_RE.search(c) for c in tail):
         return None
     ap = abs_path(op)
-    for cand in _protected_paths(ap):
+    for cand in _protected_paths(ap, also=_SESSION_ROOT):
         ccomps = [c for c in cand.split(os.sep) if c]
         if len(ccomps) < len(tail) or ccomps[-len(tail):] != tail:
             continue

@@ -1400,6 +1400,131 @@ PAYLOAD_CASES = [
     ("stash-in-dirty-run", BLOCK,
      {"tool_name": "Bash", "cwd": "{DIRTYRUN}",
       "tool_input": {"command": "git stash"}}),
+
+    # -- WHICH LEDGER the push rule asks about, when the family holds several.
+    #    `.swarm-loop` is tracked, so every worker worktree checks one out too.
+    #    The first version of the rule returned the first dirty tree in SORTED
+    #    order and read the run's branch off THAT tree, so an alphabetically
+    #    earlier worktree shadowed the primary and the dirty-`main` push went
+    #    through. Measured before the fix, both ledgers dirty, worktree named to
+    #    sort first: `git push origin main` from the primary -> rc=0.
+    #    These fixtures name the worktree `aa-…` and the primary `zz-…` so the
+    #    ordering is deliberately the wrong one.
+    ("shadow-push-main-both-dirty", BLOCK,
+     {"tool_name": "Bash", "cwd": "{SHADOW}",
+      "tool_input": {"command": "git push origin main"}}),
+    ("shadow-push-bare-both-dirty", BLOCK,
+     {"tool_name": "Bash", "cwd": "{SHADOW}",
+      "tool_input": {"command": "git push"}}),
+    ("shadow-push-main-from-wt", BLOCK,
+     {"tool_name": "Bash", "cwd": "{SHADOWWT}",
+      "tool_input": {"command": "git push origin main"}}),
+    ("shadow-push-task-from-wt", BLOCK,
+     {"tool_name": "Bash", "cwd": "{SHADOWWT}",
+      "tool_input": {"command": "git push"}}),
+    #    THE CELL THAT PROVES THE DISCRIMINATOR IS BRANCH IDENTITY, not sort
+    #    order: same shape, same sort order, only the WORKTREE's ledger dirty.
+    #    The dirty tree is still the one that sorts first — and the push of
+    #    `main` from the CLEAN primary is allowed, because `main` is not the
+    #    branch that tree holds. Flip the rule back to "first dirty tree wins"
+    #    and this cell and the four above cannot both be satisfied.
+    ("wtdirty-push-main-clean-primary", ALLOW,
+     {"tool_name": "Bash", "cwd": "{WTDIRTY}",
+      "tool_input": {"command": "git push origin main"}}),
+    ("wtdirty-push-main-from-wt", ALLOW,
+     {"tool_name": "Bash", "cwd": "{WTDIRTYWT}",
+      "tool_input": {"command": "git push origin main"}}),
+    ("wtdirty-push-bare-from-primary", ALLOW,
+     {"tool_name": "Bash", "cwd": "{WTDIRTY}",
+      "tool_input": {"command": "git push"}}),
+    #    ...and the worker's OWN push, whose branch IS the dirty tree's. Kept as
+    #    a block deliberately: nothing in the loop writes `.swarm-loop` from a
+    #    worktree, so a dirty ledger there is an anomaly — and the refusal says
+    #    THAT rather than talking to a worker about a phase it never runs.
+    ("wtdirty-push-task-from-wt", BLOCK,
+     {"tool_name": "Bash", "cwd": "{WTDIRTYWT}",
+      "tool_input": {"command": "git push"}}),
+    ("wtdirty-push-task-named-from-wt", BLOCK,
+     {"tool_name": "Bash", "cwd": "{WTDIRTYWT}",
+      "tool_input": {"command": "git push origin task/T-043"}}),
+    #    `--all` publishes every branch, so ANY dirty tree in the family is a
+    #    reason — including the worktree's, from the clean primary.
+    ("wtdirty-push-all-from-primary", BLOCK,
+     {"tool_name": "Bash", "cwd": "{WTDIRTY}",
+      "tool_input": {"command": "git push --all origin"}}),
+    #    A branch checked out in NO tree has no uncommitted anything by
+    #    definition, so it is not a reason even in the both-dirty repo.
+    ("shadow-push-unheld-branch", ALLOW,
+     {"tool_name": "Bash", "cwd": "{SHADOW}",
+      "tool_input": {"command": "git push origin some-other-branch"}}),
+
+    # -- THE VARIABLE-ROOTED RECURSIVE DELETE, all four directions pinned.
+    #    `rm -rf "$WT/T-010"` names a live worktree out loud in its literal
+    #    tail. Every OTHER path rule asks git about the operand and is
+    #    directory-independent; this one had nothing to resolve from, so it was
+    #    answered from the command's own directory. Measured, same operand, one
+    #    fixture, before the `_SESSION_ROOT` anchor:
+    #        BLOCK repo · BLOCK worktrees-parent · BLOCK the worktree
+    #        ALLOW an unrelated directory        <- the gap
+    #    while the LITERAL absolute path blocked from all four. So the limit was
+    #    never "outside a repository" — the worktrees parent is outside every
+    #    repository and blocked fine. It was "outside anything leading back to
+    #    the run". The literal controls are what make the variable cells mean
+    #    something; without them an ALLOW is satisfied by a guard that does
+    #    nothing.
+    ("var-tail-cwd-repo", BLOCK,
+     {"tool_name": "Bash", "cwd": "{REPO}",
+      "tool_input": {"command": 'rm -rf "$WT/T-010"'}}),
+    ("var-tail-cwd-worktrees-parent", BLOCK,
+     {"tool_name": "Bash", "cwd": "{OUTSIDE}",
+      "tool_input": {"command": 'rm -rf "$WT/T-010"'}}),
+    ("var-tail-cwd-the-worktree", BLOCK,
+     {"tool_name": "Bash", "cwd": "{WT}",
+      "tool_input": {"command": 'rm -rf "$WT/T-010"'}}),
+    ("var-tail-cwd-unrelated", BLOCK,
+     {"tool_name": "Bash", "cwd": "{ELSEWHERE}",
+      "tool_input": {"command": 'rm -rf "$WT/T-010"'}}),
+    ("var-tail-cwd-unrelated-deep", BLOCK,
+     {"tool_name": "Bash", "cwd": "{ELSEWHERE}/scratch",
+      "tool_input": {"command": 'rm -rf "$WT/T-010"'}}),
+    #    the LITERAL controls, same target, same four directories.
+    ("lit-tail-cwd-repo", BLOCK,
+     {"tool_name": "Bash", "cwd": "{REPO}",
+      "tool_input": {"command": 'rm -rf "{WT}"'}}),
+    ("lit-tail-cwd-worktrees-parent", BLOCK,
+     {"tool_name": "Bash", "cwd": "{OUTSIDE}",
+      "tool_input": {"command": 'rm -rf "{WT}"'}}),
+    ("lit-tail-cwd-the-worktree", BLOCK,
+     {"tool_name": "Bash", "cwd": "{WT}",
+      "tool_input": {"command": 'rm -rf "{WT}"'}}),
+    ("lit-tail-cwd-unrelated", BLOCK,
+     {"tool_name": "Bash", "cwd": "{ELSEWHERE}",
+      "tool_input": {"command": 'rm -rf "{WT}"'}}),
+    #    ...and the ALLOW half, which is what keeps the anchor from becoming
+    #    "any recursive delete with a variable in it". One property differs from
+    #    `var-tail-cwd-unrelated`: the literal tail names nothing the run owns.
+    #    Ordinary housekeeping, from the directory where the gap used to be.
+    ("var-tail-unowned-id", ALLOW,
+     {"tool_name": "Bash", "cwd": "{ELSEWHERE}",
+      "tool_input": {"command": 'rm -rf "$WT/T-999"'}}),
+    ("var-tail-build-dir", ALLOW,
+     {"tool_name": "Bash", "cwd": "{ELSEWHERE}",
+      "tool_input": {"command": 'rm -rf "$TMPDIR/build"'}}),
+    ("var-tail-node-modules", ALLOW,
+     {"tool_name": "Bash", "cwd": "{ELSEWHERE}",
+      "tool_input": {"command": 'rm -rf "$SCRATCH/node_modules"'}}),
+    ("var-tail-dist", ALLOW,
+     {"tool_name": "Bash", "cwd": "{ELSEWHERE}",
+      "tool_input": {"command": 'rm -rf "$OUT/dist"'}}),
+    #    lone unknown variable: `rm` refuses an empty operand, so this must stay
+    #    allowed however the anchor resolves.
+    ("var-tail-lone-var", ALLOW,
+     {"tool_name": "Bash", "cwd": "{ELSEWHERE}",
+      "tool_input": {"command": 'rm -rf "$VENV"'}}),
+    #    a NON-recursive rm cannot take a directory, so the rule must not fire.
+    ("var-tail-not-recursive", ALLOW,
+     {"tool_name": "Bash", "cwd": "{ELSEWHERE}",
+      "tool_input": {"command": 'rm -f "$WT/T-010"'}}),
 ]
 
 
@@ -1578,6 +1703,19 @@ def build_ledger_repos(root):
     repository named a branch called main". Both sit outside the primary
     fixture's repo and worktree list on purpose: a push rule keyed on repo
     state needs a repo whose state it alone decides.
+
+    WHY THEY LIVE UNDER `ledgers/nest/` AND NOT BESIDE THE OTHER FIXTURES —
+    measured, because the first placement broke four unrelated cells. These
+    repos bring LINKED WORKTREES with them, and `_linked_worktrees_under` stops
+    after MAX_CHILD_PROBES (4) hits within MAX_CHILD_DEPTH (2). Put directly
+    under `<root>` they sit at depth 1, so the BFS filled its budget on them
+    before it ever reached `<root>/worktrees/T-010` at depth 2 — and
+    `rm -rf ../*/T-010` / `rm -rf ../worktree*` from the worktrees parent went
+    from BLOCK to ALLOW with no change to the guard at all. Nesting them one
+    level deeper puts their worktrees at depth 3, outside that budget. The
+    guard behaviour this exposes is real and pre-existing (a scan budget of
+    four can be starved by siblings), but it is not what these fixtures are for
+    and a fixture must not silently weaken another rule's assertions.
     """
     def mkrepo(path):
         os.makedirs(path)
@@ -1599,7 +1737,9 @@ def build_ledger_repos(root):
             subprocess.run(["git", "-C", path] + cmd, env=git_env(root),
                            capture_output=True, text=True)
 
-    dirty = os.path.join(root, "dirty-run")
+    nest = os.path.join(root, "ledgers", "nest")
+    os.makedirs(nest)
+    dirty = os.path.join(nest, "dirty-run")
     mkrepo(dirty)
     os.makedirs(os.path.join(dirty, SWARM_DIR))
     for rel in ("state.json", "history.csv", "goals.json"):
@@ -1618,7 +1758,7 @@ def build_ledger_repos(root):
     # tree where a false block would actually cost something: the ledger it can
     # see is the primary tree's, and its own branch is not the run's `main`.
     subprocess.run(["git", "-C", dirty, "worktree", "add", "-q", "-b",
-                    "task/T-010", os.path.join(root, "dirty-wt"), "main"],
+                    "task/T-010", os.path.join(nest, "dirty-wt"), "main"],
                    env=git_env(root), capture_output=True, text=True)
 
     st = subprocess.run(["git", "status", "--porcelain", "--", SWARM_DIR],
@@ -1626,14 +1766,90 @@ def build_ledger_repos(root):
     if st.returncode != 0 or not st.stdout.strip():
         raise SystemExit("test setup failed: {DIRTYRUN} ledger is not dirty:\n%s%s"
                          % (st.stdout, st.stderr))
-    if not os.path.isdir(os.path.join(root, "dirty-wt")):
+    if not os.path.isdir(os.path.join(nest, "dirty-wt")):
         raise SystemExit("test setup failed: {DIRTYWT} worktree was not created")
 
-    noledger = os.path.join(root, "no-ledger")
+    noledger = os.path.join(nest, "no-ledger")
     mkrepo(noledger)
     commit(noledger)
     if os.path.exists(os.path.join(noledger, SWARM_DIR)):
         raise SystemExit("test setup failed: {NOLEDGER} has a .swarm-loop")
+
+    build_shadow_repos(root)
+
+
+def build_shadow_repos(root):
+    """Two repos whose WORKTREE PATH SORTS BEFORE THE PRIMARY'S.
+
+    `.swarm-loop` is tracked, so `git worktree add` checks one out into every
+    worker worktree too — which means the family can hold several ledgers and
+    something has to decide which one a push is about. The first version of the
+    rule decided by sorted iteration order, and an alphabetically-earlier
+    worktree then shadowed the primary and ALLOWED the dirty-`main` push the
+    rule exists to refuse. The names here (`aa-…` worktree, `zz-…` primary) make
+    that ordering the WRONG one on purpose: if the discriminator ever slides
+    back to iteration order, these go red.
+
+    Two repos because one cannot hold two ledger states:
+      {SHADOW}   both ledgers dirty  -> every push of either branch blocks
+      {WTDIRTY}  ONLY the worktree's -> the worker's own push blocks, and the
+                 push of `main` from the CLEAN primary is allowed, even though
+                 the dirty tree is the one sorted first. That ALLOW is the cell
+                 that proves the answer comes from branch identity.
+    """
+    def build(primary, wt, branch, dirty_primary, dirty_wt):
+        os.makedirs(primary)
+        for cmd in (["init", "-q"],
+                    ["symbolic-ref", "HEAD", "refs/heads/main"],
+                    ["config", "user.email", "t@example.invalid"],
+                    ["config", "user.name", "t"],
+                    ["config", "commit.gpgsign", "false"]):
+            p = subprocess.run(["git", "-C", primary] + cmd, env=git_env(root),
+                               capture_output=True, text=True)
+            if p.returncode != 0:
+                raise SystemExit("test setup failed: git %s in %s\n%s%s"
+                                 % (" ".join(cmd), primary, p.stdout, p.stderr))
+        os.makedirs(os.path.join(primary, SWARM_DIR))
+        for rel in ("state.json", "history.csv"):
+            with open(os.path.join(primary, SWARM_DIR, rel), "w") as f:
+                f.write("{}\n")
+        with open(os.path.join(primary, "src.py"), "w") as f:
+            f.write("x = 1\n")
+        for cmd in (["add", "-A"], ["commit", "-qm", "seed"],
+                    ["worktree", "add", "-q", "-b", branch, wt, "main"]):
+            subprocess.run(["git", "-C", primary] + cmd, env=git_env(root),
+                           capture_output=True, text=True)
+        # The worktree must carry its OWN checkout of the tracked ledger, or the
+        # shape this fixture exists for does not exist.
+        if not os.path.isdir(os.path.join(wt, SWARM_DIR)):
+            raise SystemExit("test setup failed: worktree %s has no %s — the "
+                             "ledger is not tracked" % (wt, SWARM_DIR))
+        if dirty_primary:
+            with open(os.path.join(primary, SWARM_DIR, "state.json"), "w") as f:
+                f.write('{"cycle": 7}\n')
+            os.makedirs(os.path.join(primary, SWARM_DIR, "analysis"))
+            with open(os.path.join(primary, SWARM_DIR, "analysis", "cycle-7.json"), "w") as f:
+                f.write("{}\n")
+        if dirty_wt:
+            with open(os.path.join(wt, SWARM_DIR, "state.json"), "w") as f:
+                f.write('{"worker": 1}\n')
+        for tree, want_dirty in ((primary, dirty_primary), (wt, dirty_wt)):
+            st = subprocess.run(["git", "status", "--porcelain", "--", SWARM_DIR],
+                                cwd=tree, env=git_env(root),
+                                capture_output=True, text=True)
+            if bool(st.stdout.strip()) != want_dirty:
+                raise SystemExit("test setup failed: %s ledger dirty=%r, wanted %r\n%s"
+                                 % (tree, bool(st.stdout.strip()), want_dirty, st.stdout))
+
+    nest = os.path.join(root, "ledgers", "nest")
+    build(os.path.join(nest, "zz-shadow"), os.path.join(nest, "aa-shadow-T-042"),
+          "task/T-042", dirty_primary=True, dirty_wt=True)
+    build(os.path.join(nest, "zz-wtdirty"), os.path.join(nest, "aa-wtdirty-T-042"),
+          "task/T-043", dirty_primary=False, dirty_wt=True)
+    if not (os.path.join(nest, "aa-shadow-T-042")
+            < os.path.join(nest, "zz-shadow")):
+        raise SystemExit("test setup failed: the worktree no longer sorts before "
+                         "the primary, so the ordering fixture proves nothing")
 
 
 def git_env(root):
@@ -2021,11 +2237,22 @@ def fill_paths(obj, repo, root):
                 can see is the primary tree's; its own branch is not the run's.
     {NOLEDGER}  the same repo, on `main`, with no `.swarm-loop` at all. The
                 control that says the block comes from the ledger.
+    {SHADOW}    a run repo on `main` with BOTH its own ledger and its worker
+                worktree's dirty — and the worktree path sorting FIRST.
+    {SHADOWWT}  that worktree, on `task/T-042`.
+    {WTDIRTY}   the same shape with only the WORKTREE's ledger dirty; the
+                primary is clean. The dirty tree still sorts first.
+    {WTDIRTYWT} that worktree, on `task/T-043`.
     """
     if isinstance(obj, str):
-        return (obj.replace("{DIRTYRUN}", os.path.join(root, "dirty-run"))
-                   .replace("{DIRTYWT}", os.path.join(root, "dirty-wt"))
-                   .replace("{NOLEDGER}", os.path.join(root, "no-ledger"))
+        nest = os.path.join(root, "ledgers", "nest")
+        return (obj.replace("{DIRTYRUN}", os.path.join(nest, "dirty-run"))
+                   .replace("{DIRTYWT}", os.path.join(nest, "dirty-wt"))
+                   .replace("{NOLEDGER}", os.path.join(nest, "no-ledger"))
+                   .replace("{SHADOWWT}", os.path.join(nest, "aa-shadow-T-042"))
+                   .replace("{SHADOW}", os.path.join(nest, "zz-shadow"))
+                   .replace("{WTDIRTYWT}", os.path.join(nest, "aa-wtdirty-T-042"))
+                   .replace("{WTDIRTY}", os.path.join(nest, "zz-wtdirty"))
                    .replace("{REPO}", repo)
                    .replace("{WT}", os.path.join(root, "worktrees", "T-010"))
                    .replace("{OUTSIDE}", os.path.join(root, "worktrees"))
