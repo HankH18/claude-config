@@ -206,16 +206,64 @@ failed, and what to do differently. Do not repeat the failed approach.>
   failure permanent instead of visible to the check above.
 - Never commit a provisioned directory (`node_modules/`, `.venv/`, `dist/`) or a
   lockfile — `git add -A` after provisioning is exactly how those land on a branch.
-- If the primary checkout has a `.codegraph/` index, use
-  `codegraph explore "<symbols or question>"` BEFORE grep/find or bulk
-  file-reading to understand the codebase — one query returns verbatim source,
-  call paths, and blast radius, including dynamic-dispatch hops grep misses.
-  Caveat: the index reflects the indexed primary tree (~1s lag behind its
-  writes), not your worktree's uncommitted edits — use it to understand the
-  base; read your own files directly when reviewing your own diff.
+- **Index-backed navigation is a PRIMARY-CHECKOUT capability. Inside your
+  worktree, navigate with `git grep` and direct reads.** A code index lives in a
+  gitignored directory, so it is not in your worktree — and the CLI does not say
+  so. It walks UP to the nearest index it can find and answers from whatever it
+  lands on. Measured on a live run: `.codegraph/` present in the primary
+  checkout, absent in **8 of 8** worktrees, and a query from a worktree resolved
+  to the index of the PARENT directory — 7,946 files across nine unrelated
+  projects, with `select count(*) from files where path like '<project>/%'`
+  returning **0**. Zero percent of any answer a worker got there could be about
+  the project it was building, and it came back confident and well-formed: the
+  same query returned 48 symbols across 3 correct files from the primary
+  checkout, and 25 symbols from a third-party library's internals from a
+  worktree. One lane noticed and fell back to direct reads; a lane that did not
+  would reason about another codebase believing it was reading its own.
+- **If you run an index CLI at all, verify that every path it returns is inside
+  your own tree before believing a word of it.** A result whose paths sit outside
+  your worktree is not a partial answer; it is an answer about other software.
+- **The general rule, because the next such tool will not be called CodeGraph:
+  any capability living in a gitignored directory is ABSENT inside a worktree,
+  and the ones that fail silently are the expensive ones.** A tool that errors is
+  cheap. A tool that answers confidently about the wrong code is the same failure
+  the wiring check below exists to catch, one level up.
 - Re-run your named acceptance tests and the project's fast checks
   (<lint/typecheck/unit command>) before finishing; do not report done with
   them failing unless you explain precisely why.
+- **Before you report `complete`, run the wiring check on every symbol you
+  added.** From your worktree root:
+    python3 <skill>/scripts/swarmloop.py reachable \
+        --symbol <name> [--symbol <name>...] --from <the real entry point>
+  It prints, per symbol, where it is DEFINED, every call site split product vs
+  test, whether it is EXPORTED (`__all__`, package `__init__`), and whether any
+  path reaches it from the entry point you name — and exits non-zero when a
+  symbol is defined and nothing reaches it. **A definition with zero call sites
+  is unfinished work wearing a green suite**: a suite cannot fail over code
+  nothing runs, which is why your own green does not settle this. `TESTS ONLY`
+  is the same defect with a passing test on top. Ten seconds, and it is the one
+  part of your report that is not self-assessed, so run it however confident the
+  rest of the report reads. What it cannot see it prints WITH the answer —
+  getattr, registries, decorator tables, non-Python callers — so a clean report
+  is evidence and not proof, and a hit you believe is a false alarm goes in
+  DECISIONS naming the call site it could not follow.
+  **Read the verdicts, not just the exit code.** `DECORATOR-REGISTERED` means the
+  definition carries a decorator and nothing else references it: that is how a
+  route, a CLI command, an event handler, a plugin or a fixture is wired in
+  Python, so it does not fail the run — and it is not an all-clear either, because
+  the tool did not follow the decorator into the table on the other side. Confirm
+  by eye that the table IS imported and mounted, and say so in DECISIONS. Exit 3
+  is the tool refusing your arguments, never a finding about your code.
+- **A repair or provisioning step must ASSERT ITS EFFECT.** Do the thing, then
+  OBSERVE the state you claimed to create; never trust the exit code of the
+  command that was supposed to create it. The shape that cost real time: a
+  namespace repair written as a loop over ONE file and terminated `... || true`.
+  It could not report failure, so nine probes came back "clean" and were read as
+  evidence about the trigger when they were evidence about the method. Two
+  mechanical rules follow. **Never write `|| true` on a step whose success you
+  are going to report**, and make the step's last line a READ of the thing —
+  the file is present, the row is there, the symbol resolves, the count is N —
+  that exits non-zero when it is not. A step that cannot fail has not passed.
 - Commit in coherent increments with clear messages. Uncommitted work is lost.
 
 ## Report format (return exactly this structure)
@@ -282,7 +330,8 @@ CONCERNS: <anything smelling wrong, including tests you believe are incorrect.
 - **Every SHARED-DOC-OBSERVATION gets a `main`-side check before it becomes an action.** A long-running worker's copy of every orchestrator-owned document is pinned at its branch point while you keep correcting those documents mid-wave, so its findings are *time-shifted*, not wrong. Observed: both `T-010` and `T-011` reported that `public-surface.md` still said "the five trust dimensions" **after** an amendment had made it six and `main` already read six. Cheap per item, but it is a per-finding tax and a false alarm is one careless step from a re-fix of something already fixed — or from telling the next wave something false. Read the line on `main` first; then either answer the worker in its retry packet or fix `main` once. The separate report field exists so the whole class triages in one pass instead of one finding at a time.
 - **Inject learnings selectively.** Only entries relevant to the task's area; a packet stuffed with every lesson ever learned buries the two that matter.
 - **State the CURRENT baseline, never a remembered one.** Every packet carries the suite's pass count as measured at dispatch time, plus the line "other agents are in flight; prove any failure is yours by reverting YOUR file and re-running." A remembered number goes stale within minutes of other branches landing, and the worker then burns effort explaining a discrepancy that is just drift — the revert-and-rerun check is the one that matters anyway.
-- **Consolidation/dedup packets are non-additive — state done as "the old pattern no longer exists."** Write the done-condition as e.g. "grep shows zero inline occurrences in these files" or "every new accessor has ≥1 caller outside its module", never "the new abstraction exists". Additive-only does NOT apply to these tasks and the packet must say so explicitly — the payoff of a consolidation IS editing the call sites, and a worker given the additive-only default once shipped six accessors with zero callers, leaving more duplication than before with every metric green. At collection, grep for callers of anything the refactor added; an addition with zero callers means the wiring half was skipped.
+- **Consolidation/dedup packets are non-additive — state done as "the old pattern no longer exists."** Write the done-condition as e.g. "grep shows zero inline occurrences in these files" or "every new accessor has ≥1 caller outside its module", never "the new abstraction exists". Additive-only does NOT apply to these tasks and the packet must say so explicitly — the payoff of a consolidation IS editing the call sites, and a worker given the additive-only default once shipped six accessors with zero callers, leaving more duplication than before with every metric green. At collection, run `swarmloop.py reachable --symbol <each accessor the refactor added>` — an addition with zero callers means the wiring half was skipped, and here the done-condition is the call sites themselves.
+- **Run the wiring check on every PRESERVED commit, whatever its message claims — in EITHER direction.** `python3 <skill>/scripts/swarmloop.py reachable --symbol <what the commit says it added> --from <the real entry point>`, and read the exit code. Measured, on two commits recovered from a killed agent: commit A added a function with **zero call sites**, absent from both `__all__` lists, carrying docstrings that asserted a behaviour existing nowhere — 0% effective, and the suite was GREEN over a fully live HIGH-severity defect. Commit B's function was wired at two independent points on the real path and its claim was exactly accurate. The commit messages did not distinguish them; ten seconds of call-site grep did. The first generalisation drawn from this — that self-assessed progress runs generous — came from n=1 and was falsified by commit B in the opposite direction, so **do not weight the check by how the report reads**: the discriminator was never the prose, which is precisely why it is now a command instead of a habit. Read `NO CALL SITES` as *unfinished*, never as dead code to delete; `TESTS ONLY` as the same defect wearing a green suite; `UNREACHED` as a question to answer rather than a verdict, since the name-keyed call graph is the weakest layer it has. `DECORATOR-REGISTERED` is the one verdict that does NOT fail the run: the definition carries a decorator and nothing else references it, which is how routes, CLI commands, event handlers, plugins and fixtures are wired — measured against a live FastAPI project, that verdict covers 20 of the 31 symbols the tool previously called `NO CALL SITES`, i.e. the application's entire HTTP surface. It is still not an all-clear: the tool did not follow the decorator into the table on the other side, so confirm that table is itself imported and mounted. Every blind spot — getattr, registries, decorator tables, Python source embedded in a string, non-Python callers — prints with the answer, so a clean report is evidence and never proof of wiring. Exit 3 means the tool refused its arguments; it is never a finding about the commit.
 - **Hung agents.** If a subagent has produced nothing for an unreasonable time relative to its task size, mark the ticket failed-hung, let the rest of the batch integrate without it, and re-mint it with a smaller decomposition. A salvage or second attempt dispatches like any other ticket but earns deep verification (see the depth table below). Never merge a branch from an agent that didn't return a report.
 
 ## Wave-verifier packet variant (rung 2 of the verification ladder)
@@ -333,10 +382,13 @@ is what makes `..` the correct operator here; it has been verified twice, do not
   confirm it sits inside the tree under test. A green resolved out of the primary
   checkout's `node_modules` or `.venv` is evidence about the wrong code, and rung 1
   is structurally blind to it: `check-branch` inspects a diff, not a resolution path.
-- Find callers of everything the batch added — CodeGraph when a `.codegraph/`
-  index exists, grep otherwise. An addition with zero production callers outside
-  itself and its tests means the wiring half was skipped at least as often as it
-  means dead code.
+- Find callers of everything the batch added — `swarmloop.py reachable --symbol
+  <name> --from <entry point>` for the mechanical answer (defined / called /
+  exported / reachable, exit 1 when a symbol is defined and nothing reaches it),
+  CodeGraph or grep to chase what it says it could not follow. An addition with
+  zero production callers outside itself and its tests means the wiring half was
+  skipped at least as often as it means dead code — and `TESTS ONLY` is that same
+  finding with a green suite sitting on top of it.
 - Audit every doer claim against the diff: a CHANGED list that omits a changed
   file, an ACCEPTANCE claim the suite contradicts, a DECISIONS entry the code does
   not reflect — each one is a finding.

@@ -24,6 +24,7 @@ Subcommands:
   reads       Read edges the graph does not declare (gates freeze)
   findings    Record checker findings durably, then mint tickets from them
   red-check   Prove each ticket's verify command FAILS before it is built
+  reachable   Wiring check: is a symbol defined, called, exported, reachable
   dispatch    Record a dispatched agent / close one (append-only)
   retire      Reclaim worktrees whose work LANDED on main (plain remove, never --force)
   resume      Reconstruct an interrupted run from artifacts alone
@@ -8016,6 +8017,789 @@ def cmd_distil(args):
             print("  swarmloop.py, and curates what remains, before further runs.")
 
 
+# ------------------------------------------------- wiring check (reachable)
+#
+# The incident: two commits recovered from a killed agent, both claiming
+# progress in prose. Commit A added a function with ZERO call sites, absent from
+# both __all__ lists, carrying docstrings that asserted a behaviour existing
+# nowhere — 0% effective, and the suite was GREEN over a fully live
+# HIGH-severity defect. Commit B's function was wired at two independent points
+# on the real path and its claim held exactly. The commit messages did not
+# distinguish them; ten seconds of call-site grep did.
+#
+# So the check runs on every preserved commit REGARDLESS of what the message
+# claims, IN EITHER DIRECTION. An earlier reading of the same incident — that
+# self-assessed progress is biased generous — was drawn from n=1 and falsified
+# by commit B in the opposite direction. The discriminator was never the prose,
+# which is exactly why this can be a command instead of a habit.
+#
+# The question, verbatim: is the new function reachable from the real entry
+# point, exported, and on the path the user's command actually takes?
+#
+# Where it errs it errs toward the FALSE ALARM. getattr, a registry, a decorator
+# table or a template can hide a real call site; calling such a symbol unwired
+# costs a human ten seconds, calling an unwired one wired costs what the
+# incident cost. Every blind spot is printed WITH the verdicts (_reach_limits)
+# rather than left for the reader to already know about — a clean report from
+# this command is not proof of wiring and must never be quoted as one.
+#
+# There is a THIRD error, and the first version of this command committed it: a
+# confident verdict about a hop it never took. Measured read-only against a live
+# FastAPI project, 24.5% of public top-level functions came back not-wired, and
+# 20 of the 31 "NO CALL SITES" — 'defined, and NOTHING references it' — were
+# route handlers registered by @router.get/@router.post, i.e. the most-wired code
+# in the repo. Overclaiming the completeness of its own analysis is the same
+# defect this command was built to catch, committed by the command itself; at
+# that rate a reader stops believing the one verdict it exists to produce. So a
+# registering decorator on the definition now gets its own verdict, its own line
+# naming the decorator and where it sits, and a diagnosis that says the table on
+# the other side was NOT followed. Named cause beats small number.
+
+REACH_SKIP_DIRS = frozenset((
+    ".git", "__pycache__", "node_modules", ".venv", "venv", ".tox", ".nox",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", "site-packages",
+    "build", "dist", ".eggs",
+))
+
+# How many definitions / call sites / hints are enumerated before the list is
+# elided. The COUNT on the header line is always exact; only the listing caps.
+REACH_LIST_CAP = 8
+
+# Decorators that WRAP a definition in place and register it with nothing. A
+# symbol carrying only these and no callers is still the incident's shape, so it
+# keeps NO CALL SITES. Everything else — @router.post, @app.task, @click.command,
+# @pytest.fixture, @foo.register, and every decorator this list has never heard
+# of — is treated as a POSSIBLE registration, because decorator registration is
+# not an edge case in Python: it is how routes, CLI commands, event handlers,
+# plugins and fixtures are wired. Matching is on the WHOLE dotted label, never
+# the last component, so `@app.cache` is not mistaken for `@functools.cache`.
+REACH_INERT_DECORATORS = frozenset((
+    "staticmethod", "classmethod", "property", "cached_property",
+    "functools.cached_property",
+    "abstractmethod", "abstractproperty", "abc.abstractmethod",
+    "abc.abstractproperty", "abc.abstractclassmethod", "abc.abstractstaticmethod",
+    "wraps", "functools.wraps",
+    "lru_cache", "functools.lru_cache", "cache", "functools.cache",
+    "total_ordering", "functools.total_ordering",
+    "contextmanager", "contextlib.contextmanager",
+    "asynccontextmanager", "contextlib.asynccontextmanager",
+    "overload", "typing.overload", "final", "typing.final",
+    "no_type_check", "typing.no_type_check",
+    "runtime_checkable", "typing.runtime_checkable",
+    "dataclass", "dataclasses.dataclass",
+))
+
+# What a decorator this scanner cannot render down to a dotted name is called in
+# the report. It counts as a POSSIBLE registration for the same reason: an
+# expression we could not read is not an expression we know to be inert.
+REACH_DEC_OPAQUE = "@<expression>"
+
+# Identifier scan used to find a wanted name INSIDE a longer string literal.
+REACH_WORD_RX = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _reach_body(node):
+    """A module/class/function body with its DOCSTRING dropped.
+
+    A docstring is documentation, not code, and this scanner reads string
+    literals looking for hidden call sites. Without this, every `Public
+    surface::` block that shows `accept_offer(auction=...)` as a usage example
+    raises a hint that a call site might be hiding in it — measured, that was two
+    thirds of the hints on a live repo, which is how a hint stops being read."""
+    body = node.body
+    if (body and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)):
+        return body[1:]
+    return body
+
+
+def _reach_dec_label(node):
+    """A decorator expression -> '@router.post', or REACH_DEC_OPAQUE.
+
+    Rendered by its CALLEE only: `@router.post("/x", status_code=201)` reads
+    `@router.post`, because which table it registers into is the question and
+    the arguments are not."""
+    n = node.func if isinstance(node, ast.Call) else node
+    parts = []
+    while isinstance(n, ast.Attribute):
+        parts.append(n.attr)
+        n = n.value
+    if not isinstance(n, ast.Name):
+        return REACH_DEC_OPAQUE
+    parts.append(n.id)
+    return "@" + ".".join(reversed(parts))
+
+
+def _reach_is_test(relf):
+    """True for a file whose greens are about the test, not about the product.
+
+    A symbol every one of whose callers is a test is the sibling of the
+    zero-caller case and reads identically in a suite: it IS exercised, so
+    something goes green over it, and nothing the user runs ever reaches it."""
+    parts = relf.replace(os.sep, "/").split("/")
+    base = parts[-1]
+    if base == "conftest.py" or base.startswith("test_") or base.endswith("_test.py"):
+        return True
+    if parts[:2] == [STATE_DIR, "acceptance"]:
+        return True
+    return any(p in ("tests", "test", "testing", "__tests__", "spec", "specs")
+               for p in parts[:-1])
+
+
+def _reach_files(root, paths):
+    """(files, unresolved specs) — the .py files to parse, sorted and deduped.
+
+    A directory named in --path is scanned even when REACH_SKIP_DIRS would have
+    skipped it during a walk: the skip list exists to keep a vendored copy of
+    the world out of an unqualified repo-root scan, not to refuse an explicit
+    instruction to look somewhere.
+
+    A spec that names nothing this scan can read comes back UNRESOLVED rather
+    than being dropped. Silently ignoring it produced a confident NO CALL SITES
+    on genuinely wired code whenever some OTHER --path happened to find files,
+    while the header line went on asserting the typo'd path had been scanned."""
+    out, unresolved = [], []
+    for spec in paths:
+        base = spec if os.path.isabs(spec) else os.path.join(root, spec)
+        base = os.path.normpath(base)
+        if os.path.isfile(base):
+            if base.endswith(".py"):
+                out.append(base)
+            else:
+                unresolved.append(spec)
+            continue
+        if not os.path.isdir(base):
+            unresolved.append(spec)
+            continue
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = sorted(x for x in dirnames if x not in REACH_SKIP_DIRS)
+            for fn in sorted(filenames):
+                if fn.endswith(".py"):
+                    out.append(os.path.join(dirpath, fn))
+    return sorted(set(out)), unresolved
+
+
+def _reach_scan(root, paths, wanted):
+    """One ast pass over the tree -> the tables the wiring check reads.
+
+    Same machinery and same failure policy as the read-edge scanner: a file that
+    does not parse is RECORDED and skipped, never fatal. Unlike that scanner an
+    unparsed file here is a hole in the ANSWER — its call sites are invisible —
+    so it is printed next to the verdicts and not only in --json."""
+    res = {
+        "files": 0, "unparsed": [], "unresolved_paths": [],
+        "defs": {}, "refs": {}, "imports": {}, "exports": {}, "strings": {},
+        "edges": {}, "children": {}, "modules": {},
+    }
+    files, res["unresolved_paths"] = _reach_files(root, paths)
+    res["files"] = len(files)
+    wanted = set(wanted)
+
+    # PRE-PASS: `from m import foo as _foo` binds a wanted symbol under a name
+    # this scan would otherwise never look for, so `_foo()` counted as nothing.
+    # That failed in the FALSE-ALARM direction and it fired for real: measured on
+    # a live repo, one symbol's ONLY consumption path was that idiom — called
+    # from four packages' __init__ as `_bind_submodules` — and it reported NO
+    # CALL SITES, the verdict whose text is 'defined, and NOTHING references it'.
+    # The map is per-FILE, because an alias binds only in the module that spells
+    # it; a repo-wide map would let one file's rename over-count another's.
+    alias_by_file = {}
+    for path in files:
+        try:
+            with open(path) as f:
+                src = f.read()
+        except OSError:
+            continue
+        # An ImportFrom carrying an asname must contain both words. The guard is
+        # here so the second parse below is paid only by files that could
+        # possibly matter, not by every file in the tree.
+        if " as " not in src or "import" not in src:
+            continue
+        try:
+            tree = ast.parse(src)
+        except (SyntaxError, ValueError):
+            continue          # the main pass records it as unparsed
+        m = {}
+        for n in ast.walk(tree):
+            if isinstance(n, ast.ImportFrom):
+                for al in n.names:
+                    if al.asname and al.asname != al.name and al.name in wanted:
+                        m[al.asname] = al.name
+        if m:
+            alias_by_file[os.path.relpath(path, root)] = m
+
+    for path in files:
+        relf = os.path.relpath(path, root)
+        try:
+            with open(path) as f:
+                tree = ast.parse(f.read(), filename=relf)
+        except (OSError, SyntaxError, ValueError) as e:
+            res["unparsed"].append((relf, str(e)[:120]))
+            continue
+        # A dotted label, not an importable module path: --path may point
+        # outside the repo, and the `..` segments of that relpath would otherwise
+        # render every holder as `............opt.lib.foo`.
+        mod = ".".join(p for p in relf[:-3].replace(os.sep, "/").split("/")
+                       if p not in ("", ".", ".."))
+        is_test = _reach_is_test(relf)
+        is_init = os.path.basename(relf) == "__init__.py"
+        res["modules"][mod] = relf
+
+        def add_def(name, qual, lineno, kind, parent, decs=(), _f=relf, _t=is_test):
+            res["defs"].setdefault(name, []).append(
+                {"file": _f, "line": lineno, "kind": kind, "qual": qual, "test": _t,
+                 "decorators": list(decs),
+                 "registering": any(d["label"] == REACH_DEC_OPAQUE
+                                    or d["label"][1:] not in REACH_INERT_DECORATORS
+                                    for d in decs)})
+            res["children"].setdefault(parent, []).append((qual, kind))
+
+        aliases = alias_by_file.get(relf, {})
+
+        def add_ref(name, how, lineno, holder, _f=relf, _t=is_test, _al=aliases):
+            res["edges"].setdefault(holder, set()).add(name)
+            real = _al.get(name)
+            if real is not None:
+                # The closure has to follow the alias too, or a symbol reached
+                # only under its local name reads UNREACHED for the same reason
+                # it used to read NO CALL SITES.
+                res["edges"][holder].add(real)
+            key = real if real is not None else name
+            if key in wanted:
+                res["refs"].setdefault(key, []).append(
+                    {"file": _f, "line": lineno, "how": how, "holder": holder,
+                     "test": _t, "alias": (name if real is not None else None)})
+
+        def add_export(name, lineno, via, _f=relf):
+            res["exports"].setdefault(name, []).append(
+                {"file": _f, "line": lineno, "via": via})
+
+        def add_import(n, _f=relf, _t=is_test, _i=is_init):
+            # Only `from M import S` binds a SYMBOL. `import M` binds a module,
+            # and the S in `M.S` arrives below as an attribute reference — so
+            # recording it here too would double-count one site.
+            base = ("." * (n.level or 0)) + (n.module or "")
+            for al in n.names:
+                if al.name == "*":
+                    continue
+                res["imports"].setdefault(al.name, []).append(
+                    {"file": _f, "line": n.lineno, "module": base,
+                     "as": al.asname or al.name, "test": _t})
+                if _i:
+                    # A package __init__ re-export is a public surface even with
+                    # no __all__: `from pkg import S` resolves through it.
+                    add_export(al.name, n.lineno, "package __init__")
+
+        def visit(n, holder, _mod=mod):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                kind = "class" if isinstance(n, ast.ClassDef) else "function"
+                qual = "%s.%s" % (holder, n.name)
+                # The decorators ON the definition are recorded WITH it. The
+                # scanner used to visit this list and then throw it away, so a
+                # decorator-registered function — the whole HTTP surface of a
+                # FastAPI app — got the most confident failure verdict this
+                # command has with no hint that the wiring was sitting on the
+                # line above its own def.
+                add_def(n.name, qual, n.lineno, kind, holder,
+                        [{"label": _reach_dec_label(d), "file": relf, "line": d.lineno}
+                         for d in n.decorator_list])
+                # A decorator expression also evaluates in the ENCLOSING scope,
+                # so `@registry.register` is a reference held by that scope — and
+                # it is one of the ways a registry hides the only call site a
+                # symbol has.
+                for dec in n.decorator_list:
+                    visit(dec, holder)
+                if isinstance(n, ast.ClassDef):
+                    for b in list(n.bases) + [k.value for k in n.keywords]:
+                        visit(b, holder)
+                else:
+                    for dflt in (list(n.args.defaults)
+                                 + [x for x in n.args.kw_defaults if x is not None]):
+                        visit(dflt, holder)
+                    if n.returns is not None:
+                        visit(n.returns, holder)
+                for s in _reach_body(n):
+                    visit(s, qual)
+                return
+            if isinstance(n, ast.ImportFrom):
+                add_import(n)
+                return
+            # `import M` had an early return of its own here. It was provably a
+            # no-op — an alias node exposes no visitable children, so the generic
+            # descent below does nothing either — and a branch that cannot be
+            # made to fail is a claim this suite cannot defend. The rule it was
+            # standing in for is real and IS defended, in add_import above and by
+            # the attribute case below.
+            if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and holder == _mod:
+                tgts = (list(n.targets) if isinstance(n, ast.Assign) else [n.target])
+                names = [t.id for t in tgts if isinstance(t, ast.Name)]
+                value = getattr(n, "value", None)
+                if "__all__" in names and value is not None:
+                    if isinstance(value, (ast.List, ast.Tuple, ast.Set)):
+                        for el in value.elts:
+                            if isinstance(el, ast.Constant) and isinstance(el.value, str):
+                                add_export(el.value, n.lineno, "__all__")
+                    # The names inside __all__ are the export record, not string
+                    # literals a getattr might resolve: visiting the value here
+                    # would report every exported symbol as a dynamic hint.
+                    return
+                for nm in names:
+                    add_def(nm, "%s.%s" % (_mod, nm), n.lineno, "assignment", _mod)
+                if value is not None:
+                    visit(value, holder)
+                for t in tgts:
+                    if not isinstance(t, ast.Name):
+                        visit(t, holder)
+                if isinstance(n, ast.AnnAssign) and n.annotation is not None:
+                    visit(n.annotation, holder)
+                return
+            if isinstance(n, ast.Name):
+                if isinstance(n.ctx, ast.Load):
+                    add_ref(n.id, "name", n.lineno, holder)
+                return
+            if isinstance(n, ast.Attribute):
+                if isinstance(n.ctx, ast.Load):
+                    add_ref(n.attr, "attr", n.lineno, holder)
+                visit(n.value, holder)
+                return
+            if isinstance(n, ast.Constant) and isinstance(n.value, str):
+                if n.value in wanted:
+                    res["strings"].setdefault(n.value, []).append(
+                        {"file": relf, "line": n.lineno, "test": is_test,
+                         "inside": False})
+                else:
+                    # The limits block promised "where the bare name appears as a
+                    # STRING LITERAL it is listed above as a dynamic hint", and
+                    # the implementation only ever matched a string whose WHOLE
+                    # value was the name. So it missed the case it most needed:
+                    # Python source embedded in a string. Measured — a symbol
+                    # whose only reference in 343 files was `webhooks.
+                    # webhook_sink()` inside a textwrap.dedent subprocess probe
+                    # got ZERO hints under 'defined, and NOTHING references it'.
+                    # Only CALL-SHAPED occurrences count (`name(` or `.name`), so
+                    # a docstring that merely says the name stays quiet.
+                    for m in REACH_WORD_RX.finditer(n.value):
+                        w = m.group(0)
+                        if w not in wanted:
+                            continue
+                        head = n.value[m.start() - 1] if m.start() else ""
+                        tail = n.value[m.end():m.end() + 1]
+                        if tail != "(" and head != ".":
+                            continue
+                        res["strings"].setdefault(w, []).append(
+                            {"file": relf, "line": n.lineno, "test": is_test,
+                             "inside": True})
+                return
+            for c in ast.iter_child_nodes(n):
+                visit(c, holder)
+
+        for stmt in _reach_body(tree):
+            visit(stmt, mod)
+
+    return res
+
+
+def _reach_entries(res, entries, root):
+    """--from specs -> (seed scope qualnames, unresolved specs).
+
+    Three spellings, tried in this order: a file path or dotted module (its
+    MODULE scope, i.e. what import time executes), `module-or-path:symbol`, and
+    a bare symbol name (every definition of it). A spec that resolves to nothing
+    comes back unresolved and is reported loudly — an UNREACHED verdict computed
+    from an empty seed set is a statement about nothing at all."""
+    quals = {}
+    for name, ds in res["defs"].items():
+        quals[name] = [d["qual"] for d in ds]
+    by_relf = dict((v, k) for k, v in res["modules"].items())
+
+    def as_module(spec):
+        spec = spec.strip()
+        if spec in res["modules"]:
+            return spec
+        cand = os.path.normpath(spec)
+        if cand in by_relf:
+            return by_relf[cand]
+        if os.path.isabs(cand):
+            rel = os.path.relpath(cand, root)
+            if rel in by_relf:
+                return by_relf[rel]
+        return None
+
+    seeds, unresolved = set(), []
+    for spec in entries:
+        mod = as_module(spec)
+        if mod is not None:
+            seeds.add(mod)
+            continue
+        if ":" in spec:
+            left, _, sym = spec.rpartition(":")
+            lmod = as_module(left)
+            hit = [q for q in quals.get(sym, [])
+                   if lmod is not None and (q == "%s.%s" % (lmod, sym)
+                                            or q.startswith(lmod + "."))]
+            if hit:
+                seeds.update(hit)
+                continue
+            unresolved.append(spec)
+            continue
+        if quals.get(spec):
+            seeds.update(quals[spec])
+            continue
+        unresolved.append(spec)
+    return sorted(seeds), unresolved
+
+
+def _reach_bfs(res, seeds):
+    """Name-keyed forward closure from the seeded scopes.
+
+    Edges are NAME-keyed, not import-resolved: two same-named functions in
+    different modules are one node here. That over-approximates reachability —
+    the false-OK direction — which is why every symbol carrying more than one
+    definition is flagged AMBIGUOUS in the report rather than quietly graded.
+    Reaching a scope also reaches the CLASS bodies inside it, because a class
+    body executes when its enclosing scope does; a nested FUNCTION is not
+    entered that way, since reaching it requires a reference to its name."""
+    quals = {}
+    for name, ds in res["defs"].items():
+        quals[name] = [d["qual"] for d in ds]
+    reached = set()
+    pending = []
+
+    def enter(q):
+        if q in reached:
+            return
+        reached.add(q)
+        pending.append(q)
+        for child, kind in res["children"].get(q, ()):
+            if kind == "class":
+                enter(child)
+
+    for q in seeds:
+        enter(q)
+    while pending:
+        cur = pending.pop()
+        for name in res["edges"].get(cur, ()):
+            for tq in quals.get(name, ()):
+                enter(tq)
+    return reached
+
+
+def _reach_verdict(res, sym, reached, have_entries):
+    """One symbol's layers, and the verdict they add up to."""
+    defs = res["defs"].get(sym, [])
+    own = [d["qual"] for d in defs]
+
+    def is_own(holder):
+        return any(holder == q or holder.startswith(q + ".") for q in own)
+
+    # A reference from inside the symbol's own body wires nothing: recursion is
+    # not a caller, and neither is a helper nested inside it.
+    refs = [r for r in res["refs"].get(sym, []) if not is_own(r["holder"])]
+    prod = [r for r in refs if not r["test"]]
+    tests = [r for r in refs if r["test"]]
+    reached_here = bool(own) and any(q in reached for q in own)
+    decs = []
+    for d in defs:
+        decs += d.get("decorators", [])
+    registering = any(d.get("registering") for d in defs)
+
+    if not defs:
+        verdict = "UNDEFINED"
+    elif not prod and registering:
+        # A registering decorator IS a reference to this definition, made by the
+        # enclosing module at import time — it is simply one this scanner cannot
+        # follow into the table on the other side. Reporting it as NO CALL SITES
+        # ('defined, and NOTHING references it') was the tool committing the
+        # exact overclaim it exists to catch: on the repo this was measured
+        # against, that verdict landed on the application's entire HTTP surface.
+        verdict = "DECORATOR-REGISTERED"
+    elif not refs:
+        verdict = "NO CALL SITES"
+    elif not prod:
+        verdict = "TESTS ONLY"
+    elif have_entries and not reached_here:
+        verdict = "UNREACHED"
+    else:
+        verdict = "WIRED"
+    return {
+        "symbol": sym, "verdict": verdict, "definitions": defs,
+        "call_sites": refs, "product_call_sites": len(prod),
+        "test_call_sites": len(tests), "exported": res["exports"].get(sym, []),
+        "imported_by": res["imports"].get(sym, []),
+        "dynamic_hints": res["strings"].get(sym, []),
+        "decorators": decs, "registering_decorator": registering,
+        "ambiguous": len(defs) > 1,
+        "reached_from_entry": (reached_here if have_entries else None),
+    }
+
+
+REACH_DIAGNOSIS = {
+    "UNDEFINED":
+        "no definition of this name exists in what was scanned. Either the commit does "
+        "not contain what its message claims, or the scan missed it — widen --path "
+        "before concluding.",
+    "NO CALL SITES":
+        "defined, and NOTHING references it. This is the recovered commit's exact shape: "
+        "a function, a docstring asserting a behaviour, and no wiring. A suite stays "
+        "GREEN over it.",
+    "DECORATOR-REGISTERED":
+        "no PRODUCT code references it by name, but its definition carries a decorator "
+        "that can register it — a route table, a CLI group, an event handler, a plugin, "
+        "a fixture. That is how such code is wired in Python, so this is NOT the "
+        "recovered commit's shape. It is NOT an all-clear either: this scanner does not "
+        "follow a decorator into whatever holds it, so confirm BY EYE that the table it "
+        "registers into is itself imported and reached.",
+    "TESTS ONLY":
+        "every caller is a test. Something goes green over this symbol and nothing the "
+        "user runs reaches it — the zero-caller defect wearing a passing suite.",
+    "UNREACHED":
+        "it has product callers, but no call path from any --from entry point reaches "
+        "it. Either those callers are themselves unreached, or the only path runs "
+        "through a hop this scanner cannot follow (see the limits below).",
+    "WIRED":
+        "defined, called from product code, and reachable from an entry point where one "
+        "was named.",
+}
+
+
+def _reach_limits(have_entries):
+    """[lines] — printed with EVERY report, an all-WIRED one included.
+
+    A blind spot the reader has to already know about is not a stated limit, and
+    this command is only worth having if its OK can be trusted. So the list of
+    what it cannot see ships attached to the answer."""
+    lines = [
+        "  WHAT THIS CANNOT SEE — a clean report is not proof of wiring:",
+        "    * Python only. A call from JS/TS, a template, YAML, a shell script or a",
+        "      packaging entry_points table is invisible to an ast pass over .py files.",
+        "    * getattr(), a registry dict, a decorator table or a plugin loader hides a",
+        "      real call site. Where the bare name appears as a STRING LITERAL it is",
+        "      listed above as a dynamic hint and the verdict is NOT upgraded on it: that",
+        "      errs toward the false ALARM (ten seconds of a human's time) over the false",
+        "      OK (what the incident cost).",
+        "    * Python source that lives inside a STRING is text, not code, to an ast",
+        "      pass — a subprocess probe built with textwrap.dedent, an exec(), a",
+        "      generated module. Measured: one symbol on the live repo this was tuned",
+        "      against is called ONLY from such a probe. A CALL-SHAPED occurrence",
+        "      (`name(` or `.name`) is reported above as an `embedded` hint and the",
+        "      verdict is not upgraded on it; a name merely MENTIONED in prose is not",
+        "      reported at all, so the absence of that line proves nothing.",
+        "    * references are matched by the identifier AT THE REFERENCE SITE. A",
+        "      `from m import foo as _foo` rename IS followed (the alias is resolved",
+        "      per file and the caller is shown `[as _foo]`), but a name rebound any",
+        "      other way — `g = foo` then `g()`, a dict of callables, a partial — is",
+        "      not, and reads as no caller at all.",
+        "    * a package whose public surface is a PEP 562 module __getattr__ / lazy",
+        "      table reads as exported NOWHERE: `exported` knows __all__ and a",
+        "      package __init__'s from-imports, and nothing else.",
+        "    * a file the RUNNING interpreter cannot parse contributes no call sites",
+        "      at all. It is named above per file, and the modern trigger is a version",
+        "      mismatch rather than broken code — measured, a `type X = ...` (PEP 695,",
+        "      3.12+) statement takes a whole module out of the answer under 3.11.",
+        "    * a DECORATOR on the definition is reported and NOT followed. This scanner",
+        "      sees that @router.post is there; it cannot see whether that router is",
+        "      itself imported and mounted. DECORATOR-REGISTERED therefore means 'the",
+        "      wiring is a hop I did not take', never 'wired' — the hop is yours to check.",
+        "    * a caller counts as a TEST by its PATH alone: conftest.py, test_*.py,",
+        "      *_test.py, anything under tests/ test/ testing/ __tests__/ spec/ specs/,",
+        "      and the frozen acceptance directory. Product code under a directory named",
+        "      `spec` is read as a test here, which downgrades WIRED to TESTS ONLY —",
+        "      the false-ALARM direction, and one look settles it.",
+        "    * references are matched BY NAME, not resolved through imports. Two",
+        "      same-named symbols in different modules are one node — it over-counts",
+        "      callers, in the false-OK direction. Every symbol with more than one",
+        "      definition is flagged AMBIGUOUS above.",
+    ]
+    if have_entries:
+        lines += [
+            "    * --from reachability is a NAME-KEYED forward closure over static",
+            "      references. It is the weakest layer here: read UNREACHED as a question",
+            "      to answer, and DEFINED-but-uncalled as the finding.",
+        ]
+    else:
+        lines += [
+            "    * NO --from WAS GIVEN, so nothing was checked for reachability from an",
+            "      entry point. 'called from somewhere' is not 'on the path the user's",
+            "      command takes' — a symbol called only by other dead code reads as WIRED",
+            "      here. Pass --from to separate them.",
+        ]
+    lines.append(
+        "    * only what is on disk NOW is scanned; this reads no git history.")
+    return lines
+
+
+def cmd_reachable(args):
+    """The wiring check, as a command instead of a habit."""
+    root = repo_root()
+    wanted = []
+    for chunk in (args.symbol or []):
+        for x in chunk.split(","):
+            x = x.strip()
+            if x and x not in wanted:
+                wanted.append(x)
+    if not wanted:
+        # Exit 3, not die()'s 1. task-packets.md tells the orchestrator to read
+        # this command's exit code, and 1 already means "a symbol is not wired" —
+        # so the tool FAILING must not be spelled the same as the tool FINDING
+        # something. 3 is this file's usage-error code (see _Parser.error).
+        die("--symbol needs at least one name (every value given was empty)", code=3)
+    entries = []
+    for chunk in (args.entries or []):
+        for x in chunk.split(","):
+            x = x.strip()
+            if x and x not in entries:
+                entries.append(x)
+
+    paths = args.path or [root]
+    res = _reach_scan(root, paths, wanted)
+    seeds, unresolved = _reach_entries(res, entries, root) if entries else ([], [])
+    reached = _reach_bfs(res, seeds) if seeds else set()
+    rows = [_reach_verdict(res, s, reached, bool(entries)) for s in wanted]
+    bad = [r for r in rows if r["verdict"] != "WIRED"]
+    # What the EXIT CODE is about is narrower than what `not_wired` is about. A
+    # DECORATOR-REGISTERED symbol is not proven wired and stays in not_wired, but
+    # it does not fail the run: the commonest wiring idiom in Python cannot be a
+    # hard failure, or the mandatory check fires on every route in the repo and
+    # its readers learn to pass --no-fail.
+    findings = [r for r in bad if r["verdict"] != "DECORATOR-REGISTERED"]
+    shown = [os.path.relpath(p, root) if os.path.isabs(p) else p for p in paths]
+    shown = [p if p != "." else "the repo root" for p in shown]
+
+    if args.json:
+        print(json.dumps({
+            "scanned_files": res["files"],
+            "scan_roots": shown,
+            "paths_unresolved": res["unresolved_paths"],
+            "unparsed": [{"file": a, "error": b} for a, b in res["unparsed"]],
+            "entry_points": entries,
+            "entry_scopes_resolved": seeds,
+            "entry_points_unresolved": unresolved,
+            "scopes_reached": len(reached),
+            "symbols": rows,
+            "not_wired": [r["symbol"] for r in bad],
+            "findings": [r["symbol"] for r in findings],
+            "limits": _reach_limits(bool(entries)),
+        }, indent=2, sort_keys=True))
+    else:
+        print("reachable: %d symbol(s) against %d python file(s) under %s"
+              % (len(wanted), res["files"], ", ".join(shown)))
+        if entries:
+            print("  entry points: %s  -> %d scope(s) seeded, %d scope(s) reached"
+                  % (", ".join(entries), len(seeds), len(reached)))
+        if res["unresolved_paths"]:
+            # A --path naming nothing used to be dropped in silence while the
+            # header line above went on asserting it had been scanned — the one
+            # place this command was not meticulous about the failure class it
+            # is meticulous about everywhere else.
+            print("  --path DID NOT RESOLVE: %s — it names no directory and no .py file "
+                  "that exists, so NOTHING under it was scanned. The file count above is "
+                  "about the paths that DID resolve."
+                  % ", ".join(res["unresolved_paths"]))
+        if unresolved:
+            print("  ENTRY POINT DID NOT RESOLVE: %s — it names no file, module or symbol "
+                  "in the scan." % ", ".join(unresolved))
+            if not seeds:
+                print("      NO entry scope resolved at all, so the reachability layer is "
+                      "reporting about an EMPTY graph: every UNREACHED below is an artefact "
+                      "of that, not a finding.")
+        for relf, err in res["unparsed"]:
+            print("  COULD NOT PARSE %s: %s — its call sites are invisible to this answer"
+                  % (relf, err))
+        if not res["files"]:
+            print("  NO PYTHON FILES WERE SCANNED. This is an ast pass over .py and can say "
+                  "NOTHING about a codebase in another language; do not read the verdicts "
+                  "below as evidence about one.")
+        print("")
+        for r in rows:
+            print("  %-38s %s" % (r["symbol"], r["verdict"]))
+            if r["definitions"]:
+                for d in r["definitions"][:REACH_LIST_CAP]:
+                    print("      defined    %s:%d  (%s%s)"
+                          % (d["file"], d["line"], d["kind"],
+                             ", in a TEST file" if d["test"] else ""))
+                if len(r["definitions"]) > REACH_LIST_CAP:
+                    print("      defined    ... and %d more"
+                          % (len(r["definitions"]) - REACH_LIST_CAP))
+            else:
+                print("      defined    NOWHERE in the %d file(s) scanned" % res["files"])
+            if r["call_sites"]:
+                print("      callers    %d (%d product, %d test)"
+                      % (len(r["call_sites"]), r["product_call_sites"], r["test_call_sites"]))
+                for c in r["call_sites"][:REACH_LIST_CAP]:
+                    print("                 %s:%d  in %s%s%s"
+                          % (c["file"], c["line"], c["holder"],
+                             ("  [as %s]" % c["alias"]) if c.get("alias") else "",
+                             "  [TEST]" if c["test"] else ""))
+                if len(r["call_sites"]) > REACH_LIST_CAP:
+                    print("                 ... and %d more"
+                          % (len(r["call_sites"]) - REACH_LIST_CAP))
+            else:
+                print("      callers    NONE — zero references outside its own body, across "
+                      "%d file(s)" % res["files"])
+            if r["exported"]:
+                print("      exported   %s" % "; ".join(
+                    "%s (%s:%d)" % (e["via"], e["file"], e["line"])
+                    for e in r["exported"][:REACH_LIST_CAP]))
+            else:
+                print("      exported   NO — in no __all__, re-exported by no package "
+                      "__init__")
+            if r["imported_by"]:
+                print("      imported   %s" % ", ".join(
+                    "%s:%d" % (i["file"], i["line"])
+                    for i in r["imported_by"][:REACH_LIST_CAP]))
+            if r["decorators"]:
+                print("      decorated  %s%s" % (
+                    "; ".join("%s at %s:%d" % (d["label"], d["file"], d["line"])
+                              for d in r["decorators"][:REACH_LIST_CAP]),
+                    (" ... and %d more" % (len(r["decorators"]) - REACH_LIST_CAP)
+                     if len(r["decorators"]) > REACH_LIST_CAP else "")))
+                if r["registering_decorator"]:
+                    print("                 a route/registry/plugin table may be its only "
+                          "call site. This scanner does NOT follow a decorator into the "
+                          "table on the other side.")
+                else:
+                    print("                 every one of these WRAPS IN PLACE and registers "
+                          "nothing, so the verdict above is not softened on them.")
+            if r["reached_from_entry"] is not None:
+                print("      reachable  %s from %s"
+                      % ("YES" if r["reached_from_entry"] else "NO", ", ".join(entries)))
+            if r["ambiguous"]:
+                print("      AMBIGUOUS  %d definitions share this name; references are "
+                      "matched by name alone, so the layers above MERGE them and read "
+                      "generously" % len(r["definitions"]))
+            bare = [h for h in r["dynamic_hints"] if not h.get("inside")]
+            inside = [h for h in r["dynamic_hints"] if h.get("inside")]
+            if bare:
+                print("      dynamic    the bare name appears as a STRING at %s — a getattr "
+                      "or registry may reach it. The verdict above is NOT upgraded on this."
+                      % ", ".join("%s:%d" % (h["file"], h["line"])
+                                  for h in bare[:REACH_LIST_CAP]))
+            if inside:
+                print("      embedded   the name appears CALL-SHAPED inside a longer string "
+                      "at %s — Python source in a string (a subprocess probe, an exec, a "
+                      "generated module) is text to an ast pass, so a real call site can "
+                      "hide there. Read the string before believing the verdict above; it "
+                      "is NOT upgraded on this."
+                      % ", ".join("%s:%d" % (h["file"], h["line"])
+                                  for h in inside[:REACH_LIST_CAP]))
+            print("      %s" % REACH_DIAGNOSIS[r["verdict"]])
+        print("")
+        counts = {}
+        for r in rows:
+            counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
+        print("  summary: " + " · ".join(
+            "%d %s" % (counts.get(v, 0), v)
+            for v in ("WIRED", "DECORATOR-REGISTERED", "NO CALL SITES", "TESTS ONLY",
+                      "UNREACHED", "UNDEFINED")))
+        for line in _reach_limits(bool(entries)):
+            print(line)
+
+    if (findings or unresolved or res["unresolved_paths"]) and not args.no_fail:
+        sys.exit(1)
+    sys.exit(0)
+
+
 # -------------------------------------------------------------------- main
 
 def main():
@@ -8372,6 +9156,26 @@ def main():
 
     s = sub.add_parser("status", help="print loop state")
     s.set_defaults(func=cmd_status)
+
+    s = sub.add_parser("reachable",
+                       help="the wiring check: is a symbol defined, called, exported and "
+                            "reachable from a real entry point (exit 1 when it is not)")
+    s.add_argument("--symbol", action="append", default=None, required=True, metavar="NAME",
+                   help="repeatable, comma-separated: the symbol(s) a commit claims to have "
+                        "added")
+    s.add_argument("--from", action="append", default=None, dest="entries", metavar="ENTRY",
+                   help="repeatable, comma-separated: an entry point — a file (src/cli.py), "
+                        "a dotted module, `module:symbol`, or a bare symbol name. WITHOUT it "
+                        "the reachability layer is skipped and only defined/called/exported "
+                        "are reported")
+    s.add_argument("--path", action="append", default=None, metavar="DIR",
+                   help="repeatable: where to scan (default: the whole repo root, minus "
+                        "vendor/cache directories — a directory named here is scanned even "
+                        "if it is on that skip list)")
+    s.add_argument("--json", action="store_true", help="machine-readable output")
+    s.add_argument("--no-fail", action="store_true",
+                   help="print the verdicts without exiting non-zero")
+    s.set_defaults(func=cmd_reachable)
 
     args = p.parse_args()
     args.func(args)
