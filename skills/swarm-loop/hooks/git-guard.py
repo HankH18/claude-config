@@ -152,8 +152,23 @@ argv, and widening it would cost false blocks, which are worse):
     `git -C <path> ...`; but substitution bodies are scanned off the RAW string
     (single quotes decide whether bash runs them at all, and posix tokenization
     erases quotes), so their interiors are judged from the directory the line
-    STARTED in. That errs toward BLOCK, which is the survivable direction, and
-    it is what remains of the older, wider "anything after a `cd`" limitation.
+    STARTED in. It is what remains of the older, wider "anything after a `cd`"
+    limitation. **Which way it errs depends on the rule family, and the claim
+    that it "errs toward BLOCK" was true of only half of them.** A VERB rule
+    (`stash`, `reset --hard`, `clean -f`) fires on the verb no matter which
+    directory the question is asked from, so the miss costs a false BLOCK -
+    survivable. A PATH-CLASSIFICATION rule asks git whether the OPERAND is a
+    path, and the answer is a property of the directory: a RELATIVE operand
+    that exists only under the `cd` target is not a path in the starting
+    directory, so it classifies as a ref and the path rule never runs. Measured,
+    same operand, one fixture: `git checkout only_in_worktree.py` with cwd=<wt>
+    -> rc=2, and `cd <wt> && echo "$(git checkout only_in_worktree.py)"` from
+    the primary checkout -> rc=0. So for path rules the bound errs toward
+    ALLOW. An ABSOLUTE operand classifies the same from anywhere and keeps
+    erring toward BLOCK, which is why the `rm -rf <abs worktree path>` case
+    reads as conservative and hid this. Both directions are pinned in
+    tests/test_git_guard.py (`cwd-worktree-own-file`,
+    `cd-subst-relative-path-misses`).
   - `find . ... -delete` outside `.swarm-loop/`, and `... | xargs rm`. Narrow on
     purpose: `find . -name '*.pyc' -delete` is ordinary housekeeping, and a false
     block on housekeeping is worse than this miss.

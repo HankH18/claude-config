@@ -958,6 +958,26 @@ PAYLOAD_CASES = [
     ("cwd-worktree-own-file", BLOCK,
      {"tool_name": "Bash", "cwd": "{WT}",
       "tool_input": {"command": "git checkout only_in_worktree.py"}}),
+    #    ...and the SAME operand, one spelling over, is the documented
+    #    substitution bound erring the OTHER way. The interior of a `$(...)` is
+    #    scanned from the directory the line STARTED in; `only_in_worktree.py`
+    #    is not a path in the primary checkout, so it classifies as a REF and
+    #    the destructive-path rule never runs. This is why "the substitution
+    #    bound errs toward BLOCK" was wrong for path rules — it is true of verb
+    #    rules and of absolute operands, and false here. Pinned as the miss it
+    #    is, not as a promise: if a future widening makes this BLOCK, this case
+    #    goes red and the docstrings in both files need re-measuring, which is
+    #    the point of asserting a known bound.
+    ("cd-subst-relative-path-misses", ALLOW,
+     {"tool_name": "Bash", "cwd": "{REPO}",
+      "tool_input": {"command": "cd {WT} && echo \"$(git checkout only_in_worktree.py)\""}}),
+    #    The CONTROL that makes the pair conclusive: identical string, no
+    #    substitution, so the same-line `cd` IS honoured and the operand is
+    #    classified from the worktree. The rule works; the substitution is what
+    #    moves the directory the question is asked from.
+    ("cd-relative-path-blocked-without-subst", BLOCK,
+     {"tool_name": "Bash", "cwd": "{REPO}",
+      "tool_input": {"command": "cd {WT} && git checkout only_in_worktree.py"}}),
     ("cwd-control-both-trees", BLOCK,
      {"tool_name": "Bash",
       "tool_input": {"command": "git checkout a.txt"}}),
@@ -1533,11 +1553,24 @@ def has_substitution(name):
     the same string run from the worktree is inert and allowed.
 
     That is a real bound, not a rounding error, and it is EXEMPTED from the cd
-    axis rather than papered over with an expectation fitted to it. It errs
-    toward BLOCK, which is the survivable direction, and it narrows — it does
-    not remove — the guard's long-standing "anything reached after a `cd`
-    WITHIN the command" limitation. Two explicit cases pin the behaviour so it
-    stays known rather than merely unmeasured.
+    axis rather than papered over with an expectation fitted to it. It narrows
+    — it does not remove — the guard's long-standing "anything reached after a
+    `cd` WITHIN the command" limitation.
+
+    WHICH WAY IT ERRS DEPENDS ON THE RULE FAMILY, and this docstring used to
+    claim "toward BLOCK, the survivable direction" for all of them. That holds
+    for VERB rules and for ABSOLUTE operands, both of which classify the same
+    from any directory — which is exactly why the `rm -rf <abs wt path>` case
+    above reads conservative and hid the other half. A PATH-CLASSIFICATION rule
+    asks git whether the operand IS a path, and that is a property of the
+    directory asked from: a RELATIVE operand that exists only under the `cd`
+    target is not a path in the starting directory, classifies as a ref, and
+    the path rule never runs. Measured on this fixture, one operand, two
+    spellings: `cwd-worktree-own-file` (cwd=WT, no substitution) -> BLOCK, and
+    `cd-subst-relative-path-misses` (same operand inside `$(...)` after a
+    same-line `cd`, from the primary checkout) -> ALLOW. Three explicit cases
+    pin the behaviour in BOTH directions so it stays known rather than merely
+    unmeasured.
 
     Exempted BY NAME, not by a `"$(" in cmd` test. That test removed 35 cases
     from the axis, most of them single-quoted prose or heredoc bodies the guard
