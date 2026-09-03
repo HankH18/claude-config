@@ -2783,8 +2783,14 @@ ck_has  "...and the file it looked in" "hooks/git-guard.py"
 ck_has  "...and what a CTO could authorize" "NON-DESTRUCTIVE"
 ck_has  "...and what it never could" "no \"ask the CTO\" path at all"
 ck_has  "...and that a user-level deny outranks it" "absolute"
-ck_has  "...and what to run instead today" "watch-fix"
+ck_has  "...and the fallback for THIS modifier (full-auto -> watch)" \
+        "$CBP watch  for the same sessions"
+ck_hasnt "...not the other modifier's fallback" "$CBP watch-fix  for the same"
 ck_hasnt "...and it starts NOTHING" "6. Watchers"
+
+cb "$CBP" all --dry-run
+ck_exit "all refuses while the gate is missing too" 3 "$RC"
+ck_has  "...with ITS fallback (all -> watch-fix)" "$CBP watch-fix  for the same sessions"
 
 # When the guard declares the sentinel, the refusal becomes a launch. That is
 # the whole seam: one grep.
@@ -2800,13 +2806,26 @@ ck_has  "...as its own topology label" "6. Watchers (all)"
 ck_has  "...announcing the gate is armed" "the CTO authorization gate"
 ck_has  "...naming who wears the CTO hat" "would give     the CTO role to the watchdog"
 ck_has  "...and where approvals are recorded" "authority/approvals.log"
-ck_has  "...and it does plan the fixer" "would copy"
+ck_has  "...and it DOES plan the fixer (the one difference from full-auto)" \
+        "would copy"
+ck_has  "...and starts the fixer session" "(fixer, writes only its copy)"
 
+# full-auto and all differ ONLY by the fixer. full-auto is the `watch`
+# topology plus authority — build + watcher, the watcher wearing the CTO hat —
+# and `all` is `watch-fix` plus the same hat. Both are live paths the moment
+# the gate lands; neither adds a session to hold the authority, because adding
+# one is what would break the requester/grantor split.
 cb "$CBP" full-auto --dry-run
-ck_exit "full-auto still refuses even WITH the gate: nobody would hold it" 1 "$RC"
-ck_has  "...saying exactly that" "nobody would hold the authority it arms"
-ck_has  "...and pointing at the topology that does name a holder" "all  instead"
-ck_hasnt "...and starting nothing" "6. Watchers"
+ck_exit "full-auto launches once the guard declares the sentinel" 0 "$RC"
+ck_has  "...under its own topology label" "6. Watchers (full-auto)"
+ck_has  "...arming the gate" "the CTO authorization gate"
+ck_has  "...with the CTO hat on the watchdog, exactly like all" \
+        "would give     the CTO role to the watchdog"
+ck_has  "...and an approvals log" "authority/approvals.log"
+ck_has  "...starting the WATCHDOG" "(watchdog, read-only profile)"
+ck_hasnt "...and NO fixer: that is the only thing all has that it does not" \
+         "would copy"
+ck_hasnt "...so no fixer session either" "(fixer, writes only its copy)"
 
 printf '# stub guard\n' > "$CBS/hooks/git-guard.py"
 cb "$CBP" full-auto --dry-run
@@ -3007,6 +3026,17 @@ ck "...and that a destructive operation has no ask-the-CTO path at all" "1" \
    "$(grep -c 'no "ask the CTO" path at all' "$SCRIPT_DIR/../templates/watchdog-prompt.md")"
 ck "...and the ESCALATE rule for an approval tracing back to its own suggestion" "1" \
    "$(grep -c 'you do not grant it. You escalate to' "$SCRIPT_DIR/../templates/watchdog-prompt.md")"
+# The hat is worn in BOTH authority topologies. A section headed for only one of
+# them tells a full-auto watcher the rules are not its problem.
+ck "...and the CTO section applies to both authority topologies" "1" \
+   "$(grep -c 'If you are also the CTO (topology `full-auto` or `all`)' "$SCRIPT_DIR/../templates/watchdog-prompt.md")"
+ck "...saying the two differ only by the fixer" "1" \
+   "$(grep -c 'differ only in whether a fixer exists beside you' "$SCRIPT_DIR/../templates/watchdog-prompt.md")"
+
+# The collapse fails closed: a topology that reached the launcher uncollapsed
+# would behave like `watch` by accident rather than by decision.
+ck "the gate refuses a topology that did not collapse" "1" \
+   "$(grep -c "did not collapse to watch or watch-fix" "$CB_SRC")"
 
 ck "the provisioned hook points at the launcher's OWN guard" "True" \
    "$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d['hooks']['PreToolUse'][0]['hooks'][0]['command'].endswith('/p/skill/hooks/git-guard.py\"'))" "$CBGEN/watchdog.json")"

@@ -187,11 +187,16 @@ Append a shift banner as your first write to each document you open:
     ---
     ## shift @@SHIFT@@ — run @@RUN_ID@@, watchdog @@WATCH_NAME@@
 
-## If you are also the CTO (topology `all`)
+## If you are also the CTO (topology `full-auto` or `all`)
 
 The "CTO role" line in your ledger says whether this applies. If it says none,
 skip this section entirely — you have no authority and no store, and a request
 for one is a thing to report, not to answer.
+
+Both authority topologies put the hat on YOU rather than starting another
+session, and they differ only in whether a fixer exists beside you
+(`full-auto` is build + you; `all` adds the fixer). Nothing about your
+authority changes between them.
 
 When you do hold it, the build session may ask you to authorize an operation
 its guard blocked pending review. Your authority is bounded by

@@ -6,10 +6,19 @@ open more, each in its own detached tmux session, each with a permission profile
 
     claude-build <dir> watch        build + watchdog
     claude-build <dir> watch-fix    build + watchdog + fixer
-    claude-build <dir> all          watch-fix, with the WATCHER also wearing
-                                    the CTO hat  (REFUSES today)
-    claude-build <dir> full-auto    watch-fix + a CTO authorization gate
-                                    (REFUSES today, and see below)
+    claude-build <dir> full-auto    build + watchdog, the watchdog also
+                                    wearing the CTO hat   (REFUSES today)
+    claude-build <dir> all          build + watchdog + fixer, same CTO hat
+                                                           (REFUSES today)
+
+The two authority topologies differ ONLY by the fixer:
+
+    full-auto  =  the `watch` topology      + the watcher wears the CTO hat
+    all        =  the `watch-fix` topology  + the watcher wears the CTO hat
+
+Neither adds a session to hold the authority. Adding one is exactly what would
+break the property that makes this safe: the requester is the build and the
+grantor is the watcher, so nothing can approve its own request.
 
 Both spellings are accepted (`watch` and `--watch`). The bare word costs you one
 thing: a project directory literally named `watch` must be written `./watch`.
@@ -153,6 +162,38 @@ the working directories; `bypassPermissions` is refused).
 So the deny list is spelled with `Edit(<path>/**)` and nothing else — adding
 `Write(...)` spellings would add startup warnings, not coverage — and the
 permission mode is `acceptEdits`, not `dontAsk`.
+
+### Three constraints worth carrying past this feature
+
+**1. `~/.claude/**` is a sensitive path, and no `--restricted` session may write
+there.** This is load-bearing and surprising: it is why the observation
+documents cannot live in `~/.claude/observations/` beside the manual convention
+they replace. Measured with an explicit `Edit(//Users/…/.claude/observations/**)`
+allow rule in the profile — the write was still refused:
+
+    Claude requested permissions to edit
+    /Users/…/.claude/observations/… which is a sensitive file.
+
+A watchdog whose notebook lives under `~/.claude` cannot write its notebook, so
+the feature cannot exist there at all. That is a constraint on where ANY agent's
+durable notes can go, not just this one's.
+
+**2. An allow-list of read-only Bash is the wrong shape for an unattended
+pane.** Under `acceptEdits` an unlisted command PROMPTS, and a prompt at a pane
+nobody is sitting at is an agent that has silently stopped — indistinguishable
+from one that is thinking. Measured: the very first thing the live watchdog
+reached for was an unlisted compound command. So the boundary has to be a DENY
+list, which fails closed and loudly, rather than an allow list, which fails
+open-ended and silently. That reasoning generalises to any long-running agent
+in a detached session.
+
+**3. `--tools` without `Task` removes the Agent tool entirely.** Measured by
+enumerating the session's tools: with `Task` unnamed, no `Agent` tool exists.
+The fan-out cap is therefore structural, not a sentence in a prompt an agent can
+talk itself out of — which is a better answer than a numeric cap, because the
+failure it prevents was an agent that had *read* the cap and blew through it
+anyway ("my brief lists it as a thing to watch for in the build — I didn't
+consider that I'd be the one causing it").
 
 ### The allow list is a bare `Bash`, on purpose
 
@@ -298,24 +339,23 @@ Attacked directly, with the shipped fixer profile:
 
 ## `all`, and the seam for the authorization gate
 
-`all` is `watch-fix`'s three sessions with the **watcher also holding the CTO
-role**. There is no fourth session: the requester is the build and the grantor
-is the watcher, so the separation that matters — nothing approves its own
-request — survives without another agent.
+`full-auto` and `all` both put the CTO hat on the **watcher**, and differ only
+in whether a fixer runs beside it. There is no separate CTO session in either:
+the requester is the build and the grantor is the watcher, so the separation
+that matters — nothing approves its own request — survives without another
+agent.
 
-Both `all` and `full-auto` parse and validate like the others and then
-**refuse**, because both contain an authorization gate that does not exist yet
-and a watcher holding an authority it does not have is a review step the
-operator believes is happening. Two distinct refusals, both red paths:
+Both parse and validate like the others and then **refuse today**, because both
+contain an authorization gate that does not exist yet, and a watcher holding an
+authority it does not have is a review step the operator believes is happening —
+strictly worse than the feature not existing.
 
-* **gate absent** (today, for both): exit 3, naming the sentinel, the file, and
-  what a CTO will and will not be able to do once it lands.
-* **gate present, `full-auto`**: still refuses. `all` is the only topology that
-  NAMES who holds the authority; `full-auto`'s CTO is a session claude-build
-  does not know how to start, so arming `AUTHORITY` for it would put an
-  authority in nobody's hands. The message points at `all`.
-* **gate present, `all`**: launches, with the CTO role on the watchdog and an
-  approvals store created.
+* **gate absent** (today, for both): exit 3, naming the sentinel, the file, what
+  a CTO will and will not be able to do once it lands, and the fallback for
+  *that* modifier — `watch` for `full-auto`, `watch-fix` for `all`.
+* **gate present**: both launch. `full-auto` starts two sessions, `all` three,
+  and in both the watchdog gets the CTO role and the approvals store is
+  created.
 
 ### The approvals store, and the shape that makes it work
 
@@ -356,12 +396,13 @@ why it is built now even though the gate is not.
 
 **Seam 1 — the flip is one grep.** `claude-build` looks for the literal
 `CLAUDE_BUILD_AUTHORIZATION_GATE` in `hooks/git-guard.py`. When the guard
-declares it, `all`'s refusal becomes a launch: the topology stays `watch-fix`
-underneath, `AUTHORITY=1`, `CTO_ROLE=watchdog`, and the approvals store is
-created. All three outcomes are pinned in `tests/test_harness.sh` — sentinel
-absent → exit 3 for both modifiers; sentinel present → `all` exits 0 naming the
-CTO holder and the log, `full-auto` still refuses — so the transition is
-recorded rather than discovered.
+declares it, the refusal becomes a launch: `AUTHORITY=1`, `CTO_ROLE=watchdog`,
+the modifier collapses to the topology it is built on (`full-auto`→`watch`,
+`all`→`watch-fix`), and the approvals store is created. All four outcomes are
+pinned in `tests/test_harness.sh` — sentinel absent → exit 3 for both, each
+naming its own fallback; sentinel present → `full-auto` starts two sessions and
+`all` starts three, both naming the CTO holder and the log — so the transition
+is recorded rather than discovered.
 
 **Seam 2 — how the guard finds the CTO.** When a modifier is active,
 `claude-build` exports `CLAUDE_BUILD_STATE_DIR` before the build's `exec`. A

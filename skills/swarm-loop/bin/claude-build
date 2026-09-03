@@ -632,11 +632,15 @@ SESSION TOPOLOGY (modifiers — bare word or --flag, both accepted)
                        that watches the harness document and fixes what is
                        obviously fixable — in a COPY of the skill, never in the
                        live one, and never as a commit.
-  full-auto            watch-fix plus a CTO authorization gate.
-  all                  watch-fix's three sessions, with the WATCHER also
-                       wearing the CTO hat. The build still asks and someone
-                       else still grants, so the requester cannot approve
-                       itself; every approval is appended to a log outside
+  full-auto            `watch`'s TWO sessions, with the watcher also wearing
+                       a CTO hat: it may authorize non-destructive operations
+                       the guard blocked pending review.
+  all                  `watch-fix`'s THREE sessions, with the same CTO hat on
+                       the watcher. full-auto and all differ ONLY by the fixer.
+
+                       In both, the build still asks and someone else still
+                       grants, so the requester cannot approve itself, and
+                       every approval is appended to a log that sits outside
                        every directory the build can reach.
 
                        full-auto and all BOTH REFUSE TO LAUNCH TODAY. The
@@ -773,21 +777,31 @@ fi
 if [ "$WATCH" = full-auto ] || [ "$WATCH" = all ]; then
   if grep -q "$GATE_SENTINEL" "$GUARD" 2>/dev/null; then
     AUTHORITY=1
-    # `all` puts the CTO hat on the WATCHER rather than adding a fourth session:
-    # the requester is still the build and the grantor is still someone else, so
-    # the separation that matters survives. Both spellings are watch-fix
-    # underneath; AUTHORITY is what differs, and CTO_ROLE says who wears it.
-    [ "$WATCH" = all ] && CTO_ROLE=watchdog
-    if [ -z "$CTO_ROLE" ]; then
-      # The gate exists, but full-auto's CTO is a session claude-build does not
-      # know how to start: `all` is the only topology that names who holds the
-      # authority. Arming AUTHORITY with nobody wearing the hat would be the
-      # same defect the refusal above exists to prevent — an operator believing
-      # a review step is happening — so this is a red path, not a downgrade.
-      die "$WATCH: the authorization gate is installed, but claude-build has no CTO session for full-auto — nobody would hold the authority it arms. Use  claude-build ${DIR:-.} all  instead: same three sessions, with the watcher wearing the CTO hat and every approval appended to a log the build cannot reach."
-    fi
-    WATCH=watch-fix
+    # Both put the CTO hat on the WATCHER rather than adding another session:
+    # the requester is still the build and the grantor is still someone else,
+    # so the separation that matters survives without a fourth agent. The ONLY
+    # difference between the two modifiers is the fixer —
+    #
+    #   full-auto = the `watch` topology     (build + watcher) + authority
+    #   all       = the `watch-fix` topology (build + watcher + fixer) + authority
+    #
+    # so each collapses to the topology it is built on, and CTO_ROLE says who
+    # wears the hat in both.
+    CTO_ROLE=watchdog
+    [ "$WATCH" = full-auto ] && WATCH=watch
+    [ "$WATCH" = all ]       && WATCH=watch-fix
+    # Fail closed on the collapse itself. Everything downstream branches on
+    # WATCH being one of the two launchable topologies, and a value that got
+    # here uncollapsed would quietly behave like `watch` — which is right for
+    # full-auto by accident and wrong for anything else. An internal state
+    # nobody checked is the silent-verdict failure this script exists to avoid.
+    case "$WATCH" in
+      watch|watch-fix) ;;
+      *) die "internal: topology '$WATCH' did not collapse to watch or watch-fix" ;;
+    esac
   else
+    GATE_FALLBACK=watch
+    [ "$WATCH" = all ] && GATE_FALLBACK=watch-fix
     printf '\033[31merror:\033[0m %s is not available — its authorization gate is not installed.\n' "$WATCH" >&2
     cat >&2 <<GATE_EOF
 
@@ -808,10 +822,10 @@ if [ "$WATCH" = full-auto ] || [ "$WATCH" = all ]; then
                     absolute and no agent grants past it.
 
   What to do now
-    Use  claude-build ${DIR:-.} watch-fix  for the watchdog + fixer topology
-    without the authorization gate, and rerun with $WATCH once the guard
-    declares the sentinel. The sessions are the same three either way; what
-    is missing is only the authority.
+    Use  claude-build ${DIR:-.} $GATE_FALLBACK  for the same sessions without
+    the authorization gate, and rerun with $WATCH once the guard declares the
+    sentinel. The sessions are identical either way; what is missing is only
+    the authority the watcher would have held.
 
 GATE_EOF
     exit 3
@@ -1046,9 +1060,13 @@ fi
 # All of this happens BEFORE the exec on the last line, because `exec` replaces
 # this process and nothing after it ever runs. It is also what was asked for:
 # the build keeps the terminal you are standing in, the observers get their own.
+# What the run calls itself. The two authority topologies are told apart by the
+# fixer, which is the only thing that differs between them.
 TOPOLOGY="$WATCH"
-[ "$AUTHORITY" = 1 ] && TOPOLOGY=full-auto
-[ "$AUTHORITY" = 1 ] && [ "$CTO_ROLE" = watchdog ] && TOPOLOGY=all
+if [ "$AUTHORITY" = 1 ]; then
+  TOPOLOGY=full-auto
+  [ "$WATCH" = watch-fix ] && TOPOLOGY=all
+fi
 # NOT under ~/.claude. Two independent reasons, and the first is a hard block:
 #  1. Claude Code classifies everything under ~/.claude as a SENSITIVE path and
 #     refuses a --restricted session's write there — measured, with an explicit
