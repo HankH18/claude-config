@@ -5380,12 +5380,20 @@ def _learned_entries(text):
     WHOLE file is read — preamble rule bullets included, which is why the count
     is only ever advisory in that state and why the writer refuses outright
     rather than appending into a document whose shape it cannot find.
+
+    '## ' is an opener as well as '- ' and '### ', and that is not cosmetic: the
+    first entries this file ever held were written by hand as `## Heading` blocks
+    with prose bodies, and a reader that only knew bullets counted EIGHT real
+    entries as zero — reporting "EMPTY (0 entries) — Termination is supposed to
+    distil" over a file that had just been filled. A count that is wrong about
+    the file it exists to measure is the defect this whole command is about, so
+    every entry shape the file has actually carried is counted.
     """
     marked = LEARNED_ENTRIES_MARKER in text
     body = text.split(LEARNED_ENTRIES_MARKER, 1)[-1] if marked else text
     blocks, cur = [], None
     for ln in body.splitlines():
-        if ln.startswith("- ") or ln.startswith("### "):
+        if ln.startswith("- ") or ln.startswith("### ") or ln.startswith("## "):
             if cur is not None:
                 blocks.append(cur)
             cur = ln
@@ -6741,29 +6749,88 @@ def cmd_status(args):
 # Every one of these is a thing that cannot be true of a durable orchestration
 # lesson: a lesson about wave sizing does not need a home directory in it.
 _DL_PATHY = re.compile(r"(?:/Users/|/home/|/opt/|/etc/|/var/|~/|\b[A-Za-z]:\\)")
+# `sh` is deliberately NOT in this alternation. It is a real TLD and it is also
+# the extension of every shell script in this repository, so including it made
+# "run the gate with tests/run.sh" refuse as "a URL, host or remote: 'run.sh'" —
+# a refusal whose stated reason is false, which sends the author to fix a thing
+# that is not there. A matcher that names the wrong rule is worse than a missing
+# rule, because the author cannot tell it is wrong from the message.
 _DL_URLY = re.compile(r"(?:https?://|git@[\w.-]+:"
-                      r"|\b[\w-]+\.(?:com|net|org|io|ai|dev|app|co|sh|cloud|local)\b)", re.I)
+                      r"|\b[\w-]+\.(?:com|net|org|io|ai|dev|app|co|cloud|local)\b)", re.I)
 # An interior capital is what product and service names look like: ClearView,
-# ProxyShop, DynamoDB, GitHub. Deliberately strict and deliberately without an
-# escape hatch — the fix is always to name the ROLE ("the shared database", "the
-# remote") instead of the brand, and that rewrite makes the entry MORE durable,
-# which is the whole point of the file.
+# ProxyShop, DynamoDB, GitHub. The fix is always to name the ROLE ("the shared
+# database", "the remote") instead of the brand, and that rewrite makes the entry
+# MORE durable, which is the whole point of the file.
 _DL_PROPER = re.compile(r"\b[A-Za-z][a-z0-9]+[A-Z][A-Za-z0-9]*\b")
+# ...with one exception class: the language, runtime or platform the orchestrator
+# itself runs on is technical vocabulary, not a project fact, and "name the ROLE
+# it played" is not advice anyone can act on for an operating system. These are
+# spelled with an interior capital by convention and by nobody's choice.
+_DL_PROPER_OK = ("macos", "javascript", "typescript", "openssh", "openssl")
 # Ticket / defect / cycle identifiers: the canonical project trivia.
-_DL_TICKET = re.compile(r"\b[A-Z]{1,4}-\d{1,5}\b")
+_DL_TICKET = re.compile(r"\b([A-Z]{1,4})-\d{1,5}\b")
+# ...but the same shape spells every standard an orchestration lesson may
+# legitimately name. "Decode every captured log as UTF-8" was refused as "a
+# ticket or defect identifier: 'UTF-8'"; so were SHA-256, RFC-2119, HTTP-2 and
+# GPT-4. A project key ("T-036", "PROJ-14") is still refused — that is the rule
+# — but an encoding, a digest, a wire protocol or a model generation is not one.
+_DL_TICKET_OK = ("utf", "sha", "aes", "rsa", "rfc", "http", "iso", "ieee",
+                 "gpt", "tls", "ssl", "sse", "pep", "ecma", "ipv", "utc",
+                 "usb", "sql", "crc", "arm", "cve")
 
-# "Imperative" enforced the only way a regex can: reject the openings that are
-# provably NOT imperative. A lesson opening "the merge queue was slow" is a
-# report; "cap wave width at 3" is an instruction a future run can execute.
+# "Imperative" enforced the only way a regex can — and enforced to mean what the
+# refusal SAYS it means. The original list refused "Never …" and "Always …",
+# which are the two most common shapes a real rule takes, with the message "that
+# is a report about what happened". Measured against ground truth it refused 13
+# of the 20 entries in this skill's own hand-curated archive and 6 of the 8 the
+# first real run ever wrote. A gate that refuses the correct form does not teach
+# the form; it teaches writing around the gate, which is worse than no gate. So:
+#
+#   * an article or pronoun opener is a report ONLY IF the sentence also
+#     NARRATES — "the merge queue WAS slower than expected" reports; "a shared
+#     scratchpad path is not lane isolation" states a standing rule.
+#   * "Never …"/"Always …" open an instruction, full stop.
+#   * "When …"/"If …"/"Every …" open a clause, and are judged by what the clause
+#     ARRIVES at: an instruction after the comma, or a deontic ("must", "should").
 _DL_NOT_IMPERATIVE = ("the", "a", "an", "this", "that", "it", "we", "i", "they",
-                      "there", "our", "its", "his", "her", "when", "if", "because",
-                      "after", "before", "during", "most", "every", "some", "one",
-                      "two", "three", "always", "never")
-# Imperative verbs whose spelling collides with the -ed/-ing participle test.
-_DL_IMPERATIVE_OK = ("read", "feed", "seed", "need", "embed", "shed", "shred",
-                     "spread", "proceed", "exceed", "succeed", "speed", "breed",
+                      "there", "our", "its", "his", "her", "because",
+                      "never", "always")
+# Past-tense narration: the actual signal the refusal message names. Kept
+# deliberately small and high-precision — a missed report costs one weak entry,
+# a false hit costs a correct lesson its author was told to mangle.
+_DL_NARRATES = re.compile(r"\b(?:was|were|wasn't|weren't|had|did|didn't|got|"
+                          r"became|went|took|spent|used\s+to|turned\s+out|"
+                          r"ended\s+up|has\s+been|have\s+been)\b", re.I)
+# Adverbs that open a canonical imperative. "Never merge an unrebased branch" IS
+# the verb a future run should obey. Exactly two members, and both are earning
+# their place: they are the only openers that appear on the report list above AND
+# open an instruction, so this is what stops "Never dispatch a lane whose base
+# WAS rewritten" — an instruction that happens to name a past failure inside
+# itself — from being read as narration. Anything else imperative ("Prefer …",
+# "Stop …") is not on any list and needs no entry here; adding one would be an
+# allowlist member no input can reach.
+_DL_IMPERATIVE_ADVERB = ("never", "always")
+# Subordinators and quantifiers. Not imperative on their own, not reports either:
+# judged by the main clause below.
+_DL_CLAUSE_OPENER = ("when", "if", "after", "before", "during", "once", "unless",
+                     "while", "whenever", "wherever", "every", "each", "any",
+                     "all", "no", "most", "some", "one", "two", "three")
+_DL_DEONTIC = re.compile(r"\b(?:must|should|shall|cannot|can't|may\s+not|"
+                         r"has\s+to|have\s+to|needs?\s+to|is\s+not|are\s+not|"
+                         r"never|always)\b", re.I)
+# Openers whose -ed/-ing spelling is NOT a participle. Two classes, both of them
+# false refusals the -ed/-ing test produces on its own: imperative verbs spelled
+# that way (Feed, Seed, Embed, Bring, String) and pronouns and adverbs spelled
+# that way — "Nothing calls this is a defect only when a frozen test passes
+# because of it" is a real entry in this file, refused as "a participle".
+# ("read" and "spread" were in this list and were dead: both end in "ad", so the
+# participle test never reached them.)
+_DL_IMPERATIVE_OK = ("feed", "seed", "need", "embed", "shed", "shred",
+                     "proceed", "exceed", "succeed", "speed", "breed",
                      "bleed", "bring", "ring", "sing", "string", "cling", "fling",
-                     "swing", "wring")
+                     "swing", "wring",
+                     "nothing", "something", "anything", "everything",
+                     "instead", "indeed", "ahead")
 
 _DL_LESSON_MIN, _DL_LESSON_MAX = 20, 400
 _DL_BECAUSE_MIN, _DL_BECAUSE_MAX = 30, 900
@@ -6772,9 +6839,14 @@ _DL_BECAUSE_MIN, _DL_BECAUSE_MAX = 30, 900
 def _dl_norm(s):
     """One line, no control characters, no leading bullet. Entries are counted by
     a line prefix, so an entry containing a newline would be counted twice and
-    would break every future count including its own capacity gate."""
+    would break every future count including its own capacity gate.
+
+    Vertical tab and form feed are turned into a space like every other control
+    character, not dropped: the filter used to strip them BEFORE the map could
+    replace them, which silently welded the words on either side together
+    ('cap\\x0bwave' -> 'capwave') while the docstring's promise still held."""
     s = "".join(" " if ch in "\t\r\n\x0b\x0c" else ch
-                for ch in (s or "") if ch >= " " or ch in "\t\r\n")
+                for ch in (s or "") if ch >= " " or ch in "\t\r\n\x0b\x0c")
     s = " ".join(s.split())
     while s[:2] in ("- ", "* ") or s[:1] == "#":
         s = s.lstrip("-*# ").strip()
@@ -6798,16 +6870,98 @@ def _dl_wrap(text, width=94, indent="  "):
 
 
 def _dl_project_hits(field, value):
-    """[(rule, offending token)] — every project-specific signal in one field."""
+    """[(rule, offending token)] — every project-specific signal in one field.
+
+    Every hit must be TRUE of the token it names. A refusal that reports "a
+    ticket or defect identifier: 'UTF-8'" is not a strict gate, it is a wrong
+    answer delivered with a citation, and the author it is aimed at cannot fix
+    the thing it names because the thing is not there. So the two matchers whose
+    shape collides with ordinary technical vocabulary carry an explicit
+    exception list, and the exception is checked against the token the matcher
+    actually captured rather than against the sentence.
+    """
     hits = []
     for rule, rx in (("a machine or repo path", _DL_PATHY),
                      ("a URL, host or remote", _DL_URLY),
                      ("a product / service / API name (interior capital)", _DL_PROPER),
                      ("a ticket or defect identifier", _DL_TICKET)):
-        m = rx.search(value)
-        if m:
-            hits.append((field, rule, m.group(0)))
+        for m in rx.finditer(value):
+            tok = m.group(0)
+            if rx is _DL_TICKET and m.group(1).lower() in _DL_TICKET_OK:
+                continue                       # UTF-8, SHA-256, RFC-2119, GPT-4
+            if rx is _DL_PROPER and tok.lower() in _DL_PROPER_OK:
+                continue                       # macOS, JavaScript
+            hits.append((field, rule, tok))
+            break
     return hits
+
+
+def _dl_opener(s):
+    """The first word of `s`, stripped of markdown punctuation, lowercased."""
+    w = (s.strip().split(" ", 1)[0] if s and s.strip() else "").strip("*_`\"'(),.:;—-").lower()
+    return w if w.isalpha() else ""
+
+
+def _dl_is_participle(w):
+    """True when `w` is an -ed/-ing form that is not an imperative or a pronoun."""
+    return bool(w) and w not in _DL_IMPERATIVE_OK and (w.endswith("ing") or w.endswith("ed"))
+
+
+def _dl_imperative_fault(lesson):
+    """None when --lesson reads as a rule, else the one reason it does not.
+
+    The rule LEARNED.md states about itself is "write entries imperative and
+    specific"; the thing this refusal exists to stop is an entry that NARRATES —
+    "the merge queue was slower than expected all cycle" — because a future run
+    cannot obey a story. Four openings, four different questions:
+
+      "Never …" / "Always …"   an instruction. Accepted outright; refusing these
+                               was the original defect, and it refused them with
+                               the message "that is a report about what happened",
+                               which is false of every one of them.
+      "When …" / "Every …"     a clause. Accepted if it ARRIVES somewhere — an
+                               instruction after the comma ("When a worker goes
+                               quiet, probe it"), or a deontic ("Every ticket
+                               must carry a machine-checkable goal").
+      "The …" / "A …"          a subject. Refused only when the sentence also
+                               narrates; a standing claim ("A shared scratchpad
+                               path is not lane isolation") is a rule, and four
+                               of the eight entries the first real run wrote open
+                               exactly this way.
+      "Capping …"              a participle. Still refused — it is the one
+                               opening that is reliably a description of a
+                               practice rather than an instruction to follow it.
+    """
+    first = _dl_opener(lesson)
+    if not first:
+        return None
+    if first in _DL_IMPERATIVE_ADVERB:
+        return None
+    if first in _DL_NOT_IMPERATIVE:
+        if _DL_NARRATES.search(lesson):
+            return ("--lesson opens with %r and narrates in the past tense — that is a report "
+                    "about what happened. Open with the verb a future run should obey" % first)
+        return None
+    if first in _DL_CLAUSE_OPENER:
+        main = lesson.partition(",")[2]
+        m = _dl_opener(main)
+        # The main clause is judged by the same two questions as a top-level
+        # opening, so "When X, the persisted copies become stale" (a standing
+        # claim) passes and "When the queue was slow, the wave stalled" (a story)
+        # does not.
+        if m and not _dl_is_participle(m) and not (m in _DL_NOT_IMPERATIVE
+                                                   and _DL_NARRATES.search(lesson)):
+            return None
+        if _DL_DEONTIC.search(lesson):
+            return None
+        return ("--lesson opens with %r and never reaches an instruction — a clause is a rule "
+                "only once it says what to DO ('When a worker goes quiet, probe it with a "
+                "counter') or what MUST hold ('Every ticket must carry a frozen goal'). As "
+                "written it is a report" % first)
+    if _dl_is_participle(first):
+        return ("--lesson opens with %r — a participle, not an imperative. Open with "
+                "the verb a future run should obey" % first)
+    return None
 
 
 def _dl_validate(lesson, because, existing):
@@ -6830,14 +6984,9 @@ def _dl_validate(lesson, because, existing):
                    "facts. Name the ROLE it played, not the name it had"
                    % (f, rule, tok) for f, rule, tok in _dl_project_hits(field, value))
 
-    first = (lesson.split(" ", 1)[0] if lesson else "").strip("*_`\"'(),.:;").lower()
-    if first and first.isalpha():
-        if first in _DL_NOT_IMPERATIVE:
-            bad.append("--lesson opens with %r — that is a report about what happened. Open "
-                       "with the verb a future run should obey" % first)
-        elif first not in _DL_IMPERATIVE_OK and (first.endswith("ing") or first.endswith("ed")):
-            bad.append("--lesson opens with %r — a participle, not an imperative. Open with "
-                       "the verb a future run should obey" % first)
+    fault = _dl_imperative_fault(lesson)
+    if fault:
+        bad.append(fault)
 
     key = re.sub(r"[^a-z0-9]+", "", lesson.lower())
     if key:
@@ -6847,6 +6996,37 @@ def _dl_validate(lesson, because, existing):
                            "to merge duplicates, not to add one: %s" % _oneline(ln, 120))
                 break
     return bad
+
+
+_DL_STOP = frozenset("""
+    a an and are as at be been but by can for from had has have if in into is it
+    its not of on one only or our over so than that the their them then there
+    these they this those to two under until up was were what when where which
+    while who why will with would you your every each any all no most some three
+    do does did done doing about after before during other same such very just
+    also more much many both few less least than because since until yet still
+    """.split())
+
+
+def _dl_provenance(run_text, lesson):
+    """-> (n_present, [absent words]) for the lesson's distinctive words.
+
+    (None, []) when the lesson carries too few distinctive words to judge, which
+    is not a licence: the length floor in `_dl_validate` is what catches those.
+
+    This is the whole content of the provenance gate. It cannot prove the run
+    file's claim was TRUE — no mechanism here can — but it can prove the promoted
+    sentence has some relationship to what the run wrote down, which is the one
+    thing the previous line-count could not distinguish and the one thing the
+    gate's own comment claimed it did.
+    """
+    run_words = set(re.findall(r"[a-z0-9]+", run_text.lower()))
+    words = [w for w in dict.fromkeys(re.findall(r"[a-z0-9]+", lesson.lower()))
+             if len(w) >= 4 and w not in _DL_STOP]
+    if len(words) < 3:
+        return None, []
+    missed = [w for w in words if w not in run_words]
+    return len(words) - len(missed), missed
 
 
 class _learned_lock(object):
@@ -7010,19 +7190,31 @@ def cmd_distil(args):
         return
 
     # ---------------------------------------------------------------- tier 2
-    # Provenance first: distillation compresses something the run recorded. With
-    # an empty run file there is nothing to compress and the "lesson" is being
-    # invented at Termination, which is how a memory file fills with plausible
-    # sentences nobody learned. One tier-1 call satisfies this.
+    # Provenance: distillation COMPRESSES something the run recorded. The first
+    # version of this gate counted non-blank lines in the run file and never
+    # compared the promoted lesson to a byte of it, so a run file containing the
+    # single character `x` licensed any sentence at all — vacuous at exactly the
+    # thing it exists to do. It now measures the overlap it claims to.
     try:
-        run_lines = sum(1 for ln in open(lpath) if ln.strip()) if os.path.exists(lpath) else 0
+        run_text = open(lpath).read() if os.path.exists(lpath) else ""
     except OSError:
-        run_lines = 0
-    if run_lines == 0:
+        run_text = ""
+    if not run_text.strip():
         die("%s/%s is empty or absent — there is nothing to distil FROM, so this entry "
             "would be invented rather than learned. Record it in the run first:\n"
             "    swarmloop.py distil --lesson \"%s\" --because \"...\""
             % (STATE_DIR, LEARNINGS_MD, _oneline(lesson, 60)))
+    kept, missed = _dl_provenance(run_text, lesson)
+    if kept is not None and kept * 2 < kept + len(missed):
+        die("%s/%s does not contain this lesson — %d of its %d distinctive words appear "
+            "nowhere in what the run recorded, starting with %s. Distillation compresses "
+            "what a run learned; a lesson that shares no vocabulary with the run file was "
+            "written at Termination, not learned during it. Record it in the run first:\n"
+            "    swarmloop.py distil --lesson \"%s\" --because \"...\"\n"
+            "  (This measures textual overlap, which proves the lesson EXISTED as a run "
+            "artifact. It cannot prove the run artifact was true — nothing here can.)"
+            % (STATE_DIR, LEARNINGS_MD, len(missed), kept + len(missed),
+               ", ".join(repr(w) for w in missed[:5]), _oneline(lesson, 60)))
 
     if not os.path.exists(learned):
         die("%s not found at %s — this script is running from a copy outside the skill, so "

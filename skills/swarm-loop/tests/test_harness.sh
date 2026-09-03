@@ -3824,6 +3824,9 @@ ck_has "W48c-7 --help says being --merged proves nothing by itself" \
        "Being --merged proves nothing on its own"
 ck_has "W48c-7 --help names last-verdict-wins for the ledger" \
        "LAST verdict per ticket wins"
+
+
+# ===========================================================================
 # (y) DISTIL — the self-improvement loop's write half
 #
 # The loop was declared in SKILL.md from version one and nothing ever closed it:
@@ -3843,10 +3846,23 @@ REAL_LEARNED="$SCRIPT_DIR/../LEARNED.md"
 REAL_LEARNED_SHA="$(sha_of "$REAL_LEARNED")"
 
 mk_iso() {   # a pristine isolated skill: the real script, the real LEARNED.md
+  # ...with the ENTRY REGION EMPTIED. The preamble, the rules it states about
+  # itself and the '## Entries' marker are the installed file's own bytes,
+  # because those are what is under test. The entries are not: that file is
+  # machine-wide memory any run on this machine may append to at any moment, and
+  # a suite whose expected counts move when someone else distils goes red for a
+  # reason that is not a defect. (It did: the first real entries this file ever
+  # held arrived mid-session as '## ' headings.)
   rm -rf "$ISO"
   mkdir -p "$ISO/scripts"
   cp "$SL" "$ISO/scripts/swarmloop.py" || return 1
-  cp "$REAL_LEARNED" "$LM" || return 1
+  python3 - "$REAL_LEARNED" "$LM" <<'PY' || return 1
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+head, sep, _ = open(src).read().partition("## Entries")
+assert sep, "the installed LEARNED.md has lost its '## Entries' marker"
+open(dst, "w").write(head + sep + "\n")
+PY
   return 0
 }
 
@@ -3886,6 +3902,15 @@ print("yes" if sys.argv[2] in " ".join(open(sys.argv[1]).read().split()) else "n
 PY
 }
 
+prov() {   # prov <lesson> — make <lesson> part of what THIS run recorded
+  # Tier 2 promotes what tier 1 wrote down. Every --to-skill case below therefore
+  # has to put its lesson in the run file first, including the cases that assert
+  # a refusal: a case whose refusal comes from the provenance gate proves nothing
+  # about the rule it claims to be testing.
+  mkdir -p .swarm-loop
+  printf -- '- (cycle 0) **%s** - recorded during the run\n' "$1" >> .swarm-loop/learnings.md
+}
+
 # A lesson that must SURVIVE every rule: imperative, specific, motivated, and
 # carrying the harness's own vocabulary, which a lazier matcher would reject.
 GOOD_L="Commit the run state directory at every epoch boundary, never only at freeze"
@@ -3896,6 +3921,42 @@ mk_repo distil1
 mk_iso
 ck_file "(y) the isolated skill copy has a LEARNED.md" "$LM"
 ck "(y) and it starts with zero entries" "0" "$(n_entries)"
+
+# Every entry SHAPE this file has actually carried must count as one entry. The
+# reader knew '- ' bullets and '### ' headings; the first entries LEARNED.md ever
+# held were written by hand as '## ' headings with prose bodies, and the reader
+# scored eight of them as ZERO — `checkpoint` reported "EMPTY (0 entries) —
+# Termination is supposed to distil" over a file that had just been filled. A
+# count that is wrong about the file it exists to measure is the defect class
+# this whole command is against, so the three shapes are pinned here.
+python3 - "$LM" <<'PY'
+import sys
+open(sys.argv[1], "a").write("""
+- **Cap wave width at three when the batch shares build outputs** - a bullet, the
+  shape `distil` writes, wrapped across two lines
+
+### A third-level heading entry
+
+## A second-level heading entry, the shape the first real run wrote
+
+Its body is prose across several paragraphs, and none of it is a fourth entry.
+
+APPLY: nothing here opens an entry either.
+""")
+PY
+ck "(y) bullet + '###' + '##' all count as ONE entry each" "3" "$(n_entries)"
+# ...and the count of the INSTALLED file agrees with an independent count of its
+# openers, whatever shapes a curator happens to have used in it today.
+ck "(y) the reader's count of the real LEARNED.md matches its opener count" \
+   "$(python3 -c "
+import re,sys
+b=open('$REAL_LEARNED').read().split('## Entries',1)[-1]
+print(len(re.findall(r'^(?:- |### |## )', b, re.M)))")" \
+   "$(python3 -c "
+import os,sys
+sys.path.insert(0, os.environ['SL_DIR']); import swarmloop
+e,_=swarmloop._learned_entries(open('$REAL_LEARNED').read()); print(len(e))")"
+mk_iso
 
 sli distil --lesson "$GOOD_L" --because "$GOOD_B"
 ck_exit "(y) tier 1 appends without a flag — the safe tier is the default" 0 "$RC"
@@ -3911,9 +3972,26 @@ ck_has "(y) and the refusal says why a lesson needs its failure" "cannot be judg
 ck "(y) the run file did not grow on the refusal" "1" \
    "$(grep -c -F -- "(cycle 0)" .swarm-loop/learnings.md)"
 
+# `--cycle N` overrides the cycle read out of state.json — the only way an
+# orchestrator distilling a lesson about an EARLIER epoch can file it under the
+# epoch it came from rather than the one it is standing in.
+sli distil --cycle 7 --lesson "Probe a quiet worker with a counter that only grows when work lands" \
+  --because "a hung worker and a working one are indistinguishable from the orchestrator, and one wave spent an epoch on nothing"
+ck_exit "(y) --cycle N is accepted" 0 "$RC"
+ck "(y) ...and the entry is filed under the cycle it names, not state.json's" "1" \
+   "$(grep -c -F -- "(cycle 7)" .swarm-loop/learnings.md)"
+
 # The run file's ~30 cap is a WARNING, never a refusal: it is one repo's file,
 # curated by hand every epoch, and refusing mid-run loses the lesson itself.
+#
+# This CONTROL must read the output of a SUCCESSFUL under-cap append. It used to
+# sit after the exit-3 `--because` usage error above, which never reaches the
+# append path at all — so it asserted that a usage error prints no soft-cap
+# warning, the threshold had no red path anywhere in the suite, and firing the
+# warning unconditionally left every case green.
 ck_hasnt "(y) CONTROL: under the soft cap it says nothing about curating" "over SKILL.md Phase 8's"
+ck "(y) CONTROL: ...over an append that really happened, well under the cap" "2" \
+   "$(grep -c '^- (cycle ' .swarm-loop/learnings.md)"
 python3 - <<'PY'
 with open(".swarm-loop/learnings.md", "a") as f:
     for i in range(31):
@@ -3969,6 +4047,7 @@ ck_has "(y2) --list names the run file" ".swarm-loop/learnings.md"
 ck_has "(y2) --list names the skill memory" "iso-skill/LEARNED.md"   # normpath'd
 
 LM_SHA1="$(sha_of "$LM")"
+prov "Rebase an integration branch onto the base immediately before merging it"
 sli distil --to-skill --dry-run \
   --lesson "Rebase an integration branch onto the base immediately before merging it" \
   --because "two integration branches landed the same file twice because neither had been rebased"
@@ -3985,22 +4064,26 @@ LM_SHA="$(sha_of "$LM")"
 # Each of these is a signal that cannot be true of a durable orchestration
 # lesson. The refusal names the token, because "rejected" without the word is
 # not something the agent that wrote it can act on.
+prov "Pin the ProxyShop renderer before dispatching a wave that touches it"
 sli distil --to-skill --lesson "Pin the ProxyShop renderer before dispatching a wave that touches it" \
   --because "the renderer moved under three agents at once and each rebased onto a different tree"
 ck_exit "(y3) a product / service name is refused" 1 "$RC"
 ck_has "(y3) ...naming the offending token" "'ProxyShop'"
 ck_has "(y3) ...and saying how to fix it" "Name the ROLE it played"
 
+prov "Reuse the venv at /Users/dev/app/.venv instead of building one per worktree"
 sli distil --to-skill --lesson "Reuse the venv at /Users/dev/app/.venv instead of building one per worktree" \
   --because "each worktree rebuilt a two-minute environment and the wave took longer to provision than to run"
 ck_exit "(y3) a machine path is refused" 1 "$RC"
 ck_has "(y3) ...named as a path" "a machine or repo path"
 
+prov "Push the run branch to the mirror at labs.example.com before the final report"
 sli distil --to-skill --lesson "Push the run branch to the mirror at labs.example.com before the final report" \
   --because "the only offsite copy of a nine-hour run lived on one laptop until the last push"
 ck_exit "(y3) a host or URL is refused" 1 "$RC"
 ck_has "(y3) ...named as a host" "a URL, host or remote"
 
+prov "Schedule T-036 ahead of anything that imports the registry it creates"
 sli distil --to-skill --lesson "Schedule T-036 ahead of anything that imports the registry it creates" \
   --because "the dependent tickets all failed red-check because the enabler had not landed yet"
 ck_exit "(y3) a ticket identifier is refused" 1 "$RC"
@@ -4014,21 +4097,25 @@ mk_iso
 sli distil --lesson "$GOOD_L" --because "$GOOD_B"     # satisfy provenance
 LM_SHA="$(sha_of "$LM")"
 
+prov "the merge queue was slower than expected all cycle"
 sli distil --to-skill --lesson "the merge queue was slower than expected all cycle" \
   --because "waves four and five each waited on a review that nobody had been assigned to do"
 ck_exit "(y4) a report-shaped opening is refused" 1 "$RC"
 ck_has "(y4) ...named as non-imperative" "that is a report about what happened"
 
+prov "Capping wave width at three keeps merge review survivable"
 sli distil --to-skill --lesson "Capping wave width at three keeps merge review survivable" \
   --because "wave five collided on shared build outputs and two merges had to be redone by hand"
 ck_exit "(y4) a participle opening is refused" 1 "$RC"
 ck_has "(y4) ...named as a participle" "a participle, not an imperative"
 
+prov "Cap wave width at three or fewer tickets when the batch shares build outputs"
 sli distil --to-skill --lesson "Cap wave width at three or fewer tickets when the batch shares build outputs" \
   --because "it was slow"
 ck_exit "(y4) a stub motivation is refused" 1 "$RC"
 ck_has "(y4) ...named as too short to judge" "it is a stub"
 
+prov "Cap it"
 sli distil --to-skill --lesson "Cap it" --because "$GOOD_B"
 ck_exit "(y4) a stub lesson is refused" 1 "$RC"
 
@@ -4036,6 +4123,7 @@ ck "(y4) not one malformed entry wrote a byte" "$LM_SHA" "$(sha_of "$LM")"
 
 # CONTROL: the near-miss. Each of the four refusals above must be a property of
 # the entry, not of a validator that refuses everything it is shown.
+prov "Cap wave width at three or fewer tickets when the batch shares build outputs"
 sli distil --to-skill --lesson "Cap wave width at three or fewer tickets when the batch shares build outputs" \
   --because "wave five collided on shared build outputs and two merges had to be redone by hand"
 ck_exit "(y4) CONTROL: the corrected entry is accepted" 0 "$RC"
@@ -4044,6 +4132,7 @@ ck "(y4) CONTROL: and it landed" "1" "$(n_entries)"
 # Curation is a rule LEARNED.md states about itself: merge duplicates, do not
 # add one. The check reads whole entry BLOCKS, so a lesson that only wrapped
 # differently is still recognised as the same lesson.
+prov "Cap wave width at three or fewer tickets when the batch shares build outputs"
 sli distil --to-skill --lesson "Cap wave width at three or fewer tickets when the batch shares build outputs" \
   --because "an entirely different failure text, so only the lesson itself collides with what is there"
 ck_exit "(y4) a duplicate lesson is refused" 1 "$RC"
@@ -4055,6 +4144,7 @@ ck "(y4) and the file still holds exactly one" "1" "$(n_entries)"
 # of this one and lets the second copy in — which is what the block folding in
 # _learned_entries is for, and the only case that can tell.
 LONG_L="Rebase every integration branch onto the base branch immediately before merging it and never after"
+prov "$LONG_L"
 sli distil --to-skill --lesson "$LONG_L" \
   --because "two integration branches landed the same file twice because neither had been rebased first"
 ck_exit "(y4) a lesson long enough to WRAP is accepted once" 0 "$RC"
@@ -4064,6 +4154,7 @@ import sys
 t = open('$LM').read()
 i = t.index('Rebase every integration branch')
 print('yes' if '\n' in t[i:i+len('$LONG_L')] else 'NO')")"
+prov "$LONG_L"
 sli distil --to-skill --lesson "$LONG_L" \
   --because "a different failure text entirely, so only the wrapped lesson itself collides"
 ck_exit "(y4) the wrapped duplicate is refused too" 1 "$RC"
@@ -4076,6 +4167,7 @@ sli distil --lesson "$GOOD_L" --because "$GOOD_B"     # satisfy provenance
 fill_learned 39
 ck "(y5) the copy now holds 39 entries" "39" "$(n_entries)"
 
+prov "Kill a wave that has produced no commit by its second checkpoint"
 sli distil --to-skill --lesson "Kill a wave that has produced no commit by its second checkpoint" \
   --because "a hung worker and a working one look identical from the orchestrator and the run spent an epoch on nothing"
 ck_exit "(y5) the append that FILLS the file still succeeds" 0 "$RC"
@@ -4084,6 +4176,7 @@ ck_has "(y5) ...telling it to stop and tell the user" "STOP AND TELL THE USER"
 ck "(y5) 40 entries now" "40" "$(n_entries)"
 
 LM_SHA="$(sha_of "$LM")"
+prov "Run the frozen metric commands from the primary checkout only"
 sli distil --to-skill --lesson "Run the frozen metric commands from the primary checkout only" \
   --because "a worktree copy of the harness measured a tree that had never been merged and the verdict was fiction"
 ck_exit "(y5) the 41st entry is REFUSED" 1 "$RC"
@@ -4166,6 +4259,247 @@ swarmloop._dl_append(p, open(p, "rb").read(),
                      b"base** - merged into an integration branch is not landed\n")
 PY
 ck "(y6) CONTROL: with the bytes it read, the append lands" "1" "$(n_entries)"
+
+# ---------------------------------------------------------------------------
+# (y7) THE FALSE-REFUSAL DIRECTION
+#
+# Every case above this point asks "does the gate refuse what it should?". None
+# asked "does it ACCEPT what it should?", and measured against ground truth the
+# answer was no: the validator refused 13 of the 20 entries in this skill's own
+# hand-curated archive and 6 of the 8 the first real run ever wrote — including
+# "Never ..." and "Always ...", the two commonest shapes a rule takes, with the
+# message "that is a report about what happened", which is false of both.
+#
+# A gate that refuses the correct form does not teach the form. It teaches
+# writing around the gate, and SKILL.md tells the agent every refusal "is the
+# gate working, not an obstacle to route around" — so the agent that hits a
+# false refusal mangles a correct lesson rather than reporting the bug. Each
+# case below is one canonical form that MUST be accepted, and each goes red if
+# its matcher regresses.
+# ---------------------------------------------------------------------------
+section "(y7) distil --to-skill must ACCEPT the correct forms  [repo: distil7]"
+mk_repo distil7
+mk_iso
+ACC_B="a run ended with an unverifiable claim because nobody had measured the thing the claim was about"
+
+accept_() {   # accept_ <name> <lesson> — must validate; --dry-run writes nothing
+  prov "$2"
+  sli distil --to-skill --dry-run --lesson "$2" --because "$ACC_B"
+  ck_exit "$1" 0 "$RC"
+}
+refuse_() {   # refuse_ <name> <lesson> <fragment the refusal must name>
+  prov "$2"
+  sli distil --to-skill --dry-run --lesson "$2" --because "$ACC_B"
+  ck_exit "$1 — refused" 1 "$RC"
+  ck_has "$1 — for the stated reason" "$3"
+}
+
+# F1: the imperative forms. "Never do X" IS the verb a future run should obey.
+accept_ "(y7) 'Never ...' is an imperative, not a report" \
+        "Never merge an integration branch that has not been rebased onto the base first"
+accept_ "(y7) 'Always ...' likewise" \
+        "Always re-measure a metric from the primary checkout before believing a worktree's number"
+# ...and both are still imperatives when the rule NAMES the past failure inside
+# itself, which is exactly where the report test and the imperative form collide.
+accept_ "(y7) 'Never ...' even when the rule mentions what went wrong" \
+        "Never dispatch a lane against a base that was rewritten after its packet was written"
+accept_ "(y7) 'Always ...' even when the rule mentions what went wrong" \
+        "Always re-pin a branch tip that was measured while its worktree was still dirty"
+accept_ "(y7) 'When X, do Y' — a conditional imperative" \
+        "When a worker goes quiet, probe it with a counter that only grows as real work lands"
+accept_ "(y7) 'If X, do Y' likewise" \
+        "If a graded metric has not moved for two measured cycles, kill the wave rather than extend it"
+accept_ "(y7) 'Every X must ...' — a deontic rule" \
+        "Every ticket must carry a machine-checkable goal frozen before it is dispatched"
+accept_ "(y7) 'One X per Y, and never ...' — a quantifier rule" \
+        "One agent per file scope, and never two agents mutating one worktree at any depth"
+accept_ "(y7) a standing claim opening with an article is a rule, not a story" \
+        "A shared scratchpad path is not lane isolation and inherits none of a worktree's guarantees"
+
+# ...and the refusals that direction must NOT cost. A story is still a story.
+refuse_ "(y7) a past-tense story opening with an article" \
+        "the merge queue was slower than every estimate we made all cycle long" \
+        "narrates in the past tense"
+refuse_ "(y7) a clause that never arrives at an instruction" \
+        "When the merge queue was slow the whole wave sat behind one unassigned review" \
+        "never reaches an instruction"
+refuse_ "(y7) a participle opening still reads as a description" \
+        "Capping wave width at three keeps merge review survivable across a long epoch" \
+        "a participle, not an imperative"
+
+# F6: ordinary technical vocabulary is not project trivia, and a refusal that
+# names the WRONG rule sends the author to fix something that is not there.
+accept_ "(y7) an encoding is not a ticket identifier" \
+        "Decode every captured log as UTF-8 with replacement before matching a pattern against it"
+accept_ "(y7) a digest algorithm is not a ticket identifier" \
+        "Compare build artifacts by SHA-256 digest rather than by mtime when deciding staleness"
+accept_ "(y7) a script filename is not a host" \
+        "Run the whole gate with tests/run.sh before declaring any phase of the work complete"
+accept_ "(y7) the platform the loop runs on is not a product fact" \
+        "Give the orchestrator a macOS-independent progress probe so the same loop runs anywhere"
+# CONTROL: the exception lists are exceptions, not an opt-out of the rule.
+refuse_ "(y7) CONTROL: a real ticket key is still refused" \
+        "Schedule T-036 ahead of anything that imports the registry that ticket creates" \
+        "a ticket or defect identifier"
+refuse_ "(y7) CONTROL: a real host is still refused" \
+        "Push the run branch to the mirror at labs.example.com before writing the final report" \
+        "a URL, host or remote"
+refuse_ "(y7) CONTROL: a real product name is still refused" \
+        "Pin the ProxyShop renderer before dispatching any wave that touches it" \
+        "interior capital"
+
+# F7: the -ed/-ing allowlist exists ONLY to prevent false refusals, and had no
+# case of its own. Two classes live in it: imperative verbs spelled like
+# participles, and pronouns that are not verbs at all.
+accept_ "(y7) an imperative verb spelled like a participle is accepted" \
+        "Seed every worktree with the run state directory before the first dispatch reaches it"
+accept_ "(y7) ...and so is a pronoun that merely ends in -ing" \
+        "Nothing calls this is a defect only when a frozen test already passes because of it"
+
+# F7: the over-length ceiling. The archived corpus contains an 1138-character
+# --because the ceiling exists to catch, and nothing exercised it.
+prov "Bound every metric command with a timeout a hung runner cannot outlive"
+sli distil --to-skill --dry-run \
+  --lesson "Bound every metric command with a timeout a hung runner cannot outlive" \
+  --because "$(python3 -c "print('a runner that hangs forever reads as a metric that never improves, and ' * 14)")"
+ck_exit "(y7) a --because over the ceiling is refused" 1 "$RC"
+ck_has "(y7) ...told it belongs in the final report" "belongs in the final report"
+sli distil --to-skill --dry-run \
+  --lesson "Bound every metric command with a timeout a hung runner cannot outlive" \
+  --because "$(python3 -c "print('a' * 899)")"
+ck_exit "(y7) CONTROL: one character under the ceiling is accepted" 0 "$RC"
+
+# F2: the provenance gate. It counted non-blank lines in the run file and never
+# compared the promoted lesson to a byte of it — so a run file holding the single
+# character 'x' licensed any sentence at all, which is the one thing the gate
+# exists to stop. It now measures the overlap it claims to.
+section "(y8) distil --to-skill provenance is a COMPARISON  [repo: distil8]"
+mk_repo distil8
+mk_iso
+mkdir -p .swarm-loop
+printf 'x\n' > .swarm-loop/learnings.md
+LM_SHA="$(sha_of "$LM")"
+sli distil --to-skill --lesson "Cap wave width at three tickets whenever the batch shares any build output" \
+  --because "an entirely fabricated failure that appears nowhere in the run file this gate distils from"
+ck_exit "(y8) a lesson the run file never mentions is REFUSED" 1 "$RC"
+ck_has "(y8) ...saying its words appear nowhere in the run" "nowhere in what the run recorded"
+ck_has "(y8) ...and naming one of them" "'wave'"
+ck "(y8) and nothing was written" "$LM_SHA" "$(sha_of "$LM")"
+# CONTROL: the same lesson, once the run has actually recorded it.
+prov "Cap wave width at three tickets whenever the batch shares any build output"
+sli distil --to-skill --lesson "Cap wave width at three tickets whenever the batch shares any build output" \
+  --because "two lanes in one wave collided on a shared build output and both merges had to be redone"
+ck_exit "(y8) CONTROL: recorded in the run first, the same lesson lands" 0 "$RC"
+ck "(y8) ...and it really landed" "1" "$(n_entries)"
+# CONTROL: distillation may GENERALISE. Half the distinctive words is the bar,
+# not verbatim recall, or the gate would forbid the compression it is named for.
+sli distil --to-skill \
+  --lesson "Cap wave width whenever a batch shares any build output between its tickets" \
+  --because "a generalisation of what the run recorded is still a distillation of it, not an invention"
+ck_exit "(y8) CONTROL: a reworded distillation of a recorded lesson is accepted" 0 "$RC"
+
+# F4/F5/F7/F8: the writer's mechanics, each of which had no red path.
+section "(y9) the writer's mechanics  [repo: distil9]"
+mk_repo distil9
+mk_iso
+
+# APPEND-ONLY, tested as append-only. The prefix assertion in (y2) catches a
+# rewrite that LOSES content; it does not catch a read-modify-write that
+# reproduces the same bytes, and a truncate-and-rewrite passed it. What
+# O_APPEND actually buys is that a concurrent appender's bytes are still there
+# afterwards — so this interleaves one, between the compare-and-swap's read and
+# the write, and asserts it survived.
+CONC_OUT=$(python3 - "$LM" 2>&1 <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["SL_DIR"])
+import swarmloop
+p = sys.argv[1]
+FOREIGN = (b"\n- **Retire a worktree only once its branch is an ancestor of the base** - "
+           b"a second process appended this between the read and the write\n")
+real_open, fired = open, []
+
+class _Racer(object):
+    """Appends FOREIGN after the CAS has read the file and before it writes."""
+    def __init__(self, f, path):
+        self.f, self.path = f, path
+    def read(self, *a):
+        data = self.f.read(*a)
+        if not fired:
+            fired.append(1)
+            with real_open(self.path, "ab") as g:
+                g.write(FOREIGN)
+        return data
+    def __getattr__(self, n):
+        return getattr(self.f, n)
+
+def hooked(path, mode="r", *a, **k):
+    f = real_open(path, mode, *a, **k)
+    return _Racer(f, path) if mode == "rb" else f
+
+seen = real_open(p, "rb").read()
+swarmloop.open = hooked
+try:
+    swarmloop._dl_append(p, seen, b"\n- **Cap wave width at three when a batch shares build "
+                                  b"outputs** - the entry this call was asked to write\n")
+finally:
+    swarmloop.open = real_open
+now = real_open(p, "rb").read()
+print("foreign=%s ours=%s prefix=%s"
+      % (b"a second process appended this" in now,
+         b"the entry this call was asked to write" in now,
+         now.startswith(seen)))
+PY
+)
+ck "(y9) a concurrent appender's bytes SURVIVE the append" \
+   "foreign=True ours=True prefix=True" "$CONC_OUT"
+
+# The trailing-newline branch: a file whose last byte is not \n must not have
+# the new entry welded onto the end of the old one.
+mk_iso
+python3 - "$LM" <<'PY'
+import sys
+p = sys.argv[1]
+open(p, "a").write("- **Kill a wave that produced no commit by its second checkpoint** - no newline")
+PY
+python3 - "$LM" >/dev/null 2>&1 <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["SL_DIR"])
+import swarmloop
+p = sys.argv[1]
+swarmloop._dl_append(p, open(p, "rb").read(),
+                     b"- **Rebase an integration branch immediately before merging it** - x\n")
+PY
+ck "(y9) an append onto a file with no trailing newline does not weld two entries" "2" \
+   "$(n_entries)"
+
+# The STALE-LOCK BREAKER — the only escape from a machine-wide wedge. This lock
+# REFUSES after its timeout rather than proceeding, so an orphaned lockfile left
+# by a SIGKILLed run blocks `distil --to-skill` for every future run on this
+# machine until the staleness check clears it. (y6) proves the refusal; nothing
+# proved the recovery, and disabling the breaker was invisible to the whole suite.
+mk_iso
+sli distil --lesson "$GOOD_L" --because "$GOOD_B"
+python3 - "$LM.lock" <<'PY'
+import os, sys, time
+p = sys.argv[1]
+open(p, "w").write("999999\n")          # an orphan: the pid is long gone
+old = time.time() - 100000              # ...and far older than the 120s ceiling
+os.utime(p, (old, old))
+PY
+ck_file "(y9) an orphaned lockfile is in place" "$LM.lock"
+sli distil --to-skill --lesson "$GOOD_L" --because "$GOOD_B"
+ck_exit "(y9) a STALE lock is broken and the append proceeds" 0 "$RC"
+ck "(y9) ...and the entry really landed" "1" "$(n_entries)"
+ck_nofile "(y9) ...and the orphan lockfile is gone" "$LM.lock"
+
+# Normalisation: \x0b and \x0c were DROPPED rather than replaced, silently
+# welding the words on either side of them together.
+ck "(y9) a vertical tab becomes a space, it does not weld two words together" \
+   "cap wave width" \
+   "$(python3 -c "
+import os, sys
+sys.path.insert(0, os.environ['SL_DIR']); import swarmloop
+print(swarmloop._dl_norm('cap\x0bwave\x0cwidth'))")"
 
 # The suite's own blast radius. Every case above ran an isolated copy; if any one
 # of them ever reaches the INSTALLED skill's memory instead, this goes red.
