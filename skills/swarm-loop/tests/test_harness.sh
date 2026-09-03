@@ -6683,6 +6683,41 @@ ck_has "V4 ...and is counted as surviving collection" \
 ck_hasnt "V4 ...with no rootdir story invented to explain it" \
          "rootdir/path-shape difference"
 
+# THE STAMP CARRIES THE PROBE'S ANSWER. Without it, a `red` stamped over a gate
+# whose grading tests could not be collected at all is byte-identical IN THE
+# LEDGER to a `red` whose grading tests were observed running — and the merge
+# gate reads the ledger, not the terminal that printed the difference.
+echo importerr > FAKE_MODE
+gq add -A; gq commit -qm importerr2
+# The branch is built BEFORE red-check runs: red-check leaves an UNCOMMITTED
+# .swarm-loop/redcheck.jsonl, and `git add -A` after it carries orchestrator
+# state onto the branch, which check-branch vetoes for an entirely different rule.
+gq checkout -b task/T-1 -q
+echo w > a.txt; gq add -A; gq commit -qm t1
+gq checkout main -q
+sl red-check --close --ticket T-1
+ck "V4 the stamp records what the PROBE said, not only the verdict" "uncollectable" \
+   "$(python3 -c 'import json;print(json.loads(open(".swarm-loop/redcheck.jsonl").read().splitlines()[-1]).get("selection"))')"
+sl check-branch --branch task/T-1 --ticket T-1
+ck_exit "V4 ...and an unverified red still CLEARS the branch (never a veto)" 0 "$RC"
+ck_has "V4 ...but the merge gate says the red was never confirmed" \
+       "the probe did NOT positively observe"
+# The CONTROL needs its own lane: the gate reports the last `red` stamp whose
+# base is an ancestor of THIS branch's fork point, and task/T-1 forked before
+# the ok-mode run, so it would keep reporting the uncollectable stamp above.
+echo ok > FAKE_MODE
+gq add -A; gq commit -qm ok2
+gq checkout -b task/T-1b -q
+echo w2 > b.txt; gq add -A; gq commit -qm t1b
+gq checkout main -q
+sl red-check --close --ticket T-1
+ck "V4 CONTROL: a probe that DID observe the tests stamps selection ok" "ok" \
+   "$(python3 -c 'import json;print(json.loads(open(".swarm-loop/redcheck.jsonl").read().splitlines()[-1]).get("selection"))')"
+sl check-branch --branch task/T-1b --ticket T-1
+ck_exit "V4 CONTROL: ...and that branch clears too" 0 "$RC"
+ck_hasnt "V4 CONTROL: ...and the merge gate adds no caveat to it" \
+         "the probe did NOT positively observe"
+
 # The `empty` verdict used to be unreachable: it was gated on PYTEST_SHAPE_RE,
 # which deliberately does not match "no tests collected". Keyed off exit 5 it is
 # reachable under real pytest (measured: a conftest `pytest_collection_modifyitems`

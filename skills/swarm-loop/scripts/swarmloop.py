@@ -2680,6 +2680,22 @@ def _redcheck_gate(root, d, tid, base, branch, fork):
         print(f"red-check: {tid} was RED at {str(last.get('base_sha'))[:12]} "
               f"({last.get('timestamp')}, {last.get('mode')}) — an ancestor of this "
               "branch's merge parent")
+        # ADVISORY, never a veto, and the reason it exists: a `red` stamped over
+        # a gate whose grading tests could not be COLLECTED at all reads, in the
+        # ledger, exactly like a `red` whose grading tests were observed running.
+        # The terminal that printed the difference is long gone by the time this
+        # gate runs; the stamp is what survives, so the stamp has to carry it.
+        sel = str(last.get("selection") or "")
+        if sel and sel != "ok":
+            print(f"  ADVISORY — that red was stamped with selection `{sel}`: the probe did "
+                  "NOT positively observe this ticket's own frozen tests being collected at "
+                  "that base, so the red is unverified rather than confirmed. It is not a "
+                  "finding either — the commonest causes are a ticket with no "
+                  "`@pytest.mark.ticket` grading test (`unknown`) and a throwaway worktree "
+                  "with no venv (`uncollectable`). Read the gate before you rely on it.")
+        elif not sel:
+            print("  (that stamp carries no selection field — written before red-check "
+                  "recorded one, so what its gate actually selected is not on file)")
         return False
     # `_is_ancestor` returns None when git cannot answer — a rewritten history, a
     # sha that no longer exists. Its own contract is that unknown must keep a
@@ -6346,7 +6362,7 @@ def cmd_red_check(args):
             cmd = (idx[tid].get("verify") or "").strip()
             if not cmd:
                 nogate.append(tid)
-                stamps.append((tid, "no-gate", cmd))
+                stamps.append((tid, "no-gate", cmd, None))
                 print(f"  {tid:<9} NO GATE — the ticket declares no 'verify' command")
                 continue
             wt = os.path.join(tmpbase, tid)
@@ -6360,7 +6376,7 @@ def cmd_red_check(args):
                 # provisioning failure read exactly like a ticket that had been
                 # checked and passed. An unchecked gate is not a checked one.
                 skipped.append(tid)
-                stamps.append((tid, "skipped", cmd))
+                stamps.append((tid, "skipped", cmd, None))
                 print(f"  {tid:<9} SKIPPED — could not create a worktree, so this "
                       "ticket's gate was NEVER CHECKED: "
                       + (add.stderr or "").strip()[:160])
@@ -6391,7 +6407,7 @@ def cmd_red_check(args):
                 if proc.returncode == 0:
                     if is_bootstrap:
                         bootstrap.append(tid)
-                        stamps.append((tid, "bootstrap", cmd))
+                        stamps.append((tid, "bootstrap", cmd, None))
                         print(f"  {tid:<9} BOOTSTRAP — `{cmd}` exits 0 on an empty tree, "
                               "and for this ticket that IS the outcome: a green pipeline "
                               "over an empty suite" + (f" ({note})" if note else ""))
@@ -6400,20 +6416,20 @@ def cmd_red_check(args):
                               "smoke test is still graded by freeze's coverage gate.")
                         continue
                     vacuous.append(tid)
-                    stamps.append((tid, "vacuous", cmd))
+                    stamps.append((tid, "vacuous", cmd, None))
                     print(f"  {tid:<9} VACUOUS — `{cmd}` EXITS 0 with nothing implemented"
                           + (f" ({note})" if note else ""))
                     continue
                 if not n:
                     if is_bootstrap:
                         bootstrap.append(tid)
-                        stamps.append((tid, "bootstrap", cmd))
+                        stamps.append((tid, "bootstrap", cmd, None))
                         print(f"  {tid:<9} BOOTSTRAP — exit {proc.returncode} with no tests "
                               "SELECTED, which is the pre-build shape of a pipeline that has "
                               "nothing to run yet; the graph says `bootstrap: true`")
                         continue
                     weak.append(tid)
-                    stamps.append((tid, "weak", cmd))
+                    stamps.append((tid, "weak", cmd, None))
                     print(f"  {tid:<9} WEAK — exit {proc.returncode}, but NO tests were "
                           f"SELECTED: `{cmd}` proves nothing about this ticket either way")
                     continue
@@ -6494,12 +6510,17 @@ def cmd_red_check(args):
                              f"`check-branch --ticket {tid}` will REFUSE at merge"))
                     if not args.close:
                         pre_dispatch_stamped.append((tid, verdict))
-                stamps.append((tid, verdict, cmd))
+                # The PROBE'S OWN ANSWER travels with the verdict. Without it a
+                # `red` stamped over a gate whose grading tests could not be
+                # collected at all is byte-identical, in the ledger, to a `red`
+                # whose grading tests were observed running — and the merge gate
+                # reads the ledger, not this terminal.
+                stamps.append((tid, verdict, cmd, pv))
                 for line in extra:
                     print("            " + line)
             except subprocess.TimeoutExpired:
                 weak.append(tid)
-                stamps.append((tid, "weak", cmd))
+                stamps.append((tid, "weak", cmd, None))
                 print(f"  {tid:<9} WEAK — `{cmd}` timed out after {args.timeout}s")
             finally:
                 _git(root, "worktree", "remove", "--force", wt)
@@ -6516,7 +6537,7 @@ def cmd_red_check(args):
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
     _append_redcheck(d, [{"ticket": t, "verdict": v, "base": base, "base_sha": base_sha,
                           "cmd": c, "mode": "close" if args.close else "pre-dispatch",
-                          "timestamp": now} for t, v, c in stamps])
+                          "selection": sv, "timestamp": now} for t, v, c, sv in stamps]) 
 
     print("")
     print(f"red-check: {len(red)} real · {len(vacuous)} VACUOUS · {len(weak)} weak · "
@@ -10139,7 +10160,9 @@ def main():
 
     s = sub.add_parser("red-check", help="prove each ticket's verify command FAILS before it "
                                          "is built (exit 1 on VACUOUS, WEAK, NO GATE or "
-                                         "SKIPPED — exit 0 means every gate is real)")
+                                         "SKIPPED — exit 0 means every gate is real; a ticket "
+                                         "carrying `bootstrap: true` in the graph is exempt "
+                                         "from must-go-red and from nothing else)")
     s.add_argument("--ticket", action="append", default=None, metavar="IDS",
                    help="repeatable, comma-separated (default: every ticket in the graph)")
     s.add_argument("--graph", default=None, metavar="PATH")
@@ -10154,10 +10177,16 @@ def main():
     s.add_argument("--close", action="store_true",
                    help="CLOSE-TIME retro-check: point --base at the ticket's merge parent and "
                         "ask 'was this gate red immediately before this work landed?'. Turns the "
-                        "two selection findings (SWALLOWED, DESELECTED) from advisories into "
-                        "refusals. Never pass it on the pre-dispatch path: those findings can be "
-                        "wrong on a custom runner, and a false refusal there stops a ticket that "
-                        "has nothing wrong with it.")
+                        "selection findings (SWALLOWED, DESELECTED, MISSING, collected-NONE) "
+                        "from advisories into refusals. UNVERIFIED (a collect-only run that hit "
+                        "a collection error) and FORCED stay advisory in both modes. Never pass "
+                        "--close on the pre-dispatch path: those findings can be wrong on a "
+                        "custom runner, and a false refusal there stops a ticket that has "
+                        "nothing wrong with it. NOTE that the classification is the same either "
+                        "way — without --close the ticket is COUNTED red and exits 0, but the "
+                        "stamp still records the finding and check-branch --ticket still reads "
+                        "it, so a selection finding at dispatch is a merge veto in waiting and "
+                        "is now printed as one.")
     s.set_defaults(func=cmd_red_check)
 
     s = sub.add_parser("reads", help="read edges the ticket graph does not declare, and the "
