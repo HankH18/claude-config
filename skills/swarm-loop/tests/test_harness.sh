@@ -2782,6 +2782,144 @@ ck_exit "BC: status is unchanged by the new optional keys" 0 "$RC"
 
 
 # ===========================================================================
+# --scratch-root · the per-lane scratch directory is RECORDED, never guessed
+#
+# Every parallel agent in a wave used to be handed the SAME scratch path with
+# nothing anywhere saying it was shared. Two agents wrote a probe script at the
+# same filename and one of them executed it with ANOTHER agent's worktree as its
+# working directory; it died on a path that did not exist, which was luck rather
+# than design. The same collision against a live path is one lane's script
+# mutating another lane's tree — exactly what the worktrees exist to prevent.
+#
+# Each lane now gets <scratch-root>/<task-id>/, and the ROOT is recorded for the
+# same reason --worktree-root is: a run that never recorded where its
+# directories lived resumed, reported ZERO live worktrees, and re-dispatched
+# every in-flight ticket into a second set of trees. These cases mirror the
+# worktree-root ones one for one.
+# ===========================================================================
+section "--scratch-root: recorded, printed, never enforced  [repo: rscratch]"
+mk_repo rscratch
+sl init --max-cycles 6 --force --scratch-root ../rscratch-scratch
+ck_exit "init accepts --scratch-root" 0 "$RC"
+ck "the scratch root is recorded in state.json" "../rscratch-scratch" \
+   "$(jget .swarm-loop/state.json "d['scratch_root']")"
+ck_hasnt "a scratch root OUTSIDE the repo draws no warning" "is INSIDE the measured repo"
+
+sl resume
+ck_exit "resume runs with a recorded scratch root" 0 "$RC"
+ck_has "resume prints the scratch root the lanes were handed" "rscratch-scratch"
+ck_has "...and the per-lane subdivision, so nobody has to infer it" \
+       "one subdirectory per task id: <root>/<task-id>/"
+ck_has "...and states the limit instead of implying enforcement" \
+       "RECORDED, never enforced"
+ck_has "...naming what the harness structurally cannot see" \
+       "nothing here observes the inside of a lane's turn"
+
+sl status
+ck_exit "status runs with a recorded scratch root" 0 "$RC"
+ck "status carries the raw value machine-readably" "../rscratch-scratch" \
+   "$(jget "$OUT" "d['scratch_root']")"
+ck "...and its prose says the path is never enforced" "True" \
+   "$(jget "$OUT" "'never enforced' in d['lane_scratch']")"
+
+# --force resets the RUN; it may not silently relocate the lanes' scratch
+# directories any more than it may relocate their worktrees.
+sl init --max-cycles 6 --force
+ck_exit "init --force with no --scratch-root" 0 "$RC"
+ck "--force CARRIES the scratch root forward (never silently dropped)" "../rscratch-scratch" \
+   "$(jget .swarm-loop/state.json "d['scratch_root']")"
+
+# --- an in-repo scratch root WARNS. A warning is not a refusal --------------
+# The cost is not visible from the flag: metric commands run with cwd = the repo
+# root, so a scratch dir inside the repo sits in every tree-walking command's
+# scan. A file-count metric once read 1, then 4, then 10 purely as lane
+# directories appeared, and analyze scored that as a regression.
+sl init --max-cycles 6 --force --scratch-root .swarm-loop/scratch
+ck_exit "an in-repo scratch root is WARNED about, never refused" 0 "$RC"
+ck_has "...the warning names the problem" "is INSIDE the measured repo"
+ck_has "...and why it costs a METRIC, not merely tidiness" \
+       "every tree-walking command's search path"
+ck_has "...and that the exclusions freeze at cycle 0, so it cannot be fixed later" \
+       "Phase 2 freezes those exclusions at cycle 0"
+ck_has "...and says out loud that it was recorded anyway" "Recorded anyway."
+ck "...and it really is recorded" ".swarm-loop/scratch" \
+   "$(jget .swarm-loop/state.json "d['scratch_root']")"
+ck "...and is gitignored, exactly like an in-repo worktree root" "1" \
+   "$(grep -c '^\.swarm-loop/scratch/$' .gitignore | tr -d ' ')"
+
+# ===========================================================================
+# The flag is OPTIONAL. A run that never names one must behave EXACTLY as it did
+# before the flag existed: no new key written, nothing downstream requiring it,
+# and the unset case reported as a stated answer rather than a blank line — the
+# operator has to be able to tell "the lanes shared one directory" apart from
+# "nobody wrote down whether they did".
+# ===========================================================================
+section "--scratch-root omitted: no key, and UNRECORDED said out loud  [repo: rscr2]"
+mk_repo rscr2
+ck "init without --scratch-root writes NO scratch_root key at all" "False" \
+   "$(jget .swarm-loop/state.json "'scratch_root' in d")"
+sl resume
+ck_exit "resume runs with no scratch root recorded" 0 "$RC"
+ck_has "resume says UNRECORDED rather than printing a blank" "lane scratch    : UNRECORDED"
+ck_has "...and names what cannot be concluded from it" "is not knowable from here"
+ck_hasnt "...without a traceback" "Traceback"
+sl status
+ck_exit "status runs with no scratch root recorded" 0 "$RC"
+ck "status reports it null, machine-readably" "None" \
+   "$(jget "$OUT" "d['scratch_root']")"
+ck "...and its prose leads with UNRECORDED, not 'no scratch was used'" "True" \
+   "$(jget "$OUT" "d['lane_scratch'].startswith('UNRECORDED')")"
+
+# Nothing downstream of init may start requiring the key.
+sl freeze
+ck_exit "freeze is untouched by the absent key" 0 "$RC"
+gq add -A; gq commit -qm harness
+sl measure --cycle 0
+ck_exit "measure is untouched by the absent key" 0 "$RC"
+sl analyze --cycle 0
+ck_exit "analyze is untouched by the absent key" 0 "$RC"
+sl checkpoint --cycle 0
+ck_exit "checkpoint is untouched by the absent key" 0 "$RC"
+sl retire --dry-run
+ck_exit "retire is untouched by the absent key" 0 "$RC"
+ck_hasnt "no command tracebacks over the missing key" "Traceback"
+
+# ===========================================================================
+# BACKWARD COMPATIBILITY with a state.json written BEFORE this flag existed.
+# The fixture is built by REMOVING the key from a run that has it, so it is the
+# real pre-change shape rather than a hand-typed approximation of one.
+# ===========================================================================
+section "--scratch-root BC: a pre-flag state.json still loads  [repo: rscr3]"
+mk_repo rscr3
+sl init --max-cycles 6 --force --scratch-root ../rscr3-scratch
+ck_exit "BC fixture: init with the flag" 0 "$RC"
+python3 - <<'PY'
+import json
+p = ".swarm-loop/state.json"
+s = json.load(open(p))
+s.pop("scratch_root", None)
+json.dump(s, open(p, "w"), indent=2)
+PY
+ck "BC: the fixture really has no scratch_root key" "False" \
+   "$(jget .swarm-loop/state.json "'scratch_root' in d")"
+sl freeze
+ck_exit "BC: freeze on a pre-flag state.json" 0 "$RC"
+gq add -A; gq commit -qm harness
+sl resume
+ck_exit "BC: resume on a pre-flag state.json" 0 "$RC"
+ck_hasnt "BC: no traceback out of the scratch-root report" "Traceback"
+ck_has "BC: an older run reads as UNRECORDED, not as a missing-key crash" \
+       "lane scratch    : UNRECORDED"
+sl status
+ck_exit "BC: status on a pre-flag state.json" 0 "$RC"
+ck "BC: status still emits the key, as null" "None" \
+   "$(jget "$OUT" "d['scratch_root']")"
+sl checkpoint --cycle 0
+ck_exit "BC: checkpoint on a pre-flag state.json" 0 "$RC"
+ck_hasnt "BC: checkpoint does not traceback either" "Traceback"
+
+
+# ===========================================================================
 # (n) THE OTHER STALL — a run whose code changes every cycle and whose goal
 #     never moves. The fingerprint kill switch cannot see this and never
 #     could: it asks "did the code change", not "did the goal move", so any

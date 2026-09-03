@@ -600,6 +600,54 @@ def cmd_init(args):
             print(f"note: {parent} is not writable — task worktrees fall back to the in-tree "
                   f"{STATE_DIR}/worktrees/; exclude it from every root-walking metric command")
 
+    # Where each lane's PRIVATE scratch/temp directory lives: one subdirectory
+    # per task id, <scratch-root>/<task-id>/. Optional, and written into
+    # state.json only when it was actually chosen — a run that never names one
+    # keeps exactly the state.json shape it had before this flag existed.
+    #
+    # Why the harness carries this at all. Every parallel agent in a wave used
+    # to be handed the SAME scratch path, with nothing anywhere saying it was
+    # shared. Two agents wrote a probe script at the same filename and one of
+    # them executed it with ANOTHER agent's worktree as its working directory.
+    # It died on a path that did not exist and no damage was done, which was
+    # luck rather than design: the same collision against a live path is one
+    # lane's script mutating another lane's tree, which is precisely what the
+    # worktrees exist to prevent.
+    #
+    # And why the ROOT is recorded rather than merely handed out at dispatch:
+    # so the subdivision survives a compaction or a resume. That is the same
+    # failure class --worktree-root was added for — a run that never recorded
+    # where its worktrees lived resumed, reported ZERO live worktrees, and
+    # re-dispatched every in-flight ticket into a second set of trees.
+    #
+    # The honest limit, stated here because nothing downstream can state it:
+    # this harness can store and print the path, and it can NEVER enforce that
+    # a lane uses its private subdirectory. It never observes the inside of a
+    # lane's turn. This is bookkeeping that survives a restart, not a guarantee.
+    #
+    # Carried across --force exactly like worktree_root: an explicit flag wins,
+    # else the previous run's choice, else nothing at all is recorded.
+    scratch_root = args.scratch_root or prev_state.get("scratch_root")
+    scratch_abs = (os.path.normpath(os.path.join(root, scratch_root))
+                   if scratch_root else None)
+    if scratch_abs and (scratch_abs == root or scratch_abs.startswith(root + os.sep)):
+        # WARN, never refuse — the operator may have no writable parent, and an
+        # in-tree path still beats every lane sharing one directory. But it is
+        # the expensive choice and the cost is not visible from the flag: metric
+        # commands run with cwd = the repo root, so a scratch directory parked
+        # inside the repo sits in every tree-walking command's search path. A
+        # file-count metric once read 1, then 4, then 10 purely as worktrees
+        # appeared, and 'analyze' reported that as a regression with no product
+        # code having changed. Phase 2 freezes the metric commands' exclusions
+        # at cycle 0, so a root chosen badly here cannot be excluded later.
+        print(f"WARNING: --scratch-root {scratch_root} is INSIDE the measured repo "
+              f"({os.path.relpath(scratch_abs, root)}). Metric commands run with cwd = the "
+              "repo root, so it sits in every tree-walking command's search path: a "
+              "file-count metric once read 1, then 4, then 10 purely as lane directories "
+              "appeared, and 'analyze' scored that as a regression with no product code "
+              "changed. Phase 2 freezes those exclusions at cycle 0, so this root cannot be "
+              "excluded later — prefer a sibling directory outside the repo. Recorded anyway.")
+
     os.makedirs(os.path.join(d, ANALYSIS_DIR), exist_ok=True)
     os.makedirs(os.path.join(d, "reports"), exist_ok=True)
     os.makedirs(os.path.join(d, "acceptance"), exist_ok=True)
@@ -669,6 +717,13 @@ def cmd_init(args):
     graph = args.ticket_graph or prev_state.get("ticket_graph")
     if graph:
         state["ticket_graph"] = graph
+    # Optional and carried forward when already set, exactly like ticket_graph:
+    # ABSENT means "this run never recorded whether its lanes were subdivided",
+    # which every reader has to be able to say out loud rather than guess at —
+    # so nothing downstream may require the key, and every run written before
+    # this flag existed keeps working untouched.
+    if scratch_root:
+        state["scratch_root"] = scratch_root
     save_json(os.path.join(d, STATE_FILE), state)
 
     goals_path = os.path.join(d, GOALS_FILE)
@@ -694,6 +749,14 @@ def cmd_init(args):
         wt_rel = os.path.relpath(wt_abs, root).replace(os.sep, "/") + "/"
         if wt_rel not in markers:
             markers.append(wt_rel)
+    # Same treatment for an in-repo scratch root. It does NOT undo the warning
+    # above — git's ignore list is not a metric command's exclusion list — but
+    # it keeps the lane directories out of `git status` and out of the codebase
+    # fingerprint the stall counter is computed from.
+    if scratch_abs and scratch_abs.startswith(root + os.sep):
+        sc_rel = os.path.relpath(scratch_abs, root).replace(os.sep, "/") + "/"
+        if sc_rel not in markers:
+            markers.append(sc_rel)
     for marker in markers:
         if marker not in existing:
             with open(gi, "a") as f:
@@ -4318,6 +4381,21 @@ def cmd_resume(args):
               "usable measurement, so the last green analysis is not this run's verdict")
     print(f"working tree    : {'DIRTY — inspect git status first' if dirty else 'clean'}")
     print(f"live worktrees  : {len(worktrees)}" + ("".join(f"\n                  {w}" for w in worktrees)))
+    # Recorded, never enforced — and the unset case is a real answer rather than
+    # a blank line: it says this run never wrote down whether each lane got its
+    # own directory or every agent shared one, which is exactly the ambiguity
+    # that let two lanes collide on a probe script of the same name.
+    sr = state.get("scratch_root")
+    sr_abs = _scratch_root_abs(root, state)
+    if sr:
+        print("lane scratch    : %s%s" % (sr_abs, "" if sr_abs == sr else "  (recorded as %s)" % sr))
+        print("                  one subdirectory per task id: <root>/<task-id>/ — RECORDED, "
+              "never enforced")
+        print("                  (nothing here observes the inside of a lane's turn)")
+    else:
+        print("lane scratch    : UNRECORDED — this run named no --scratch-root, so whether each")
+        print("                  lane had its own <root>/<task-id>/ or every agent shared one")
+        print("                  directory is not knowable from here")
     print(f"unmerged branches: {len(unmerged)}" + ("".join(f"\n                  {b}" for b in unmerged)))
 
     # --- recommendation (heuristic — confirm against the latest cycle report)
@@ -7962,6 +8040,18 @@ def _worktree_root_abs(root, state):
         root, state.get("worktree_root") or f"{STATE_DIR}/worktrees"))
 
 
+def _scratch_root_abs(root, state):
+    """The run's recorded per-lane scratch root, absolute — or None if unrecorded.
+
+    Deliberately WITHOUT the default `_worktree_root_abs` carries. An unrecorded
+    scratch root means nobody wrote down whether the lanes were subdivided at
+    all, and inventing a plausible path here would answer that question with a
+    guess. Callers render the None case as UNRECORDED instead.
+    """
+    sr = state.get("scratch_root")
+    return os.path.normpath(os.path.join(root, sr)) if sr else None
+
+
 def _base_branch(state, explicit=None):
     return explicit or state.get("base_branch") or "main"
 
@@ -9048,6 +9138,19 @@ def cmd_status(args):
         "stall_codebase": f"{state['stall_count']}/{state['stall_limit']}",
         "stall_goal_progress": (f"{int(state.get('goal_stall_count') or 0)}"
                                 f"/{_goal_stall_limit(state)}"),
+        # Optional, and ABSENT from every state.json written before the flag
+        # existed — hence .get(). Two keys on purpose: the raw value stays
+        # machine-readable, and the prose says what a null MEANS, because a bare
+        # null reads as "no scratch directories were used" when what it actually
+        # means is "nobody recorded whether the lanes shared one". Recorded,
+        # never enforced: nothing here sees the inside of a lane's turn.
+        "scratch_root": state.get("scratch_root"),
+        "lane_scratch": ("%s — one subdirectory per task id (<root>/<task-id>/); RECORDED, "
+                         "never enforced: nothing here observes the inside of a lane's turn"
+                         % state["scratch_root"] if state.get("scratch_root") else
+                         "UNRECORDED — this run named no --scratch-root, so whether each lane "
+                         "had its own subdirectory or every agent shared one path is not "
+                         "knowable from here"),
         "goals_frozen": goals.get("frozen", False),
         "goal_amendments": int(goals.get("amendments", 0)),
         "last_amended_at": goals.get("last_amended_at"),
@@ -10446,6 +10549,15 @@ def main():
                         "../<repo>-worktrees, so they stay out of every root-walking metric "
                         f"command; falls back to {STATE_DIR}/worktrees/ if the parent is not "
                         "writable). Recorded in state.json so 'resume' can find them.")
+    s.add_argument("--scratch-root", default=None, metavar="PATH",
+                   help="where each lane's PRIVATE scratch/temp directory lives — one per "
+                        "ticket, <scratch-root>/<task-id>/, so two agents cannot write the "
+                        "same throwaway filename and run each other's. Optional; recorded in "
+                        "state.json so 'resume' and 'status' can still say whether the lanes "
+                        "were subdivided after a compaction. Keep it OUTSIDE the repo: metric "
+                        "commands run with cwd = the repo root, and their exclusions freeze at "
+                        "cycle 0. Recorded, never enforced — the harness never observes the "
+                        "inside of a lane's turn.")
     s.add_argument("--protect-path", action="append", default=None, metavar="PATH",
                    help="repeatable; REPLACES the protected-path list (default: "
                         f"{STATE_DIR}/acceptance + {STATE_DIR}/{GOALS_FILE}, plus whatever "

@@ -177,8 +177,8 @@ permission to change its own route has misread this packet.
   another was told it could revert source with `git checkout`, with 112
   uncommitted lines of the lane's own fix sitting in the tree; the PreToolUse
   git-guard was the only thing standing between that instruction and the loss.
-  Read-only sub-agents are permitted and are not free — they cost context,
-  wall-clock and spend — so spawn the few you need, never all you can. An agent
+  Read-only sub-agents are permitted, and how many you run at once is the
+  operator's configuration rather than a rule in this brief. An agent
   that must MUTATE in order to test — sabotage, mutation testing — works on a
   copy under YOUR OWN scratch subdirectory, never inside this worktree and never
   anywhere under the measured repo. Everything in this block binds at every
