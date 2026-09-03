@@ -3436,10 +3436,19 @@ ck_exit "W48 --closed-from-merged --json exits 0" 0 "$RC"
 ck "W48 a zero-commit provisioned lane is NOT closed; a two-id branch closes ONE" \
    "T-000,T-010" "$(jget "$OUT" '",".join(d["closed"])')"
 sl frontier --closed-from-merged
-ck_has "W48 the skipped provisioned lane is REPORTED, not silently dropped" \
-       "SKIPPED task/T-003 (T-003)"
-ck_has "W48 ...with the discriminator that decided it" \
-       "the lane has ZERO commits of its own"
+ck_has "W48 the un-closed provisioned lane is REPORTED, not silently dropped" \
+       "UNDETERMINED task/T-003 (T-003)"
+# W48c REPLACES the old assertion here, which pinned the message "the lane has
+# ZERO commits of its own. Provisioned, not built." That message was a FACT the
+# command could not establish: `tip == base_sha` is equally true of a branch
+# merged --ff-only (git's default when base has not moved), and W48c-2 shows it
+# printed verbatim about a lane whose work is demonstrably IN main. The
+# assertion was pinning a false statement, so it moves to what is actually
+# determined — that the two shapes are indistinguishable and the lane stays open.
+ck_has "W48 ...saying what could NOT be determined, never asserting 'not built'" \
+       "Nothing here can tell those apart, so it stays OPEN"
+ck_hasnt "W48 the un-establishable reason is gone for good" \
+         "Provisioned, not built."
 ck_has "W48 the two-ticket branch name says which id it closed" \
        "task/T-010-supersedes-T-011 closes T-010 ONLY"
 ck_has "W48 the falsely-closed lane is back in the ready set" "T-003     depth 1"
@@ -3523,6 +3532,298 @@ ck_has "W48b a --base git cannot resolve is reported, not read as 'nothing lande
        "COULD NOT LOOK:"
 ck_hasnt "W48b ...and it does NOT then claim the run is consistent with a first wave" \
          "CONSISTENT with a first wave, and proof of nothing"
+
+
+# ===========================================================================
+# W48c · the two false-CLOSED guards W48 shipped were both wrong
+#
+# W48 claimed `--closed-from-merged` "can only REDUCE what is reported closed".
+# It cannot. Measured, all four with real output:
+#
+#  (1) the zero-commit guard `tip == base_sha` fires ONLY while --base has not
+#      moved. In a swarm main advances continuously, so it essentially never
+#      fired: two provisioned lanes plus one merged ticket read `3 closed` and
+#      the frontier reported the whole project finished. W48's own case passed
+#      only because its fixture provisions task/T-003 AFTER the merges — the one
+#      construction order where the predicate holds. W48c-1 builds the ORDER A
+#      SWARM ACTUALLY PRODUCES.
+#  (2) the same predicate is true of `git merge --ff-only` — git's default when
+#      main has not moved — so genuinely landed work printed "the lane has ZERO
+#      commits of its own. Provisioned, not built." about a branch whose files
+#      are in main. A reason that was never established, in the FALSE direction.
+#  (3) the banner's evidence line called two provisioned lanes "LANDED on main"
+#      on a greenfield wave 1 where nothing had ever been built.
+#  (4) two surviving mutants: the branch-name anchoring had NO covering
+#      assertion (the commit message called it the fix), and last-verdict-wins
+#      had no case giving one ticket two verdicts.
+#
+# `rev-list --count base..branch == 0` and `tip == base_sha` are BOTH true of a
+# provisioned lane and of a properly merged one; neither discriminates. Closure
+# is therefore driven by POSITIVE evidence only — a ledger-pinned tip the branch
+# has moved past, or a tip off base's first-parent chain — and everything else
+# is UNDETERMINED and stays OPEN.
+# ===========================================================================
+section "W48c-1 provisioned BEFORE the merges — the order a swarm produces  [repo: rclose3]"
+mk_repo rclose3
+cat > tickets.json <<'EOF'
+{"version": 1, "project": "e2e", "tickets": [
+ {"id": "T-000", "title": "scaffold", "verify": "true", "scope": ["**"], "depends_on": []},
+ {"id": "T-001", "title": "alpha", "verify": "false", "scope": ["a/**"],
+  "depends_on": ["T-000"]},
+ {"id": "T-003", "title": "gamma", "verify": "false", "scope": ["c/**"],
+  "depends_on": ["T-000"]},
+ {"id": "T-004", "title": "zeta", "verify": "false", "scope": ["z/**"],
+  "depends_on": ["T-000"]}
+]}
+EOF
+gq add -A; gq commit -qm "ticket graph"
+# Lanes are provisioned FIRST — Phase 3 calls this "the normal state" — and THEN
+# main advances, which is what makes `tip == base_sha` stop holding.
+gq branch task/T-003 main
+gq branch task/T-004 main
+gq checkout -b task/T-000
+mkdir -p scaffold; echo x > scaffold/x; gq add -A; gq commit -qm "T-000 scaffold"
+gq checkout main; gq merge --no-ff -m "merge T-000" task/T-000
+sl frontier --closed-from-merged --json
+ck_exit "W48c-1 --closed-from-merged --json exits 0" 0 "$RC"
+ck "W48c-1 two zero-commit lanes stay OPEN once main has moved past them" \
+   "T-000" "$(jget "$OUT" '",".join(d["closed"])')"
+sl frontier --closed-from-merged
+ck_has "W48c-1 the first lane is named, not silently closed" \
+       "UNDETERMINED task/T-003 (T-003)"
+ck_has "W48c-1 ...and so is the second" "UNDETERMINED task/T-004 (T-004)"
+ck_has "W48c-1 the ticket that really landed says WHICH evidence closed it" \
+       "closed on first-parent evidence"
+ck_has "W48c-1 both un-closed lanes are back in the ready set" "T-003     depth 1"
+ck_has "W48c-1 ...both of them" "T-004     depth 1"
+ck_hasnt "W48c-1 nothing asserts a lane was 'provisioned, not built'" \
+         "Provisioned, not built."
+
+section "W48c-2 a FAST-FORWARD merge is not an unbuilt lane  [repo: rclose4]"
+mk_repo rclose4
+cat > tickets.json <<'EOF'
+{"version": 1, "project": "e2e", "tickets": [
+ {"id": "T-000", "title": "scaffold", "verify": "true", "scope": ["**"], "depends_on": []},
+ {"id": "T-001", "title": "alpha", "verify": "false", "scope": ["a/**"],
+  "depends_on": ["T-000"]}
+]}
+EOF
+gq add -A; gq commit -qm "ticket graph"
+gq branch task/T-000 main
+# The dispatch record pins the tip BEFORE the lane has committed anything. That
+# pin is the only thing that can later prove the lane moved.
+sl dispatch --agent w-000 --kind ticket --subject T-000 --branch task/T-000
+gq checkout task/T-000
+mkdir -p scaffold; echo x > scaffold/x; gq add -A; gq commit -qm "T-000 real work"
+gq checkout main
+gq merge --ff-only task/T-000
+ck "W48c-2 FIXTURE: the merge really was a fast-forward (tips are identical)" \
+   "same" "$([ "$(git rev-parse main)" = "$(git rev-parse task/T-000)" ] && echo same)"
+ck_file "W48c-2 FIXTURE: the work really is in main" scaffold/x
+# --- with the ledger moved aside: git alone genuinely cannot tell ------------
+mv .swarm-loop/dispatch.jsonl .swarm-loop/dispatch.jsonl.off
+sl frontier --closed-from-merged --json
+ck "W48c-2 with no ledger the lane is NOT closed — false-OPEN is the safe way to be wrong" \
+   "" "$(jget "$OUT" '",".join(d["closed"])')"
+sl frontier --closed-from-merged
+ck_hasnt "W48c-2 landed work is NEVER called 'Provisioned, not built'" \
+         "Provisioned, not built."
+ck_has "W48c-2 the note names fast-forward as the shape it cannot rule out" \
+       "of a lane merged FAST-FORWARD"
+ck_has "W48c-2 ...and says what to record to settle it" \
+       "--verdict accepted."
+sl frontier
+ck_hasnt "W48c-2 the banner does NOT call this consistent with a first wave" \
+         "CONSISTENT with a first wave, and proof of nothing"
+ck_has "W48c-2 it reports the lane it could not classify instead" \
+       "UNDETERMINED: 1 task/* branch(es) are merged into main"
+# --- with the ledger back: the pinned tip settles it ------------------------
+mv .swarm-loop/dispatch.jsonl.off .swarm-loop/dispatch.jsonl
+sl frontier --closed-from-merged --json
+ck "W48c-2 the ledger-pinned tip PROVES the lane committed, so it closes" \
+   "T-000" "$(jget "$OUT" '",".join(d["closed"])')"
+sl frontier --closed-from-merged
+ck_has "W48c-2 ...and says the ledger is what proved it" \
+       "the dispatch ledger pinned task/T-000@"
+ck_has "W48c-2 ...naming the move it measured" "its tip has since moved to"
+
+section "W48c-3 greenfield wave 1 is never called 'landed'  [repo: rclose5]"
+mk_repo rclose5
+cat > tickets.json <<'EOF'
+{"version": 1, "project": "e2e", "tickets": [
+ {"id": "T-000", "title": "scaffold", "verify": "true", "scope": ["**"], "depends_on": []},
+ {"id": "T-001", "title": "alpha", "verify": "false", "scope": ["a/**"],
+  "depends_on": ["T-000"]}
+]}
+EOF
+gq add -A; gq commit -qm "ticket graph"
+# Two lanes provisioned, NOTHING ever built, and main takes one ordinary commit.
+gq branch task/T-000 main
+gq branch task/T-001 main
+echo note > NOTES.md; gq add -A; gq commit -qm "an ordinary commit on main"
+sl frontier
+ck_hasnt "W48c-3 zero branches landed, so nothing claims any did" \
+         "have a task/* branch LANDED on main"
+ck_has "W48c-3 the no-source alarm still fires" "NO CLOSURE SOURCE WAS SUPPLIED"
+ck_has "W48c-3 the two lanes are reported as unclassifiable, which is what they are" \
+       "UNDETERMINED: 2 task/* branch(es) are merged into main"
+sl frontier --closed-from-merged --json
+ck "W48c-3 and neither one closes a ticket" \
+   "" "$(jget "$OUT" '",".join(d["closed"])')"
+
+section "W48c-4 the ticket id is ANCHORED at the front of the branch name  [repo: rclose6]"
+mk_repo rclose6
+cat > tickets.json <<'EOF'
+{"version": 1, "project": "e2e", "tickets": [
+ {"id": "T-000", "title": "scaffold", "verify": "true", "scope": ["**"], "depends_on": []},
+ {"id": "T-030", "title": "thirty", "verify": "false", "scope": ["c/**"],
+  "depends_on": ["T-000"]},
+ {"id": "T-040", "title": "forty", "verify": "false", "scope": ["d/**"],
+  "depends_on": ["T-000"]}
+]}
+EOF
+gq add -A; gq commit -qm "ticket graph"
+# A branch that really landed and really closes its ticket — the control.
+gq checkout -b task/T-000
+mkdir -p scaffold; echo x > scaffold/x; gq add -A; gq commit -qm "T-000"
+gq checkout main; gq merge --no-ff -m "merge T-000" task/T-000
+# Two shapes that must close NOTHING. Both carry real landed commits, so the
+# only thing standing between them and a false close is the anchoring: an
+# unanchored scan finds T-030 in "T-030x" and T-040 in "sub/T-040".
+gq checkout -b task/T-030x main
+mkdir -p c; echo x > c/x; gq add -A; gq commit -qm "T-030x"
+gq checkout main; gq merge --no-ff -m "merge T-030x" task/T-030x
+gq checkout -b task/sub/T-040 main
+mkdir -p d; echo x > d/x; gq add -A; gq commit -qm "sub/T-040"
+gq checkout main; gq merge --no-ff -m "merge sub/T-040" task/sub/T-040
+sl frontier --closed-from-merged --json
+ck "W48c-4 a trailing suffix and a nested path close NOTHING; the plain one closes" \
+   "T-000" "$(jget "$OUT" '",".join(d["closed"])')"
+sl frontier --closed-from-merged
+ck_has "W48c-4 'T-030x' is reported, not read as T-030" \
+       "SKIPPED task/T-030x — no T-nnn ticket id at the front"
+ck_has "W48c-4 'sub/T-040' is reported, not read as T-040" \
+       "SKIPPED task/sub/T-040 — no T-nnn ticket id at the front"
+ck_has "W48c-4 both un-closed tickets are still in the ready set" "T-030     depth 1"
+ck_has "W48c-4 ...both of them" "T-040     depth 1"
+
+section "W48c-5 one ticket, two verdicts: the LAST one wins  [repo: rclose7]"
+mk_repo rclose7
+cat > tickets.json <<'EOF'
+{"version": 1, "project": "e2e", "tickets": [
+ {"id": "T-001", "title": "alpha", "verify": "false", "scope": ["a/**"], "depends_on": []},
+ {"id": "T-002", "title": "beta", "verify": "false", "scope": ["b/**"], "depends_on": []}
+]}
+EOF
+gq add -A; gq commit -qm "ticket graph"
+# T-001: accepted in one cycle, then REJECTED by a later audit -> open again.
+sl dispatch --agent a1 --kind ticket --subject T-001
+sl dispatch --close a1 --ticket T-001 --verdict accepted --note "cycle 1 green"
+sl dispatch --agent a2 --kind auditor --subject T-001
+sl dispatch --close a2 --ticket T-001 --verdict rejected --note "audit: the gate was vacuous"
+# T-002: rejected first, then FIXED and accepted -> closed. The other direction,
+# so an implementation that simply prefers `rejected` cannot pass this pair.
+sl dispatch --agent b1 --kind ticket --subject T-002
+sl dispatch --close b1 --ticket T-002 --verdict rejected --note "first attempt red"
+sl dispatch --agent b2 --kind ticket --subject T-002
+sl dispatch --close b2 --ticket T-002 --verdict accepted --note "fixed and re-verified"
+sl frontier --closed-from-ledger --json
+ck_exit "W48c-5 --closed-from-ledger exits 0" 0 "$RC"
+ck "W48c-5 accepted-then-rejected reopens; rejected-then-accepted closes" \
+   "T-002" "$(jget "$OUT" '",".join(d["closed"])')"
+sl frontier --closed-from-ledger
+ck_has "W48c-5 the re-opened ticket is named as still OPEN" \
+       "carry a REJECTED verdict and stay OPEN: T-001"
+ck_has "W48c-5 the re-opened ticket is back in the ready set" "T-001     depth 0"
+# L3 — the ledger is a trust boundary and the READ side is where that is said.
+ck_has "W48c-5 closure from the ledger admits it re-verifies nothing" \
+       "closed on an OPERATOR-RECORDED verdict, not on anything re-verified here"
+ck_has "W48c-5 ...and names the consequence exactly" \
+       "a record naming a branch that never existed closes its ticket exactly like a real one"
+# A hand-appended malformed line is COUNTED, never silently dropped.
+echo 'this is not json' >> .swarm-loop/dispatch.jsonl
+printf '\n' >> .swarm-loop/dispatch.jsonl
+echo '{"action": "close", "verdict": "accepted", "tickets": ["T-001"]' >> .swarm-loop/dispatch.jsonl
+sl frontier --closed-from-ledger
+ck_has "W48c-5 unparseable ledger lines are counted and reported" \
+       "2 unparseable line(s) in dispatch.jsonl were skipped"
+sl frontier --closed-from-ledger --json
+ck "W48c-5 ...and a truncated record does NOT close the ticket it names" \
+   "T-002" "$(jget "$OUT" '",".join(d["closed"])')"
+
+section "W48c-6 a merged-then-REVERTED branch: the known limit, stated  [repo: rclose8]"
+mk_repo rclose8
+cat > tickets.json <<'EOF'
+{"version": 1, "project": "e2e", "tickets": [
+ {"id": "T-001", "title": "alpha", "verify": "false", "scope": ["a/**"], "depends_on": []}
+]}
+EOF
+gq add -A; gq commit -qm "ticket graph"
+gq checkout -b task/T-001
+mkdir -p a; echo x > a/x; gq add -A; gq commit -qm "T-001 work"
+gq checkout main; gq merge --no-ff -m "merge T-001" task/T-001
+gq revert -m 1 --no-edit HEAD
+ck_nofile "W48c-6 FIXTURE: the revert really removed the work from main" a/x
+ck "W48c-6 FIXTURE: git still lists the branch as merged (reachability survives)" \
+   "task/T-001" "$(git branch --merged main --list 'task/*' | tr -d ' *+')"
+sl frontier --closed-from-merged --json
+# NOT a fix — a PINNED LIMIT. `git branch --merged` answers a reachability
+# question, and a revert changes presence without changing reachability. W48's
+# claim that this guard "can only under-report" was false; this case makes the
+# real behaviour visible so it cannot be claimed away again.
+ck "W48c-6 KNOWN LIMIT: a reverted ticket still reads CLOSED here" \
+   "T-001" "$(jget "$OUT" '",".join(d["closed"])')"
+sl frontier --closed-from-merged
+ck_has "W48c-6 ...and the limit is STATED wherever anything closes" \
+       "this is REACHABILITY, not presence"
+ck_has "W48c-6 ...naming revert as the case, and the ledger as the way out" \
+       "Only a REJECTED ledger verdict reopens one."
+
+section "W48c-7 the unknown-id note names its real source  [repo: rclose9]"
+mk_repo rclose9
+cat > tickets.json <<'EOF'
+{"version": 1, "project": "e2e", "tickets": [
+ {"id": "T-001", "title": "alpha", "verify": "false", "scope": ["a/**"], "depends_on": []}
+]}
+EOF
+gq add -A; gq commit -qm "ticket graph"
+sl frontier --closed T-001,T-999
+ck_exit "W48c-7 frontier with an unknown closed id still exits 0" 0 "$RC"
+# L2: this note used to carry `or "--closed"` as a fallback that could not run —
+# `closed` is non-empty only when a source ran, and every source records itself
+# BEFORE contributing. The fallback is gone; this is the note's live path.
+ck_has "W48c-7 the note names the source that supplied the unknown id" \
+       "NOTE: closure (--closed) named ids that are not in the graph: T-999"
+# ...and the source it names is the one that really supplied it, not a constant.
+# The dead `or "--closed"` arm meant a hard-coded name would have read correctly
+# on the only path the suite exercised.
+sl dispatch --agent w-x --kind ticket --subject T-998
+sl dispatch --close w-x --ticket T-998 --verdict accepted
+sl frontier --closed-from-ledger
+ck_has "W48c-7 a DIFFERENT source is named as itself, not as '--closed'" \
+       "NOTE: closure (--closed-from-ledger) named ids that are not in the graph: T-998"
+
+# --- and --help must not go on teaching the predicate that was removed --------
+# SKILL.md and `--help` both documented the guard as skipping "a branch whose
+# tip IS --base", which is a verbatim restatement of a check that essentially
+# never fired and that mis-classified every fast-forward merge. A doc that
+# teaches an orchestrator to trust it is the defect wearing a third face.
+# COLUMNS is load-bearing: argparse wraps help to the terminal width, and a
+# ck_hasnt against a string the formatter has split across two lines passes
+# vacuously — it would "prove" the removal of text that was still there.
+COLUMNS=400 sl frontier --help
+ck_exit "W48c-7 frontier --help exits 0" 0 "$RC"
+ck_has "W48c-7 CONTROL: the help really was captured, unwrapped" \
+       "also treat as closed a ticket whose task/* branch is merged into --base"
+ck_hasnt "W48c-7 --help no longer teaches the tip-IS-base rule" \
+         "a branch whose tip IS --base"
+ck_hasnt "W48c-7 ...nor its justification" "zero commits is a provisioned lane"
+ck_has "W48c-7 --help states the rule that is actually implemented" \
+       "POSITIVELY shown to have carried work"
+ck_has "W48c-7 --help says being --merged proves nothing by itself" \
+       "Being --merged proves nothing on its own"
+ck_has "W48c-7 --help names last-verdict-wins for the ledger" \
+       "LAST verdict per ticket wins"
 
 
 # ===========================================================================

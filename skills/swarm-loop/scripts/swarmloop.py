@@ -4332,34 +4332,136 @@ def _leading_ticket_id(suffix):
     return m.group(1) if m else None
 
 
-def _closed_from_merged(root, base):
-    """(ids, notes) — tickets whose task/* branch has merged into `base`.
+def _first_parent_shas(root, base):
+    """The commits on `base`'s FIRST-PARENT chain, or None if git could not say.
 
-    Two guards. Both can only REDUCE what is reported closed, and that direction
-    is deliberate: a false-CLOSED silently drops real work out of the frontier,
-    while a false-OPEN merely burns a lane on something already done.
+    The invariant this rests on: provisioning a lane is `git branch task/T-003
+    <base>`, so a provisioned lane's tip is a commit that WAS base's tip — and a
+    base that only ever moves FORWARD (a commit on it, a merge into it, a
+    fast-forward) keeps every commit it ever pointed at on its first-parent
+    chain. Therefore a merged task/* branch whose tip is NOT on that chain cannot
+    be a lane provisioned from base: base reached that tip through the SECOND
+    parent of a merge, which is what landing a built lane does.
 
-      * A branch whose tip IS the base commit has zero commits of its own.
-        `git branch task/T-003 main` — a provisioned-and-not-yet-dispatched lane,
-        which Phase 3 calls "the normal state" — is trivially `--merged main`, and
-        used to report T-003 CLOSED with nothing built.
-      * The id is parsed from the branch NAME, never scanned out of the line.
+    None (git failed) is deliberately not folded into the empty set — an empty
+    set would read as "nothing is on the chain" and close every branch."""
+    out = _git(root, "rev-list", "--first-parent", base)
+    if out.returncode != 0:
+        return None
+    return set((out.stdout or "").split())
 
-    Every skip is REPORTED. A branch that looks landed and is being ignored is
-    exactly the thing an operator has to see; a silent drop is the same defect
-    wearing the other sign."""
+
+def _rev_count(root, a, b):
+    """`git rev-list --count a..b`, or 0 when git could not answer.
+
+    0-on-failure is the safe direction HERE and only here: every caller reads a
+    POSITIVE count as evidence that work exists, so a failure reads as
+    "no evidence", never as "no work"."""
+    out = _git(root, "rev-list", "--count", "%s..%s" % (a, b))
+    if out.returncode != 0:
+        return 0
+    try:
+        return int((out.stdout or "").strip())
+    except ValueError:
+        return 0
+
+
+def _dispatch_branch_shas(d):
+    """{branch: [sha, ...]} — every branch tip a dispatch record ever PINNED.
+
+    Both record kinds carry it: `open` stores the tip at dispatch (before the
+    lane has committed anything), `close` stores the tip the verdict was measured
+    against. A tip that has moved PAST one of these is positive proof that the
+    lane committed — the one thing git alone cannot establish about a merged
+    branch. Absent-is-fine: the live run keeps no dispatch.jsonl at all."""
+    out = {}
+    path = os.path.join(d, DISPATCH_FILE)
+    if not os.path.exists(path):
+        return out
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                br, sha = rec.get("branch"), rec.get("sha")
+                if not (isinstance(br, str) and br.strip()):
+                    continue
+                if not (isinstance(sha, str) and sha.strip()):
+                    continue
+                seen = out.setdefault(br.strip(), [])
+                if sha.strip() not in seen:
+                    seen.append(sha.strip())
+    except OSError:
+        return out
+    return out
+
+
+def _closed_from_merged(root, base, d=None):
+    """(ids, notes) — tickets whose task/* branch is merged into `base` AND for
+    which something POSITIVELY establishes that the lane carried work.
+
+    `git branch --merged` is not that something. "Merged" means exactly
+    "contributes nothing base lacks", which is equally true of a lane that landed
+    and of `git branch task/T-003 main` — a provisioned-and-not-yet-dispatched
+    lane, which Phase 3 calls "the normal state". Two predicates that LOOK like
+    they discriminate do not:
+
+      * `rev-list --count base..branch == 0` is true of BOTH, by definition.
+      * `tip == base_sha` is true of a provisioned lane AND of a branch merged
+        fast-forward — git's default when base has not moved. It is also FALSE
+        for a provisioned lane the moment base takes any further commit, which in
+        a swarm is continuously, so as a guard it essentially never fired.
+
+    So closure here is driven by POSITIVE evidence only, in authority order:
+
+      1. the dispatch ledger — a recorded tip for this branch that the branch has
+         since moved past. Proof the lane committed.
+      2. the first-parent chain — see _first_parent_shas. Proof base reached this
+         tip through a merge's second parent.
+
+    With neither, the lane is UNDETERMINED and stays OPEN, and the note says what
+    could not be determined instead of asserting a reason. That direction is the
+    whole point: a false-CLOSED silently drops real work out of the frontier, a
+    false-OPEN merely burns a lane on something already done.
+
+    ONE thing this still cannot see, and the notes say so when it closes
+    anything: `--merged` is REACHABILITY, not PRESENCE. `git revert -m 1` of a
+    merge takes the work back out of base and leaves the branch listed as merged
+    forever, so a reverted ticket still reads CLOSED here. Only a REJECTED ledger
+    verdict reopens it.
+
+    Every non-closure is REPORTED. A branch that looks landed and is being
+    ignored is exactly the thing an operator has to see; a silent drop is the
+    same defect wearing the other sign."""
     ids, notes = set(), []
+    d = d if d is not None else sd(root)
     out = _git(root, "branch", "--merged", base, "--list", "task/*")
     if out.returncode != 0:
         msg = " ".join(((out.stderr or "") + " " + (out.stdout or "")).split())
         return ids, ["--closed-from-merged: git could not list branches merged into %s "
                      "(%s) — NOTHING was derived from git" % (base, msg or "no output")]
-    base_sha = (_git(root, "rev-parse", "--verify", "--quiet",
-                     base + "^{commit}").stdout or "").strip() or None
+    names = []
     for line in (out.stdout or "").splitlines():
         name = line[2:].strip() if line[:2] in ("  ", "* ", "+ ") else line.strip()
-        if not name:
-            continue
+        if name:
+            names.append(name)
+    if not names:
+        return ids, notes
+    fp = _first_parent_shas(root, base)
+    if fp is None:
+        notes.append("--closed-from-merged: git could not walk %s's first-parent history, "
+                     "so the one PROOF that a lane landed rather than sat provisioned is "
+                     "unavailable — only the dispatch ledger is being consulted" % base)
+    pinned = _dispatch_branch_shas(d)
+    by_first_parent = []
+    for name in names:
         suffix = _ticket_of_branch(name)
         tid = _leading_ticket_id(suffix)
         if not tid:
@@ -4368,15 +4470,52 @@ def _closed_from_merged(root, base):
             continue
         tip = (_git(root, "rev-parse", "--verify", "--quiet",
                     name + "^{commit}").stdout or "").strip() or None
-        if tip and base_sha and tip == base_sha:
-            notes.append("--closed-from-merged: SKIPPED %s (%s) — its tip IS %s@%s, so the "
-                         "lane has ZERO commits of its own. Provisioned, not built."
-                         % (name, tid, base, base_sha[:12]))
+        if not tip:
+            notes.append("--closed-from-merged: UNDETERMINED %s (%s) — NOT closed. git "
+                         "lists it as merged but will not resolve it to a commit, so there "
+                         "is no tip to judge" % (name, tid))
+            continue
+        why = None
+        for sha in pinned.get(name, []):
+            if sha != tip and _rev_count(root, sha, tip) > 0:
+                why = ("the dispatch ledger pinned %s@%s and its tip has since moved to %s"
+                       % (name, sha[:12], tip[:12]))
+                break
+        if why is not None:
+            # Rare and load-bearing: the ONLY evidence that rescues a lane merged
+            # fast-forward, whose tip git cannot tell from a provisioned one.
+            notes.append("--closed-from-merged: %s closes %s — %s" % (name, tid, why))
+        elif fp is not None and tip not in fp:
+            why = "first-parent"
+            by_first_parent.append(tid)
+        if why is None:
+            notes.append(
+                "--closed-from-merged: UNDETERMINED %s (%s) — NOT closed. Its tip %s IS on "
+                "%s's first-parent history, which is equally true of a lane provisioned "
+                "from %s and never built and of a lane merged FAST-FORWARD, and no dispatch "
+                "record pins an earlier tip for it. Nothing here can tell those apart, so "
+                "it stays OPEN. If it did land, record it: dispatch --close <ref> --ticket "
+                "%s --verdict accepted."
+                % (name, tid, tip[:12], base, base, tid))
             continue
         if suffix != tid:
             notes.append("--closed-from-merged: %s closes %s ONLY — the rest of that branch "
                          "name is not a second ticket" % (name, tid))
         ids.add(tid)
+    if by_first_parent:
+        # One line for the ordinary case rather than one per branch: a live run
+        # lands fifty of these and the frontier already prints a screenful.
+        shown = sorted(by_first_parent)
+        notes.append("--closed-from-merged: %d ticket(s) closed on first-parent evidence — "
+                     "their branch tips are NOT on %s's first-parent history, so %s reached "
+                     "them through the second parent of a merge: %s%s"
+                     % (len(shown), base, base, ", ".join(shown[:12]),
+                        ", …" if len(shown) > 12 else ""))
+    if ids:
+        notes.append("--closed-from-merged: this is REACHABILITY, not presence — a merge "
+                     "that was later `git revert`-ed leaves its branch listed by `git "
+                     "branch --merged` forever, so a reverted ticket still reads CLOSED "
+                     "here. Only a REJECTED ledger verdict reopens one.")
     return ids, notes
 
 
@@ -4420,15 +4559,27 @@ def _closed_from_ledger(d):
                         verdict[tid.strip()] = rec["verdict"]
     except OSError as e:
         return set(), ["--closed-from-ledger: cannot read %s (%s)" % (path, e)]
+    accepted = sorted(t for t, v in verdict.items() if v == "accepted")
     rejected = sorted(t for t, v in verdict.items() if v == "rejected")
     notes = []
+    if accepted:
+        # THE LEDGER IS A TRUST BOUNDARY WITH NO READ-SIDE CHECK, and the read
+        # side is the place to say so. `dispatch --close` warns once, at write
+        # time, when the agent-ref was never open — and then records it anyway,
+        # which is correct for an append-only log. Nothing here re-derives
+        # whether the branch existed, whether the verdict was earned, or whether
+        # a human appended the line by hand; all three are honoured identically.
+        notes.append("--closed-from-ledger: %d ticket(s) closed on an OPERATOR-RECORDED "
+                     "verdict, not on anything re-verified here — %s is append-only and a "
+                     "record naming a branch that never existed closes its ticket exactly "
+                     "like a real one" % (len(accepted), DISPATCH_FILE))
     if rejected:
         notes.append("--closed-from-ledger: %d ticket(s) carry a REJECTED verdict and stay "
                      "OPEN: %s" % (len(rejected), ", ".join(rejected)))
     if bad:
         notes.append("--closed-from-ledger: %d unparseable line(s) in %s were skipped"
                      % (bad, DISPATCH_FILE))
-    return set(t for t, v in verdict.items() if v == "accepted"), notes
+    return set(accepted), notes
 
 
 def _closure_banner(root, d, base, sources, n_closed):
@@ -4468,10 +4619,15 @@ def _closure_banner(root, d, base, sources, n_closed):
     # nothing (retire deletes landed branches), so this can only under-report —
     # which is why the quiet case says "consistent with" and not "therefore".
     ev, blind = [], []
-    landed, landed_notes = _closed_from_merged(root, base)
+    landed, landed_notes = _closed_from_merged(root, base, d)
     # A git call that FAILED must not read as "nothing has landed" — that is the
     # same silent-wrong this whole banner exists to kill, one level down.
-    blind += [n for n in landed_notes if "git could not list branches" in n]
+    blind += [n for n in landed_notes if "git could not" in n]
+    # And neither must a lane nothing could CLASSIFY. A branch merged
+    # fast-forward is indistinguishable from a provisioned one, so "no landed
+    # branch found" over a pile of undetermined lanes is not a first wave — it is
+    # a question that was not answered.
+    undetermined = [n for n in landed_notes if "UNDETERMINED" in n]
     if landed:
         shown = sorted(landed)
         ev.append("%d ticket(s) have a task/* branch LANDED on %s (%s%s)"
@@ -4488,7 +4644,14 @@ def _closure_banner(root, d, base, sources, n_closed):
     if ev:
         lines.append("     EVIDENCE that this run is NOT at its first wave: " + "; ".join(ev)
                      + ". Every one of those is being ranked below as if it were unbuilt.")
-    elif not blind:
+    if undetermined:
+        lines.append("     UNDETERMINED: %d task/* branch(es) are merged into %s and nothing "
+                     "here can say whether they carried work — a lane provisioned from %s "
+                     "and never built and a lane merged FAST-FORWARD have identical git "
+                     "shape. Run `frontier --closed-from-merged` for the per-branch reason. "
+                     "This run may well be past its first wave." % (len(undetermined), base,
+                                                                    base))
+    if not ev and not blind and not undetermined:
         lines.append("     (No landed task/* branch and no accepted ledger verdict found — "
                      "CONSISTENT with a first wave, and proof of nothing: `retire` deletes "
                      "landed branches, so this evidence goes quiet on a run that is far "
@@ -4502,19 +4665,27 @@ def _closed_from_args(root, args):
     `sources` is the load-bearing half: it is the difference between "nothing is
     done" and "nobody said what is done", which the bare count cannot express."""
     closed, notes, sources = set(), [], []
+    d = sd(root)
     closed.update(_split_ids(args.closed))
     if args.closed:
         sources.append("--closed")
     if getattr(args, "closed_from_merged", False):
         sources.append("--closed-from-merged")
-        ids, n = _closed_from_merged(root, args.base)
+        ids, n = _closed_from_merged(root, args.base, d)
         closed |= ids
         notes += n
     if getattr(args, "closed_from_ledger", False):
         sources.append("--closed-from-ledger")
-        ids, n = _closed_from_ledger(sd(root))
+        ids, n = _closed_from_ledger(d)
         closed |= ids
         notes += n
+    # INVARIANT the `unknown ids` note in cmd_frontier depends on: `closed` is
+    # non-empty only if some source ran, and every source appends to `sources`
+    # BEFORE it contributes. So `sources` is non-empty wherever that note can
+    # print — which is why the `or "--closed"` fallback it used to carry had no
+    # path to running, and is gone. No assert guards this: every other error in
+    # this file exits with a message rather than a traceback, and a guard whose
+    # only reachable behaviour is crashing is not an improvement on dead code.
     return closed, {"sources": sources, "notes": notes}
 
 
@@ -4569,8 +4740,7 @@ def cmd_frontier(args):
             print("  " + line)
         if unknown_closed:
             print("  NOTE: closure (%s) named ids that are not in the graph: %s"
-                  % (", ".join(closure["sources"]) or "--closed",
-                     ", ".join(unknown_closed)))
+                  % (", ".join(closure["sources"]), ", ".join(unknown_closed)))
         for e in errors:
             print(f"  GRAPH ERROR: {e}")
         print("")
@@ -6650,13 +6820,17 @@ def main():
     s.add_argument("--closed", action="append", default=None, metavar="IDS",
                    help="repeatable, comma-separated: tickets already merged/closed")
     s.add_argument("--closed-from-merged", action="store_true",
-                   help="also treat as closed every ticket whose task/* branch has merged "
-                        "into --base. Skips (and names) a branch whose tip IS --base: zero "
-                        "commits is a provisioned lane, not delivered work")
+                   help="also treat as closed a ticket whose task/* branch is merged into "
+                        "--base AND is POSITIVELY shown to have carried work: a dispatch "
+                        "record pinning a tip it has since moved past, or a tip off --base's "
+                        "first-parent history. Being --merged proves nothing on its own — a "
+                        "provisioned lane is trivially merged — so anything else is named "
+                        "UNDETERMINED and stays OPEN")
     s.add_argument("--closed-from-ledger", action="store_true",
                    help="also treat as closed every ticket named by a `dispatch --close "
-                        "--ticket … --verdict accepted` record. Unlike --closed-from-merged "
-                        "this survives `retire` deleting the landed branch")
+                        "--ticket … --verdict accepted` record (LAST verdict per ticket "
+                        "wins). Unlike --closed-from-merged this survives `retire` deleting "
+                        "the landed branch — and it re-verifies nothing")
     s.add_argument("--base", default="main")
     s.add_argument("--json", action="store_true", help="machine-readable output")
     s.set_defaults(func=cmd_frontier)
