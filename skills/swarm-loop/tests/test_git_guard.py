@@ -405,6 +405,25 @@ MUST_BLOCK = [
     ("dd-state",              "dd if=/dev/null of=.swarm-loop/state.json"),
     ("find-swarm-delete",     "find .swarm-loop -name '*.json' -delete"),
 
+    # -- THE THREE LEDGERS A GATE READS, and the hole they close. The merge gate
+    #    `check-branch --ticket <id>` refuses a branch whose ticket has no `red`
+    #    stamp, and its whole evidence base is `redcheck.jsonl`; that name was
+    #    not in LEDGER_NAMES, so the FIRST case below — the exact spelling
+    #    swarmloop.py's own docstring records as having turned a live VETO into
+    #    exit 0 — was ALLOWED, and so was forging a stamp with `>>`. The party
+    #    with the motive is the worker whose branch is being judged.
+    #    `dispatch.jsonl` is the same hole one step out (the gate dates a ticket
+    #    from it, and `frontier --closed-from-ledger` closes tickets from it) and
+    #    `findings.jsonl` is the pre-threshold severity record. One verb each
+    #    across the three names, because the verbs are already pinned above and
+    #    what is new here is the SET they consult.
+    ("redirect-redcheck",     ": > .swarm-loop/redcheck.jsonl"),
+    ("append-redcheck",       "echo forged >> .swarm-loop/redcheck.jsonl"),
+    ("redirect-dispatch",     "> .swarm-loop/dispatch.jsonl"),
+    ("sed-i-dispatch",        "sed -i '' 's/T-001/T-002/' .swarm-loop/dispatch.jsonl"),
+    ("truncate-findings",     "truncate -s 0 .swarm-loop/findings.jsonl"),
+    ("tee-findings",          "echo x | tee -a .swarm-loop/findings.jsonl"),
+
     # -- the three `critical_dir_reason` branches that had no case at all.
     #    Each is a DIFFERENT clause of that function, so one case cannot stand
     #    in for another: `/` is the literal-separator compare, `~` only fires
@@ -796,6 +815,44 @@ MUST_ALLOW = [
     ("pytest-acceptance",     "pytest .swarm-loop/acceptance -q"),
     ("append-non-ledger",     "echo note >> .swarm-loop/notes.md"),
     ("cat-state",             "cat .swarm-loop/state.json | jq .cycle"),
+
+    # -- the LEGITIMATE neighbours of the three gate-ledger blocks above, and
+    #    they are the load-bearing half: a false block here wedges the harness's
+    #    own write path, which is strictly worse than the hole it closes.
+    #
+    #    `swarmloop.py` writes all three from python — `_append_redcheck`,
+    #    `cmd_dispatch`, `cmd_findings` each `open(..., "a")` inside the process.
+    #    This guard is a PreToolUse hook over tool ARGV, so these invocations
+    #    carry no ledger operand and no redirect and never reach `is_ledger` at
+    #    all. That is the claim; these three cases are the measurement of it, and
+    #    without them "the harness can still write" rests on reading the code.
+    ("swarmloop-red-check",
+     "python3 scripts/swarmloop.py red-check --ticket T-001,T-002 --base main"),
+    ("swarmloop-dispatch-close",
+     "python3 scripts/swarmloop.py dispatch --close --ticket T-001 --verdict accepted"),
+    ("swarmloop-findings-mint",
+     "python3 scripts/swarmloop.py findings --min-severity high"),
+    #    Phase 3 says "run all four and RECORD the output", so the harness's own
+    #    invocation routinely carries a redirect — into `reports/`, one directory
+    #    below the protected names. This is the case that would redden first if
+    #    the name list were ever widened into a directory rule.
+    ("swarmloop-red-check-logged",
+     "python3 scripts/swarmloop.py red-check --ticket T-001"
+     " > .swarm-loop/reports/redcheck-cycle3.log 2>&1"),
+    #    READING the gate's evidence is never blocked — that is the ledger
+    #    hint's own promise, and a gate whose evidence could not be inspected
+    #    would be unauditable.
+    ("cat-redcheck",          "cat .swarm-loop/redcheck.jsonl | jq -r .verdict"),
+    ("tail-dispatch",         "tail -n 20 .swarm-loop/dispatch.jsonl"),
+    ("grep-findings",         "grep -c HIGH .swarm-loop/findings.jsonl"),
+    #    ...and the two spellings that prove the rule is keyed on the NAME and
+    #    not on `.swarm-loop/` or on a prefix of it. `references/goal-setting.md`
+    #    MANDATES the first (a metric that redirects to `/dev/null` is
+    #    disqualifying, so its output goes under `reports/`); the second is one
+    #    hyphen away from a blocked name and must stay allowed.
+    ("redirect-metric-log",
+     "pytest -q > .swarm-loop/reports/metric-cycle3.log 2>&1"),
+    ("redirect-findings-raw", "checker --json > .swarm-loop/findings-raw.json"),
 
     # -- the near-misses of the newly-checked git verbs ----------------------
     ("gc-plain",              "git gc"),
@@ -1250,6 +1307,34 @@ PAYLOAD_CASES = [
     ("edit-swarm-prose-doc", ALLOW,
      {"tool_name": "Edit", "cwd": "{REPO}",
       "tool_input": {"file_path": ".swarm-loop/backlog.md"}}),
+
+    # -- the three gate-read ledgers, through the FILE TOOLS. The shell cases in
+    #    the string battery cover a redirect; this is the other half of the same
+    #    hole and the likelier one, because a worker does not truncate a file, it
+    #    edits it. `redcheck.jsonl` is what `check-branch --ticket` reads to
+    #    decide whether this worker's branch may merge at all.
+    ("edit-redcheck-jsonl", BLOCK,
+     {"tool_name": "Edit", "cwd": "{REPO}",
+      "tool_input": {"file_path": ".swarm-loop/redcheck.jsonl"}}),
+    ("write-dispatch-jsonl", BLOCK,
+     {"tool_name": "Write", "cwd": "{REPO}",
+      "tool_input": {"file_path": ".swarm-loop/dispatch.jsonl"}}),
+    ("multiedit-findings-jsonl", BLOCK,
+     {"tool_name": "MultiEdit", "cwd": "{REPO}",
+      "tool_input": {"file_path": ".swarm-loop/findings.jsonl"}}),
+    # THE SHAPE THAT MATTERS: a worker stands in its worktree, which has no
+    # `.swarm-loop/` of its own, and names the RUN's copy absolutely. That is the
+    # graded party reaching the grade, and it is the one spelling a rule keyed on
+    # the payload cwd could get wrong.
+    ("edit-redcheck-from-worktree", BLOCK,
+     {"tool_name": "Edit", "cwd": "{WT}",
+      "tool_input": {"file_path": "{REPO}/.swarm-loop/redcheck.jsonl"}}),
+    # ...and the epoch report the loop REQUIRES the orchestrator to write, one
+    # directory below the same protected names. Without this the four blocks
+    # above are equally satisfied by a guard that froze `.swarm-loop/` entire.
+    ("edit-swarm-epoch-report", ALLOW,
+     {"tool_name": "Edit", "cwd": "{REPO}",
+      "tool_input": {"file_path": ".swarm-loop/reports/cycle-3.md"}}),
     # A malformed payload must fall through to allow, never block on its own —
     # the same fail-open contract the command parser has.
     ("edit-no-file-path", ALLOW,
@@ -2088,7 +2173,11 @@ for _n in ("append-manifest", "dd-state", "find-swarm-delete", "mv-swarm-dir",
            "rm-r-swarm-no-f", "rm-rf-brace-swarm", "rm-rf-glob-dotfiles",
            "rm-rf-glob-swarm", "rm-rf-swarm-bash-c", "rm-rf-swarm-dir",
            "rm-rf-swarm-nl", "rm-rf-swarm-sudo", "rm-swarm-state",
-           "sed-i-goals", "tee-manifest", "truncate-state"):
+           "sed-i-goals", "tee-manifest", "truncate-state",
+           # the three gate-read ledgers, same relative `.swarm-loop` path and
+           # therefore the same cwd dependence as every name above them
+           "append-redcheck", "redirect-dispatch", "redirect-redcheck",
+           "sed-i-dispatch", "tee-findings", "truncate-findings"):
     CWD_EXPECT[_n] = dict(_REL_SWARM)
 # `../worktrees…` relative to the cwd. From the repo: the live worktree tree.
 # From INSIDE the worktree `../worktrees` is `<worktrees>/worktrees`, which

@@ -148,8 +148,9 @@ found the guard had no path awareness at all):
     the data), and `find <under .swarm-loop> ... -delete`
   in-place rewrites of the run's LEDGER (`state.json`, `goals.json`,
     `manifest.json`, `history.csv`, `freeze-log.jsonl`, `escalations.jsonl`,
-    `ESCALATIONS.md`): `> <ledger>`, `truncate`, `sed -i`, `dd of=`, `tee`, and
-    an Edit/Write/NotebookEdit/MultiEdit payload naming one
+    `ESCALATIONS.md`, `redcheck.jsonl`, `dispatch.jsonl`, `findings.jsonl`):
+    `> <ledger>`, `truncate`, `sed -i`, `dd of=`, `tee`, and an
+    Edit/Write/NotebookEdit/MultiEdit payload naming one
 
   ...reached however the shell dresses them up: on a later line of a multi-line
   command, after a shell keyword (`if ...; then git stash; fi`), behind a
@@ -1697,14 +1698,17 @@ LEDGER_HINT = (
     + "`. It is not a repo-global operation, it is not destructive to a shared "
     "working tree, and it takes no one's uncommitted work. What it destroys is "
     "the evidence the run scores itself by (`history.csv`, `state.json`, "
-    "`goals.json`, `manifest.json`, the frozen acceptance suite) AND the detector "
-    "that would have noticed it was gone.\\n"
+    "`goals.json`, `manifest.json`, the frozen acceptance suite) or the evidence "
+    "a GATE reads to judge your own branch (`redcheck.jsonl`, `dispatch.jsonl`, "
+    "`findings.jsonl`) — AND the detector that would have noticed it was gone.\\n"
     "SAFE ALTERNATIVES:\\n"
     "  - READING it is never blocked. `cat`, `git show`, `jq` over any of it, "
     "freely.\\n"
     "  - Changing it is `swarmloop.py`'s job — `measure`, `analyze`, `checkpoint`, "
-    "`freeze --amend`. A hand-edited ledger voids every score computed from it, "
-    "which is why the edit is refused rather than merely discouraged.\\n"
+    "`freeze --amend`, `red-check`, `dispatch`, `findings`. Those write it from "
+    "python and are not blocked by this guard. A hand-edited ledger voids every "
+    "score computed from it, which is why the edit is refused rather than merely "
+    "discouraged.\\n"
     "  - Just need somewhere to write? Anywhere else. Only `" + SWARM_DIR
     + "` is protected."
 )
@@ -1712,6 +1716,36 @@ LEDGER_HINT = (
 # The run's LEDGER: bookkeeping the harness writes from python (`swarmloop.py`),
 # never from a shell. A truncating redirect into any of these voids the run's
 # scores with no detector left to notice.
+#
+# THE BUG THE LAST THREE NAMES REPLACE. `check-branch --ticket <id>` refuses a
+# branch whose ticket carries no `red` stamp at an ancestor of its merge parent,
+# and that gate's ENTIRE evidence base is `redcheck.jsonl`. The file was absent
+# from this set, so `: > .swarm-loop/redcheck.jsonl` — or an `Edit` from the very
+# worker whose branch is being judged, which is the party with the motive —
+# rewrote the record that grades it. `dispatch.jsonl` is the same hole one step
+# out: the same gate dates a ticket from it (a ticket it cannot date is only
+# ADVISORY), and `frontier --closed-from-ledger` closes tickets from it, so a
+# forged line both disarms the merge gate and drops real work out of the
+# frontier. `findings.jsonl` is the pre-threshold record of every finding at
+# every severity, which is the only artifact that can show the severity filter
+# was not inverted. All three are written by python and read by a gate — the
+# same shape as the seven names above them, and the anti-gaming property the
+# whole harness rests on is that a worker cannot alter the thing that grades it.
+#
+# THE OBVIOUS VERSION IS WRONG, and it is why this is a NAME LIST and not a
+# directory rule: `.swarm-loop/` also holds `backlog.md`, `learnings.md`,
+# `codebase-map.md` and `reports/cycle-N.md`, which the loop REQUIRES the
+# orchestrator to rewrite every epoch, and `check_redirect_target` documents
+# `cat > .swarm-loop/worker-preamble.md` as how the preamble every worker reads
+# gets written. Protecting the directory wedges the loop's own bookkeeping.
+#
+# WHAT THIS DOES NOT TOUCH, and must not: `swarmloop.py` writing these three
+# itself. `_append_redcheck`, `cmd_dispatch` and `cmd_findings` all `open(...,
+# "a")` from inside the process, and this is a PreToolUse hook over tool ARGV —
+# `python3 swarmloop.py red-check …` carries no ledger operand and no redirect,
+# so it never reaches `is_ledger` at all. Closing the shell/Edit route leaves the
+# harness's own route untouched. Both directions are pinned in the battery
+# (`redirect-redcheck` / `edit-redcheck-jsonl` against `swarmloop-red-check`).
 #
 # `acceptance/` is deliberately NOT here. Tampering with a frozen test is already
 # tamper-EVIDENT — `verify` re-hashes it against the manifest — and the only
@@ -1723,6 +1757,7 @@ LEDGER_HINT = (
 LEDGER_NAMES = frozenset({
     "state.json", "goals.json", "manifest.json", "history.csv",
     "freeze-log.jsonl", "escalations.jsonl", "ESCALATIONS.md",
+    "redcheck.jsonl", "dispatch.jsonl", "findings.jsonl",
 })
 
 FILE_TOOLS = frozenset({"Edit", "Write", "NotebookEdit", "MultiEdit"})
