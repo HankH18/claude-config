@@ -2004,6 +2004,7 @@ def cmd_freeze(args):
     if not args.skip_smoke:
         print("smoke-running metric commands (probe only — nothing is recorded):")
         smoke_failures, already_met = [], []
+        deselecting, selects_zero = [], []
         for m in goals["metrics"]:
             tmo = _metric_timeout(m, args.smoke_timeout)
             try:
@@ -2012,6 +2013,17 @@ def cmd_freeze(args):
                 smoke_failures.append(m["id"])
                 print(f"  {m['id']:<28} FAIL: timeout after {tmo}s")
                 continue
+            # stdout AND stderr: the value is parsed from stdout's last line, but
+            # a runner under `2>&1`-less invocation prints its summary wherever it
+            # likes, and the selection facts are worth strictly more than the
+            # convenience of parsing one stream.
+            smoke_out = (proc.stdout or "") + (proc.stderr or "")
+            sm_sel, sm_desel, sm_pytest = _selection_facts(smoke_out)
+            sm_note = _selection_note(sm_sel, sm_desel, sm_pytest)
+            if sm_desel:
+                deselecting.append((m["id"], sm_note, smoke_out))
+            elif sm_pytest and not sm_sel:
+                selects_zero.append((m["id"], sm_note, smoke_out))
             lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
             try:
                 value = float(lines[-1])
@@ -2038,16 +2050,79 @@ def cmd_freeze(args):
             # score for the whole run with nothing checking it.
             err = _error(value, _target(m), m["direction"])
             tol = _tol(m)
+            tail = f"  [{sm_note}]" if sm_note else ""
             if err <= tol:
                 already_met.append(m["id"])
                 print(f"  {m['id']:<28} ok (parsed {value:g}, target {_target(m):g}, "
-                      f"error {err:g})  ** ALREADY AT TARGET **")
+                      f"error {err:g})  ** ALREADY AT TARGET **{tail}")
             else:
-                print(f"  {m['id']:<28} ok (parsed {value:g}, target {_target(m):g}, error {err:g})")
+                print(f"  {m['id']:<28} ok (parsed {value:g}, target {_target(m):g}, "
+                      f"error {err:g}){tail}")
         if smoke_failures:
             print(f"freeze: {len(smoke_failures)} metric command(s) failed the smoke-run: {', '.join(smoke_failures)}")
             print("manifest NOT written; goals remain unfrozen — fix the command(s) and re-run freeze")
             sys.exit(1)
+        # The deselection gate, and it has TEETH HERE AND ONLY HERE. freeze fires once
+        # per run, never on the dispatch path, and is the last moment the command is
+        # still editable text rather than frozen bytes needing a user-approved
+        # amendment — the same "last moment it is cheap to fix" the DEVNULL
+        # refusal above is built on. A false refusal costs one flag; the same
+        # check on the dispatch path would wedge a live run.
+        #
+        # What it is refusing: a metric whose own smoke run throws tests away
+        # before running them, or runs none at all. Both make the metric's number
+        # a statement about the SELECTION rather than about the code — and
+        # selection is editable from pytest.ini, pyproject.toml or a conftest,
+        # none of which are protected paths, none of which appear in any test
+        # diff, and all of which check-branch is deliberately forbidden from
+        # vetoing. Measured: honest red baseline (2 failed), marker filter added
+        # to pytest.ini, src/ still EMPTY, and the run reads ALL TARGETS MET.
+        #
+        # INTAKE ONLY, and this is the D4 rule, not a nicety. A run frozen by an
+        # earlier version has a deselecting metric this gate never inspected;
+        # every remedy for it — editing the frozen command — IS an amendment, so
+        # refusing `freeze --amend` would refuse the only door out of the state
+        # being complained about and leave the operator with a run that can never
+        # be amended again. On an already-frozen harness the finding is reported
+        # loudly, by name, and the freeze proceeds.
+        if (deselecting or selects_zero) and not args.allow_deselection and not locked_before:
+            bar = "!" * 74
+            print(bar)
+            print("!!! freeze REFUSED: a metric command's score is decided by TEST SELECTION")
+            for mid, note, out in deselecting:
+                print(f"!!!   {mid}: {note}")
+                for ln in out.splitlines():
+                    if DESELECTED_RE.search(ln):
+                        print(f"!!!       {ln.strip()[:120]}")
+                        break
+            for mid, note, out in selects_zero:
+                print(f"!!!   {mid}: {note} — the command ran pytest and pytest ran nothing")
+            print(bar)
+            die("freeze REFUSED: %d metric command(s) above deselect their own tests or select "
+                "none at all. A metric that deselects is not measuring the code, it is measuring "
+                "a filter — and the filter lives in pytest.ini / pyproject.toml / conftest.py, "
+                "which no protected path covers, which appears in no test diff, and which "
+                "check-branch reports as an ADVISORY `?` it may never veto on. Measured end to "
+                "end: an honest 2-failed baseline became `2 deselected`, measure recorded "
+                "value=0 error=0, and analyze printed ALL TARGETS MET with src/ EMPTY. "
+                "THE WAY FORWARD, in order of preference: (1) point the command at the frozen "
+                "acceptance tests directly so no filter applies; (2) drop the -m / -k / "
+                "--ignore / addopts filter from the command AND from the config it inherits; "
+                "(3) if the deselection is a deliberate project convention (a `-m 'not slow'` "
+                "house rule), re-run `freeze --allow-deselection` and record at the cycle-0 "
+                "checkpoint which tests the metric will never run — because from then on "
+                "nothing in this harness can tell you again. Manifest NOT written; goals "
+                "remain unfrozen."
+                % (len(deselecting) + len(selects_zero)))
+        if deselecting or selects_zero:
+            for mid, note, _out in deselecting + selects_zero:
+                print(f"  !! {mid}: {note} — this metric's score is decided by test SELECTION")
+            print("freeze: %d metric(s) whose score depends on test SELECTION accepted (%s). "
+                  "Say at the cycle-0 checkpoint which tests they never run."
+                  % (len(deselecting) + len(selects_zero),
+                     "--allow-deselection passed" if args.allow_deselection
+                     else "already frozen — the remedy is itself an amendment, so this "
+                          "cannot be a refusal here"))
         if already_met:
             # Warn, never block: a brownfield hold-the-line metric (build_ok=1,
             # lint=0 on an existing clean repo) legitimately starts green.
@@ -2424,6 +2499,126 @@ METRIC_CONFIG_BASENAMES = {
 METRIC_CONFIG_PREFIXES = ("jest.config", "vitest.config", ".eslintrc", "karma.conf")
 
 
+def _ticket_dispatched_at(d, tid):
+    """Earliest recorded dispatch timestamp for a ticket, or None.
+
+    None is the answer that matters: the live run has no dispatch.jsonl at all
+    (see _dispatch_holder), so 'I cannot date this ticket' must stay a first-class
+    answer rather than collapsing into 'it is new'. The gate below reads None as
+    'predates the ledger', which is the direction that cannot wedge a run.
+    """
+    path = os.path.join(d, DISPATCH_FILE)
+    if not os.path.exists(path):
+        return None
+    stamps = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(rec, dict) or not rec.get("dispatched_at"):
+                    continue
+                branch = str(rec.get("branch") or "")
+                if (tid == _ticket_of_branch(branch)
+                        or tid in str(rec.get("agent_ref") or "")
+                        or tid in str(rec.get("subject") or "")):
+                    stamps.append(str(rec["dispatched_at"]))
+    except OSError:
+        return None
+    return min(stamps) if stamps else None
+
+
+def _redcheck_gate(root, d, tid, base, branch, fork):
+    """Refuse a branch whose ticket has no `red` stamp at an ancestor of its
+    merge parent. Returns True to veto.
+
+    Nothing prevented a ticket being marked done on a gate that cannot go
+    red. `dispatch --close` is append-only bookkeeping about an AGENT — it never
+    reads the ticket's verify, cannot fail, and records a close even for a ref
+    that was never open. check-branch takes no ticket id, so it could not know
+    which gate it was judging. From the live run's findings.jsonl:120, three
+    tickets were reported CLOSED TWICE with their defects live; red-check would
+    have caught all three and nothing required anyone to run it.
+
+    THE D4 SHAPE, and it is the whole reason this is safe to land on a live run.
+    A resumed or in-flight run has no stamps for tickets already dispatched, so a
+    hard refusal would wedge the build the moment it merged. So: advisory for a
+    ticket that predates the ledger (or that cannot be dated at all), blocking
+    from the first stamp onward. `--ticket` itself stays OPTIONAL, so every
+    existing check-branch invocation keeps working verbatim.
+    """
+    stamps = _redcheck_stamps(d)
+    cmd = (f"  python3 <skill>/scripts/swarmloop.py red-check --close --ticket {tid} "
+           f"--base $(git merge-base {base} {branch})")
+    if not stamps:
+        print(f"ADVISORY (not a veto) — no {STATE_DIR}/{REDCHECK_FILE} exists, so nothing "
+              f"here can say whether {tid}'s gate was ever red:")
+        print(cmd)
+        print("    Until the first stamp lands this is unenforceable, and a run that has "
+              "never stamped must not be wedged by a gate it predates. From the first "
+              "stamp onward a ticket dispatched after it and carrying no red stamp is "
+              "REFUSED here.")
+        return False
+    mine = stamps.get(tid) or []
+    reds = [r for r in mine if r.get("verdict") == "red"]
+    anc = [(r, _is_ancestor(root, str(r.get("base_sha") or ""), fork or branch))
+           for r in reds]
+    good = [r for r, a in anc if a is True]
+    if good:
+        last = good[-1]
+        print(f"red-check: {tid} was RED at {str(last.get('base_sha'))[:12]} "
+              f"({last.get('timestamp')}, {last.get('mode')}) — an ancestor of this "
+              "branch's merge parent")
+        return False
+    # `_is_ancestor` returns None when git cannot answer — a rewritten history, a
+    # sha that no longer exists. Its own contract is that unknown must keep a
+    # tree, and it holds here too: a red stamp whose ancestry is unanswerable is
+    # not evidence the gate was never red.
+    if any(a is None for _, a in anc):
+        print(f"ADVISORY (not a veto) — {tid} has a `red` stamp whose base sha git cannot "
+              "place relative to this branch's merge parent (a rewritten or pruned history). "
+              "Unknown ancestry is not a finding; confirm by hand which tree it was red "
+              "against.")
+        return False
+    # An undated record must not be allowed to set the ledger's start: "" sorts
+    # below every real timestamp and would push every ticket into the blocking
+    # branch at once, which is the wedge the D4 shape exists to prevent.
+    first = min((r["timestamp"] for recs in stamps.values() for r in recs
+                 if str(r.get("timestamp") or "").strip()), default="")
+    when = _ticket_dispatched_at(d, tid)
+    if not mine and (not first or when is None or when < first):
+        print(f"ADVISORY (not a veto) — {tid} has no red-check stamp, and it "
+              + (f"was dispatched {when}, before this ledger's first stamp ({first})"
+                 if when and first else "cannot be dated from "
+                 + f"{STATE_DIR}/{DISPATCH_FILE}")
+              + ". A ticket that predates the ledger is not refused by it. Run it anyway "
+                "before you merge:")
+        print(cmd)
+        return False
+    print(f"VETO: {tid} has no red-check verdict of `red` at an ancestor of this branch's "
+          f"merge parent, and it is not a ticket this ledger predates.")
+    if mine:
+        print("  What IS stamped for it:")
+        for r in mine[-5:]:
+            print("    %-11s %s  base %s  (%s)"
+                  % (r.get("verdict"), r.get("timestamp"),
+                     str(r.get("base_sha") or "?")[:12], r.get("mode")))
+        print("  A verdict other than `red` means the gate proved nothing about this "
+              "ticket; a `red` at a base that is NOT an ancestor of the merge parent is a "
+              "red about a tree this branch never forked from.")
+    else:
+        print(f"  Nothing is stamped for {tid} at all, and {STATE_DIR}/{REDCHECK_FILE} "
+              f"already carries stamps from {first} onward.")
+    print("  Establish it, then re-run this check:")
+    print(cmd)
+    return True
+
+
 def _metric_config_hits(root, changed):
     """Paths a metric command could plausibly read. Advisory only, never a veto."""
     tokens = set()
@@ -2572,6 +2767,13 @@ def cmd_check_branch(args):
         sys.exit(1)
     if swarm_hits:
         print(f"VETO: branch writes orchestrator-owned state under {STATE_DIR}/ — do not merge")
+        sys.exit(1)
+    # Optional and last of the vetoes: the three above are statements about the
+    # DIFF and hold whatever the ticket is, while this one needs to be told which
+    # gate it is judging. Placed after them so a branch that tampers with the
+    # frozen harness is still refused for that, not for its paperwork.
+    if args.ticket and _redcheck_gate(root, d, args.ticket, base, args.branch,
+                                      (lane or {}).get("fork")):
         sys.exit(1)
     if config_hits:
         print("ADVISORY (not a veto) — these files can steer a frozen metric without "
@@ -2747,7 +2949,26 @@ def cmd_measure(args):
         rows.append([args.cycle, m["id"], value, err,
                      time.strftime("%Y-%m-%dT%H:%M:%S"), "measure"])
         mark = "OK " if err == 0 else "   "
-        print(f"  {m['id']:<28} value={value:<12g} target={_target(m):<10g} error={err:<12g} {mark}")
+        # SKILL.md's rule ("record PASSED / SKIPPED / DESELECTED beside every
+        # binary gate reading — a gate's number is uninterpretable without
+        # knowing what it did not run"), enforced instead of merely written.
+        # WARN-ONLY here, deliberately and permanently: measure is on the live
+        # path, a run must never be stopped mid-flight by a selection change, and
+        # the exit code below still belongs to "did the command produce a
+        # number". The teeth are at freeze, where a false positive costs a flag.
+        ms_sel, ms_desel, ms_pytest = _selection_facts(
+            (proc.stdout or "") + (proc.stderr or ""))
+        ms_note = _selection_note(ms_sel, ms_desel, ms_pytest)
+        print(f"  {m['id']:<28} value={value:<12g} target={_target(m):<10g} "
+              f"error={err:<12g} {mark}" + (f" [{ms_note}]" if ms_note else ""))
+        if ms_desel:
+            print(f"      WARNING: {m['id']} DESELECTED {ms_desel} test(s) this cycle — "
+                  "this number is partly a statement about a filter, not about the code. "
+                  "A filter added to pytest.ini / pyproject.toml / conftest.py moves it "
+                  "without touching a frozen byte or appearing in any test diff.")
+        elif ms_pytest and not ms_sel:
+            print(f"      WARNING: {m['id']} ran pytest and pytest SELECTED NO TESTS — "
+                  "whatever this value is, it was not observed.")
     _append_history(root, rows)
     if failures:
         print(f"measure: {len(failures)} metric command(s) failed: {', '.join(failures)}")
@@ -5384,6 +5605,240 @@ def _collected_count(text):
     return int(m.group(1)) if m else None
 
 
+# The other half of the count above, and the one SKILL.md has demanded beside
+# every binary gate reading since the deselection incident while nothing
+# computed it. `N deselected` is pytest's own word, printed in -q and verbose
+# alike, and it is the ONLY token that separates the two worlds below.
+DESELECTED_RE = re.compile(r"\b(\d+) deselected\b")
+# Evidence that the text came from a pytest run at all. Without this test,
+# "selected zero" is indistinguishable from "this metric is `wc -l` and there
+# was nothing to parse", and refusing the second is a false refusal on a
+# perfectly good metric. `error`/`errors` are deliberately NOT in here: tsc's
+# `Found 3 errors in 2 files.` and ruff's `Found 12 errors.` are the exact
+# strings _collected_count was hardened against reading as a test count.
+PYTEST_SHAPE_RE = re.compile(
+    r"\bcollected \d+ item|\b\d+ (?:selected|deselected|passed|failed)\b|\bno tests ran\b")
+
+
+def _selection_facts(text):
+    """(selected, deselected, looks_like_pytest) over one command's WHOLE output.
+
+    Measured end to end against the live shape: an honest red baseline
+    (`2 failed in 0.03s`), then a worker adds a marker filter to pytest.ini — a
+    path nothing protects — and with src/ still EMPTY the same metric prints
+    `2 deselected in 0.00s`. freeze said ok, verify said the harness was intact,
+    measure recorded value=0 error=0, analyze printed ALL TARGETS MET. Every
+    number in that chain is well-formed and every one of them is a lie. The
+    whole scoring apparatus was driven to target by DESELECTION, and the single
+    token that tells the two worlds apart was read by no code in this file.
+
+    `selected` is None — never 0 — when the output carries no test count at all;
+    the distinction is what keeps a compiler's error count from being read as a
+    test count, and what keeps `looks_like_pytest` load-bearing rather than
+    decorative.
+    """
+    de = DESELECTED_RE.search(text)
+    return (_collected_count(text),
+            int(de.group(1)) if de else None,
+            bool(PYTEST_SHAPE_RE.search(text)))
+
+
+def _selection_note(sel, desel, is_pytest):
+    """The human rendering of _selection_facts. '' when there is nothing to say.
+
+    The `N test(s) selected` wording is pinned by the P2 regression case and is
+    not free to drift: it is the phrasing that replaced `N test(s) collected`
+    when collected-vs-selected turned out to be the whole defect.
+    """
+    if desel:
+        return "%s test(s) selected, %d DESELECTED" % ("?" if sel is None else sel, desel)
+    if is_pytest and not sel:
+        return "ZERO tests selected"
+    if sel:
+        return "%d test(s) selected" % sel
+    return ""
+
+
+def _forced_exit(text, returncode):
+    """True when a non-zero exit cannot have come from the tests that ran.
+
+    The FORCED shape: `pytest tests/test_scaffold.py; exit 1` — three passing
+    scaffold tests and a red manufactured by the wrapper, scored `red (exit 1,
+    3 test(s) selected) — a real gate`. What IS cheaply visible is the
+    contradiction: pytest summarised only passes, so whatever produced the
+    non-zero exit was not the test run.
+
+    ADVISORY ONLY, and it must stay that way. A wrapper that runs a green pytest
+    and then a linter that legitimately fails prints exactly this shape, and its
+    red is real — it just comes from the linter. The residual limit is stated
+    where the advisory is printed rather than guessed at here.
+    """
+    if not returncode:
+        return False
+    if not re.search(r"\b\d+ passed\b", text):
+        return False
+    if re.search(r"\b\d+ (?:failed|error|errors)\b", text) or "no tests ran" in text:
+        return False
+    return True
+
+
+REDCHECK_FILE = "redcheck.jsonl"
+
+
+def _ticket_test_nodes(root, state, tid):
+    """pytest node ids of the FROZEN tests carrying @pytest.mark.ticket("<tid>").
+
+    Same file set and the same marker rules the read-edge scanner uses — the
+    protected paths, because the acceptance suite is protected by construction —
+    reduced to the one thing red-check needs and that scanner does not keep:
+    WHICH tests grade this ticket, not how many.
+    """
+    nodes = []
+    for path in _read_test_files(root, state, None):
+        relf = os.path.relpath(path, root)
+        try:
+            with open(path) as f:
+                tree = ast.parse(f.read(), filename=relf)
+        except (OSError, SyntaxError, ValueError):
+            # Never fatal, for the same reason the read-edge scan is not: an
+            # unparseable frozen suite is measure's finding to report, not a
+            # reason a diagnostic takes red-check down with a traceback.
+            continue
+
+        def visit(body, prefix, inherited):
+            for n in body:
+                if isinstance(n, ast.ClassDef):
+                    visit(n.body, prefix + [n.name], _ticket_marks(n) or inherited)
+                    continue
+                if isinstance(n, (ast.If, ast.Try, ast.With, ast.AsyncWith,
+                                  ast.For, ast.AsyncFor, ast.While)):
+                    for field in ("body", "orelse", "finalbody"):
+                        sub = getattr(n, field, None)
+                        if isinstance(sub, list):
+                            visit(sub, prefix, inherited)
+                    for h in getattr(n, "handlers", []) or []:
+                        visit(getattr(h, "body", []) or [], prefix, inherited)
+                    continue
+                if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if not n.name.startswith("test"):
+                    continue
+                if tid in (_ticket_marks(n) or inherited):
+                    nodes.append("::".join([relf] + prefix + [n.name]))
+
+        visit(tree.body, [], _pytestmark_tickets(tree))
+    return sorted(set(nodes))
+
+
+def _selection_probe(wt, nodes, timeout):
+    """(verdict, detail) — did this project's OWN pytest config keep the ticket's
+    frozen tests, or throw them away?
+
+    THE DISCRIMINATOR FOR THE DESELECTION CLASS, and the only one that closes it.
+    Measured: a ticket's `verify` was `./scripts/verify.sh check`, which is
+    `pytest -q -m 'not slow' tests`; the ticket's own grading test was
+    slow-marked, so it never ran once. red-check's `1 test(s) selected` came from
+    an UNRELATED broken test, and when a later ticket fixed that test the gate
+    went GREEN with the defect fully live. The ticket's own test sat in
+    "2 deselected" on every single run. Counting what a gate selected cannot see
+    this; only asking whether THESE tests survived can.
+
+    Naming the node ids explicitly does not bypass a marker filter — `-m` is
+    applied after collection however the items got there — so an `addopts` or a
+    wrapper-inherited filter shows up here as a deselection of the ticket's own
+    tests, which is a precise finding rather than a guess from a filename.
+
+    Every uncertain answer is "unknown", never a finding: no pytest on this
+    interpreter, a usage error, a rootdir whose node-id shapes do not match. The
+    false-positive cost here is a refused merge, so the tie goes to the branch.
+    """
+    if not nodes:
+        return "unknown", ("this ticket carries no frozen test at all — freeze's "
+                           "acceptance-coverage gate owns that finding, not this one")
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest", "--collect-only", "-q"] + nodes,
+            capture_output=True, text=True, cwd=wt, timeout=timeout)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return "unknown", "a collect-only probe could not be run in this worktree"
+    out = (proc.stdout or "") + (proc.stderr or "")
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+    def seen(node):
+        # Suffix match, not equality: pytest prints node ids relative to ITS
+        # rootdir, which is not always the repo root. Equality would report a
+        # rootdir difference as a deselection — a false refusal on a branch that
+        # did nothing wrong.
+        base = node.split("/")[-1]
+        for ln in lines:
+            if ln == node or ln == base or ln.endswith("/" + base):
+                return True
+        return False
+
+    hits = sum(1 for n in nodes if seen(n))
+    _sel, desel, is_pytest = _selection_facts(out)
+    if hits == len(nodes) and not desel:
+        return "ok", "all %d frozen test(s) survive collection here" % len(nodes)
+    if hits:
+        return "partial", ("only %d of %d frozen test(s) survive collection here%s"
+                           % (hits, len(nodes),
+                              " (%d deselected)" % desel if desel else ""))
+    if any("::" in ln for ln in lines):
+        return "unknown", ("the probe collected tests but none matched this ticket's "
+                           "node ids — a rootdir/path-shape difference, not a finding")
+    if desel:
+        return "deselected", ("all %d of this ticket's frozen test(s) were DESELECTED by "
+                              "this project's own pytest configuration (%d deselected)"
+                              % (len(nodes), desel))
+    if is_pytest:
+        return "empty", ("the probe collected NONE of this ticket's %d frozen test(s)"
+                         % len(nodes))
+    return "unknown", ("no pytest collect-only probe was possible: "
+                       + (lines[-1][:120] if lines else "<no output>"))
+
+
+def _append_redcheck(d, recs):
+    """Append-only ledger of red-check verdicts. Same shape as dispatch.jsonl,
+    and harness-owned for the same reason.
+
+    red-check is mandatory in three places in SKILL.md and was invoked by
+    NOTHING — `grep -c cmd_red_check` returned 2, the def and the set_defaults.
+    From the live run's own findings.jsonl:120, three tickets were reported
+    CLOSED TWICE with their defects live; red-check would have caught all three
+    (VACUOUS for two, WEAK for one) and nobody ran it until cycle 10. A remembered
+    command is not a gate. A stamp is a thing check-branch can ask for.
+    """
+    if not recs:
+        return
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, REDCHECK_FILE), "a") as f:
+        for rec in recs:
+            f.write(json.dumps(rec, sort_keys=True) + "\n")
+
+
+def _redcheck_stamps(d):
+    """{ticket: [record, ...]} in file order. Missing file = {} (H-17's rule)."""
+    path = os.path.join(d, REDCHECK_FILE)
+    out = {}
+    if not os.path.exists(path):
+        return out
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict) and rec.get("ticket"):
+                    out.setdefault(str(rec["ticket"]), []).append(rec)
+    except OSError:
+        return {}
+    return out
+
+
 def cmd_red_check(args):
     """Run each ticket's declared `verify` in a CLEAN worktree; fail any that
     already passes.
@@ -5422,17 +5877,30 @@ def cmd_red_check(args):
         die("not in %s: %s" % (os.path.relpath(path, root), ", ".join(unknown)))
 
     base = args.base
-    if subprocess.run(["git", "rev-parse", "--verify", base],
-                      capture_output=True, cwd=root).returncode != 0:
+    rev = subprocess.run(["git", "rev-parse", "--verify", base],
+                         capture_output=True, text=True, cwd=root)
+    if rev.returncode != 0:
         die(f"base ref '{base}' does not resolve — pass --base <ref>")
+    # The SHA, not the ref name: a stamp check-branch can test for ancestry
+    # against must survive `main` moving on after the check was run.
+    base_sha = (rev.stdout or "").strip() or base
     vacuous, weak, red, nogate, skipped = [], [], [], [], []
+    # The two close-time buckets. They are REFUSALS only under --close and
+    # advisory otherwise, because a false positive on the pre-dispatch path stops
+    # a ticket that has nothing wrong with it while a false positive at merge
+    # costs one re-run. The stamp records the honest classification either way.
+    swallowed, deselected_t = [], []
+    stamps = []
     tmpbase = tempfile.mkdtemp(prefix="swarmloop-redcheck-")
-    print(f"red-check: {len(sel)} ticket(s) against a clean worktree of {base}")
+    print(f"red-check: {len(sel)} ticket(s) against a clean worktree of "
+          f"{base} ({base_sha[:12]})"
+          + ("   [--close: retro-check, the selection findings REFUSE]" if args.close else ""))
     try:
         for tid in sel:
             cmd = (idx[tid].get("verify") or "").strip()
             if not cmd:
                 nogate.append(tid)
+                stamps.append((tid, "no-gate", cmd))
                 print(f"  {tid:<9} NO GATE — the ticket declares no 'verify' command")
                 continue
             wt = os.path.join(tmpbase, tid)
@@ -5446,6 +5914,7 @@ def cmd_red_check(args):
                 # provisioning failure read exactly like a ticket that had been
                 # checked and passed. An unchecked gate is not a checked one.
                 skipped.append(tid)
+                stamps.append((tid, "skipped", cmd))
                 print(f"  {tid:<9} SKIPPED — could not create a worktree, so this "
                       "ticket's gate was NEVER CHECKED: "
                       + (add.stderr or "").strip()[:160])
@@ -5453,21 +5922,73 @@ def cmd_red_check(args):
             try:
                 proc = _run_metric_command(cmd, wt, args.timeout)
                 out = (proc.stdout or "") + (proc.stderr or "")
-                n = _collected_count(out)
+                n, n_desel, n_pytest = _selection_facts(out)
+                note = _selection_note(n, n_desel, n_pytest)
                 if proc.returncode == 0:
                     vacuous.append(tid)
+                    stamps.append((tid, "vacuous", cmd))
                     print(f"  {tid:<9} VACUOUS — `{cmd}` EXITS 0 with nothing implemented"
-                          + (f" ({n} test(s) selected)" if n else ""))
-                elif not n:
+                          + (f" ({note})" if note else ""))
+                    continue
+                if not n:
                     weak.append(tid)
+                    stamps.append((tid, "weak", cmd))
                     print(f"  {tid:<9} WEAK — exit {proc.returncode}, but NO tests were "
                           f"SELECTED: `{cmd}` proves nothing about this ticket either way")
-                else:
+                    continue
+                # From here the gate is red on the exit code and selected
+                # something. That was the whole test until three shapes were
+                # measured slipping through it and being scored "a real gate".
+                verdict, extra = "red", []
+                # SWALLOWED. `pytest -q tests > /dev/null 2>&1 || echo '1 failed'; exit 1`
+                # — _collected_count reads the WRAPPER'S OWN echo, not any test
+                # run, and scored it red. DEVNULL_RE has guarded metric commands
+                # since the four-false-zeros incident; ticket verify strings are
+                # the same string in the same danger and were never checked.
+                dn = DEVNULL_RE.search(cmd)
+                if dn:
+                    verdict = "swallowed"
+                    extra.append("SWALLOWED — the command discards its own output (%r), so "
+                                 "the count above may come from the wrapper's echo rather "
+                                 "than from any test run. Redirect to a file instead: "
+                                 "> %s/reports/%s-verify.log 2>&1"
+                                 % (dn.group(0), STATE_DIR, tid))
+                # DESELECTION — the whole ballgame. Ask whether THIS ticket's own
+                # frozen tests survive the project's own pytest config, rather
+                # than whether something somewhere went red.
+                pv, pdetail = _selection_probe(wt, _ticket_test_nodes(root, state, tid),
+                                               min(args.timeout, 300))
+                if pv in ("deselected", "empty"):
+                    if verdict == "red":
+                        verdict = "deselected"
+                    extra.append("DESELECTED — %s. Whatever went red above, it was not this "
+                                 "ticket's grading tests." % pdetail)
+                elif pv == "partial":
+                    extra.append("partial selection — %s" % pdetail)
+                if _forced_exit(out, proc.returncode):
+                    extra.append("FORCED? — the pytest summary reports only passes, so this "
+                                 "non-zero exit did not come from the test run "
+                                 "(`... ; exit 1`). ADVISORY ONLY and it stays that way: a "
+                                 "wrapper whose red legitimately comes from a linter after a "
+                                 "green pytest prints exactly this. Read the command.")
+                if verdict == "red":
                     red.append(tid)
-                    print(f"  {tid:<9} red (exit {proc.returncode}, {n} test(s) selected) — "
-                          "a real gate")
+                    print(f"  {tid:<9} red (exit {proc.returncode}, {note}) — a real gate"
+                          + (f", {pdetail}" if pv == "ok" else ""))
+                elif verdict == "swallowed":
+                    (swallowed if args.close else red).append(tid)
+                    print(f"  {tid:<9} {'SWALLOWED' if args.close else 'red'} "
+                          f"(exit {proc.returncode}, {note})")
+                else:
+                    (deselected_t if args.close else red).append(tid)
+                    print(f"  {tid:<9} {'DESELECTED' if args.close else 'red'} "
+                          f"(exit {proc.returncode}, {note})")
+                stamps.append((tid, verdict, cmd))
+                for line in extra:
+                    print("            " + line)
             except subprocess.TimeoutExpired:
                 weak.append(tid)
+                stamps.append((tid, "weak", cmd))
                 print(f"  {tid:<9} WEAK — `{cmd}` timed out after {args.timeout}s")
             finally:
                 _git(root, "worktree", "remove", "--force", wt)
@@ -5478,14 +5999,33 @@ def cmd_red_check(args):
         except OSError:
             pass
 
+    # Written whatever the verdicts were and BEFORE the exit below: a red-check
+    # that refused is exactly the run whose finding must outlive the terminal it
+    # was printed in.
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+    _append_redcheck(d, [{"ticket": t, "verdict": v, "base": base, "base_sha": base_sha,
+                          "cmd": c, "mode": "close" if args.close else "pre-dispatch",
+                          "timestamp": now} for t, v, c in stamps])
+
     print("")
     print(f"red-check: {len(red)} real · {len(vacuous)} VACUOUS · {len(weak)} weak · "
-          f"{len(nogate)} with no gate · {len(skipped)} SKIPPED")
+          f"{len(nogate)} with no gate · {len(skipped)} SKIPPED"
+          + (f" · {len(swallowed)} SWALLOWED · {len(deselected_t)} DESELECTED"
+             if args.close else ""))
+    if stamps:
+        print(f"  {len(stamps)} verdict(s) stamped into {STATE_DIR}/{REDCHECK_FILE} "
+              f"against {base_sha[:12]} — `check-branch --ticket <id>` reads them")
     if vacuous or weak or nogate or skipped:
         print("A ticket's verify command must FAIL before the ticket is built. A gate that")
         print("passes on an empty tree measures the scaffold, not the work; a gate that")
         print("collects nothing measures nothing at all. Rewrite these before dispatching")
         print("them, and say in each task packet which grader is the real one.")
+    if swallowed or deselected_t:
+        print("A gate that went red for a reason unrelated to this ticket is not this")
+        print("ticket's gate. Measured: a verify of `pytest -q -m 'not slow' tests` scored a")
+        print("red that came from an UNRELATED broken test while the ticket's own grading")
+        print("test sat in `2 deselected` on every run — and when a later ticket fixed that")
+        print("unrelated test the gate went GREEN with the defect fully live.")
     # The exit code IS the contract, and it used to be `if vacuous` alone —
     # WEAK, NO GATE and SKIPPED all exited 0. The incident this command was
     # built for is in its own docstring: T-011/T-012 "reported `no tests ran`".
@@ -5493,7 +6033,14 @@ def cmd_red_check(args):
     # so two of the five tickets that motivated red-check would have walked
     # straight through its gate. A ticket whose gate proves nothing is not
     # dispatchable, and a ticket that was never checked is not either.
-    if vacuous or weak or nogate or skipped:
+    #
+    # swallowed/deselected are appended to this list only under --close, and are
+    # empty otherwise BY CONSTRUCTION (the loop files those tickets under `red`
+    # on the pre-dispatch path). That is the whole false-positive story: the
+    # selection probe's answer can be wrong on a project with a custom runner or
+    # a non-root pytest rootdir, and a wrong answer must never be able to refuse
+    # a ticket that has not been built yet.
+    if vacuous or weak or nogate or skipped or swallowed or deselected_t:
         sys.exit(1)
 
 
@@ -8872,6 +9419,13 @@ def main():
                         "FIRST freeze: on an already-frozen run the same finding is printed "
                         "as a loud advisory and the freeze (or --amend) proceeds, because "
                         "fixing it is itself an amendment.")
+    s.add_argument("--allow-deselection", action="store_true",
+                   help="freeze even though a metric command's smoke run DESELECTS tests or "
+                        "selects none. Only for a project whose deselection is a deliberate "
+                        "convention (a `-m 'not slow'` house rule): the metric's number is then "
+                        "partly a statement about the filter, and the filter lives in files no "
+                        "protected path covers. Record at the cycle-0 checkpoint which tests it "
+                        "will never run.")
     s.set_defaults(func=cmd_freeze)
 
     s = sub.add_parser("verify", help="check the frozen harness is intact")
@@ -8886,6 +9440,14 @@ def main():
     s = sub.add_parser("check-branch", help="veto branches touching protected/orchestrator paths")
     s.add_argument("--branch", required=True)
     s.add_argument("--base", default="main")
+    s.add_argument("--ticket", default=None, metavar="ID",
+                   help="OPTIONAL: also refuse this branch unless <ID> carries a red-check "
+                        f"verdict of `red` in {STATE_DIR}/{REDCHECK_FILE} at an ancestor of "
+                        "its merge parent. Advisory for a ticket that predates the ledger "
+                        "(or that dispatch.jsonl cannot date), blocking from the first stamp "
+                        "onward — a resumed run has no stamps for work already in flight and "
+                        "must not be wedged by a gate it predates. Omitting the flag leaves "
+                        "check-branch behaving exactly as before.")
     s.set_defaults(func=cmd_check_branch)
 
     s = sub.add_parser("measure", help="run all metric commands and record")
@@ -9056,6 +9618,13 @@ def main():
     # cross-command collision waiting to confuse both.
     s.add_argument("--per-ticket-timeout", type=int, default=600, dest="timeout",
                    help="per-ticket timeout in seconds (default 600)")
+    s.add_argument("--close", action="store_true",
+                   help="CLOSE-TIME retro-check: point --base at the ticket's merge parent and "
+                        "ask 'was this gate red immediately before this work landed?'. Turns the "
+                        "two selection findings (SWALLOWED, DESELECTED) from advisories into "
+                        "refusals. Never pass it on the pre-dispatch path: those findings can be "
+                        "wrong on a custom runner, and a false refusal there stops a ticket that "
+                        "has nothing wrong with it.")
     s.set_defaults(func=cmd_red_check)
 
     s = sub.add_parser("reads", help="read edges the ticket graph does not declare, and the "

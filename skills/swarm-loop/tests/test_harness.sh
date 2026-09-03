@@ -6035,6 +6035,507 @@ sl reachable --symbol ,, --path pkg
 ck_exit "an all-empty --symbol is a usage error (3), not a wiring finding (1)" 3 "$RC"
 
 # ===========================================================================
+# V1 · the whole scoring apparatus could be driven to target by DESELECTION
+#
+# Measured end to end before any of this existed. Honest red baseline, then a
+# worker adds a marker filter to pytest.ini — NOT a protected path, not in any
+# test diff — and with src/ still EMPTY:
+#
+#   freeze   -> ok (parsed 2, target 0, error 2)     honest red baseline
+#   measure  -> value=2 error=2                      "2 failed in 0.03s"
+#   [pytest.ini gains a marker filter; NOTHING is built]
+#   verify   -> OK - frozen harness intact           exit 0
+#   measure  -> value=0 error=0 OK                   "2 deselected in 0.00s"
+#   analyze  -> Targets met 1/1, ALL TARGETS MET     build->audit transition
+#
+# Every number in that chain is well-formed. The single token that separates the
+# two worlds is `deselected`, and no code in swarmloop.py read it — while
+# SKILL.md:278 had stated the rule ("record PASSED / SKIPPED / DESELECTED beside
+# every binary gate reading") since before the incident.
+# ===========================================================================
+section "V1 the deselection parser  [repo: rdesel1]"
+mk_repo rdesel1
+
+sf_() {  # sf_ <name> <expected "sel desel pytest"> <tool output>
+  local got
+  got=$(python3 - "$3" <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["SL_DIR"])
+import swarmloop
+print("%s %s %s" % swarmloop._selection_facts(sys.argv[1]))
+PY
+)
+  ck "$1" "$2" "$got"
+}
+sn_() {  # sn_ <name> <expected note> <tool output>
+  local got
+  got=$(python3 - "$3" <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["SL_DIR"])
+import swarmloop
+print(swarmloop._selection_note(*swarmloop._selection_facts(sys.argv[1])))
+PY
+)
+  ck "$1" "$2" "$got"
+}
+
+sf_ "V1 the honest red baseline: 2 selected, nothing thrown away" "2 None True" \
+    "2 failed in 0.03s"
+sf_ "V1 the SAME metric after a marker filter: nothing ran, 2 DESELECTED" "None 2 True" \
+    "2 deselected in 0.00s"
+sf_ "V1 a partial deselection keeps both numbers" "1 2 True" \
+    "1 failed, 2 deselected in 0.03s"
+sf_ "V1 pytest's verbose shape" "0 120 True" \
+    "collected 120 items / 120 deselected / 0 selected"
+sf_ "V1 'no tests ran' is pytest-shaped and selects nothing" "None None True" \
+    "no tests ran in 0.01s"
+# The false-positive guard, and it is the reason `error` is not in the shape
+# regex: these three are the exact strings _collected_count was hardened against
+# reading as a test count. A zero-selection REFUSAL that fired on them would
+# refuse every lint/typecheck metric in existence.
+sf_ "V1 tsc is not pytest-shaped, so it can never be 'selected ZERO'" "None None False" \
+    "Found 3 errors in 2 files."
+sf_ "V1 ruff is not pytest-shaped either" "None None False" \
+    "Found 12 errors."
+sf_ "V1 eslint is not pytest-shaped either" "None None False" \
+    "7 problems (7 errors, 0 warnings)"
+sf_ "V1 a bare number from a wc-style metric is not pytest-shaped" "None None False" \
+    "42"
+sn_ "V1 the note names DESELECTED in caps, because that is the finding" \
+    "? test(s) selected, 2 DESELECTED" "2 deselected in 0.00s"
+sn_ "V1 the note is silent when there is nothing to say" "" "42"
+sn_ "V1 a pytest run that selected nothing says so" "ZERO tests selected" \
+    "no tests ran in 0.01s"
+
+# --- and end to end, through the three commands that produce the number ------
+section "V1 freeze REFUSES a metric scored by selection  [repo: rdesel2]"
+mk_repo rdesel2
+cat > run_tests.sh <<'EOF'
+#!/bin/sh
+if [ -f DESELECT ]; then echo "2 deselected in 0.00s"; echo 0; exit 5; fi
+echo "2 failed in 0.03s"; echo 2
+EOF
+chmod +x run_tests.sh
+python3 - <<'PY'
+import json
+p = ".swarm-loop/goals.json"
+g = json.load(open(p))
+g["metrics"] = [{"id": "failing", "name": "failing tests", "command": "./run_tests.sh",
+                 "target": 0, "direction": "minimize"}]
+json.dump(g, open(p, "w"), indent=2)
+PY
+gq add -A; gq commit -qm baseline
+
+sl freeze
+ck_exit "V1 CONTROL: the honest red baseline freezes" 0 "$RC"
+ck_has "V1 CONTROL: ...and the selection is recorded beside the number" "[2 test(s) selected]"
+ck_hasnt "V1 CONTROL: ...with no refusal" "decided by TEST SELECTION"
+
+# Now the deselecting world, at a FIRST freeze — the last moment the command is
+# editable text rather than frozen bytes needing a user-approved amendment.
+mk_repo rdesel3
+cat > run_tests.sh <<'EOF'
+#!/bin/sh
+echo "2 deselected in 0.00s"; echo 0
+EOF
+chmod +x run_tests.sh
+python3 - <<'PY'
+import json
+p = ".swarm-loop/goals.json"
+g = json.load(open(p))
+g["metrics"] = [{"id": "failing", "name": "failing tests", "command": "./run_tests.sh",
+                 "target": 0, "direction": "minimize"}]
+json.dump(g, open(p, "w"), indent=2)
+PY
+gq add -A; gq commit -qm desel
+sl freeze
+ck_exit "V1 freeze REFUSES a metric whose smoke run deselects its own tests" 1 "$RC"
+ck_has "V1 ...naming the metric" "failing: ? test(s) selected, 2 DESELECTED"
+ck_has "V1 ...showing the deselect line itself" "2 deselected in 0.00s"
+ck_has "V1 ...and naming the sanctioned way forward" "--allow-deselection"
+ck_has "V1 ...the goals stay unfrozen" "goals remain unfrozen"
+ck_nofile "V1 ...and no manifest is written" ".swarm-loop/manifest.json"
+ck "V1 ...and goals.json is still unfrozen on disk" "False" \
+   "$(jget .swarm-loop/goals.json "d['frozen']")"
+
+# The escape hatch: a project whose deselection is a deliberate convention.
+sl freeze --allow-deselection
+ck_exit "V1 --allow-deselection freezes anyway" 0 "$RC"
+ck_has "V1 ...and says out loud what it accepted, and on whose authority" \
+       "1 metric(s) whose score depends on test SELECTION accepted (--allow-deselection passed)"
+ck_file "V1 ...and the manifest is written" ".swarm-loop/manifest.json"
+
+# THE D4 RULE, and it is the assertion that keeps this gate off a live run. A
+# harness frozen by an earlier version carries a deselecting metric this gate
+# never inspected, and every remedy for it — editing the frozen command — IS an
+# amendment. A refusal on an already-frozen harness would refuse the only door
+# out of the state it is complaining about.
+mk_repo rdesel3b
+cat > run_tests.sh <<'EOF'
+#!/bin/sh
+if [ -f DESELECT ]; then echo "2 deselected in 0.00s"; echo 0; exit 5; fi
+echo "2 failed in 0.03s"; echo 2
+EOF
+chmod +x run_tests.sh
+python3 - <<'PY'
+import json
+p = ".swarm-loop/goals.json"
+g = json.load(open(p))
+g["metrics"] = [{"id": "failing", "name": "failing tests", "command": "./run_tests.sh",
+                 "target": 0, "direction": "minimize"}]
+json.dump(g, open(p, "w"), indent=2)
+PY
+gq add -A; gq commit -qm honest
+sl freeze
+ck_exit "V1 the run froze honestly, before any filter existed" 0 "$RC"
+gq add -A; gq commit -qm frozen
+touch DESELECT
+sl freeze --amend "the user approved widening the target"
+ck_exit "V1 an ALREADY-FROZEN harness is never wedged by this gate — --amend proceeds" 0 "$RC"
+ck_has "V1 ...the finding is still reported loudly, by name" \
+       "failing: ? test(s) selected, 2 DESELECTED"
+ck_has "V1 ...and says why it cannot be a refusal here" "the remedy is itself an amendment"
+
+# A metric that runs pytest and pytest runs NOTHING is the same defect wearing a
+# different number: whatever the value is, it was not observed.
+mk_repo rdesel4
+cat > run_tests.sh <<'EOF'
+#!/bin/sh
+echo "no tests ran in 0.01s"; echo 0
+EOF
+chmod +x run_tests.sh
+python3 - <<'PY'
+import json
+p = ".swarm-loop/goals.json"
+g = json.load(open(p))
+g["metrics"] = [{"id": "failing", "name": "failing tests", "command": "./run_tests.sh",
+                 "target": 0, "direction": "minimize"}]
+json.dump(g, open(p, "w"), indent=2)
+PY
+gq add -A; gq commit -qm empty
+sl freeze
+ck_exit "V1 freeze REFUSES a metric whose pytest selects zero tests" 1 "$RC"
+ck_has "V1 ...saying pytest ran nothing" "pytest ran nothing"
+
+# CONTROL, and it is the one that keeps this gate off every lint metric in
+# existence: a non-pytest command that legitimately prints zero must freeze.
+mk_repo rdesel5
+cat > run_tests.sh <<'EOF'
+#!/bin/sh
+echo "Found 3 errors in 2 files."
+echo 3
+EOF
+chmod +x run_tests.sh
+python3 - <<'PY'
+import json
+p = ".swarm-loop/goals.json"
+g = json.load(open(p))
+g["metrics"] = [{"id": "types", "name": "type errors", "command": "./run_tests.sh",
+                 "target": 0, "direction": "minimize"}]
+json.dump(g, open(p, "w"), indent=2)
+PY
+gq add -A; gq commit -qm tsc
+sl freeze
+ck_exit "V1 CONTROL: a tsc-shaped metric is untouched by the selection gate" 0 "$RC"
+ck_hasnt "V1 CONTROL: ...not refused" "decided by TEST SELECTION"
+ck_hasnt "V1 CONTROL: ...and not accused of selecting zero tests" "ZERO tests selected"
+
+# --- measure: the same fact, WARN-ONLY, permanently -------------------------
+section "V1 measure reports deselection and never stops the run  [repo: rdesel6]"
+mk_repo rdesel6
+cat > run_tests.sh <<'EOF'
+#!/bin/sh
+if [ -f DESELECT ]; then echo "2 deselected in 0.00s"; echo 0; exit 5; fi
+echo "2 failed in 0.03s"; echo 2
+EOF
+chmod +x run_tests.sh
+python3 - <<'PY'
+import json
+p = ".swarm-loop/goals.json"
+g = json.load(open(p))
+g["metrics"] = [{"id": "failing", "name": "failing tests", "command": "./run_tests.sh",
+                 "target": 0, "direction": "minimize"}]
+json.dump(g, open(p, "w"), indent=2)
+PY
+gq add -A; gq commit -qm m0
+sl freeze
+ck_exit "V1 freeze the honest baseline" 0 "$RC"
+gq add -A; gq commit -qm frozen
+sl measure --cycle 0
+ck_exit "V1 cycle 0 measures the honest red" 0 "$RC"
+ck_has "V1 ...recording the selection beside the value" "[2 test(s) selected]"
+ck_hasnt "V1 ...with no warning" "DESELECTED"
+
+# Nothing is built. The filter arrives instead.
+touch DESELECT
+sl measure --cycle 1
+ck_exit "V1 measure NEVER exits nonzero over deselection — a run must not wedge" 0 "$RC"
+ck_has "V1 ...but the value now carries its selection" "2 DESELECTED"
+ck_has "V1 ...and a warning names what moved the number" \
+       "this number is partly a statement about a filter"
+ck_has "V1 ...the zero is still recorded, because measure records what it measured" "value=0"
+
+# ===========================================================================
+# V2 · red-check certified gates that prove nothing, and nothing invoked it
+#
+# Three shapes were measured being scored "a real gate":
+#   DESELECTION  verify = `pytest -q -m 'not slow' tests`; the ticket's own
+#                grading test is slow-marked so it NEVER runs. The "1 selected"
+#                came from an unrelated broken test — and when a later ticket
+#                fixed THAT test the gate went green with the defect fully live.
+#   SWALLOWED    `pytest -q tests > /dev/null 2>&1 || echo '1 failed'; exit 1`
+#                — the count is read off the wrapper's own echo.
+#   FORCED       `pytest tests/test_scaffold.py; exit 1` — 3 passing scaffold
+#                tests and a red manufactured by the wrapper.
+#
+# And red-check was invoked by NOTHING: `grep -c cmd_red_check` returned 2, the
+# def and the set_defaults. From the live run's findings.jsonl:120, three tickets
+# were reported CLOSED TWICE with their defects live; red-check would have caught
+# all three, and nobody ran it until cycle 10.
+# ===========================================================================
+section "V2 red-check asks whether the TICKET'S OWN tests ran  [repo: rprobe]"
+mk_repo rprobe
+
+# A stand-in pytest. `python3 -m pytest` puts the cwd first on sys.path, so this
+# package shadows any real pytest for every probe run inside this repo — which
+# is what lets the suite keep its "no pytest, no pip, no network" constraint
+# while still driving the collect-only probe end to end.
+mkdir -p pytest
+: > pytest/__init__.py
+cat > pytest/__main__.py <<'EOF'
+import os
+import sys
+
+args = [a for a in sys.argv[1:] if not a.startswith("-")]
+mode = open("FAKE_MODE").read().strip() if os.path.exists("FAKE_MODE") else "ok"
+if "--collect-only" in sys.argv:
+    if mode == "desel":
+        print("2 deselected in 0.01s")
+        sys.exit(5)
+    for a in args:
+        print(a)
+    print("%d tests collected in 0.01s" % len(args))
+    sys.exit(0)
+print("1 failed in 0.02s")
+sys.exit(1)
+EOF
+cat > .swarm-loop/acceptance/test_marked.py <<'EOF'
+import pytest
+
+
+@pytest.mark.ticket("T-1")
+def test_one():
+    assert False
+
+
+@pytest.mark.ticket("T-2")
+def test_two():
+    assert False
+
+
+@pytest.mark.ticket("T-3")
+def test_three():
+    assert False
+EOF
+cat > tickets.json <<'EOF'
+{"version": 1, "project": "e2e", "tickets": [
+ {"id": "T-1", "title": "red for a reason unrelated to this ticket",
+  "verify": "echo '1 failed in 0.02s'; exit 1", "scope": ["a/**"], "depends_on": []},
+ {"id": "T-2", "title": "swallows its own output",
+  "verify": "python3 -m pytest -q t > /dev/null 2>&1 || echo '1 failed'; exit 1",
+  "scope": ["b/**"], "depends_on": []},
+ {"id": "T-3", "title": "a non-zero exit manufactured over a green run",
+  "verify": "echo '3 passed in 0.01s'; exit 1", "scope": ["c/**"], "depends_on": []}
+]}
+EOF
+gq add -A; gq commit -qm probe
+
+ck "V2 the node-id scanner finds the ticket's own frozen test" \
+   ".swarm-loop/acceptance/test_marked.py::test_one" \
+   "$(python3 - <<'PY'
+import json, os, sys
+sys.path.insert(0, os.environ["SL_DIR"])
+import swarmloop
+state = json.load(open(".swarm-loop/state.json"))
+print(",".join(swarmloop._ticket_test_nodes(os.getcwd(), state, "T-1")))
+PY
+)"
+
+sl red-check --ticket T-1
+ck_exit "V2 CONTROL: a gate whose own tests DO get collected is still a real gate" 0 "$RC"
+ck_has "V2 CONTROL: ...and says so" "frozen test(s) survive collection here"
+ck_hasnt "V2 CONTROL: ...with no deselection finding" "DESELECTED"
+
+echo desel > FAKE_MODE
+gq add -A; gq commit -qm desel
+sl red-check --ticket T-1
+ck_exit "V2 on the DISPATCH path a deselection finding is EXIT-CODE-NEUTRAL" 0 "$RC"
+ck_has "V2 ...it is still said out loud" \
+       "Whatever went red above, it was not this ticket's grading tests"
+ck_has "V2 ...and the ticket is still counted red there" "1 real"
+
+sl red-check --close --ticket T-1
+ck_exit "V2 --close REFUSES the gate whose own tests were deselected" 1 "$RC"
+ck_has "V2 ...bucketed as DESELECTED" "1 DESELECTED"
+ck_has "V2 ...and the incident is named" "went GREEN with the defect fully live"
+
+echo ok > FAKE_MODE
+gq add -A; gq commit -qm ok
+sl red-check --ticket T-2
+ck_exit "V2 SWALLOWED is advisory on the dispatch path too" 0 "$RC"
+ck_has "V2 ...DEVNULL_RE now reads ticket verify strings, not only metric commands" \
+       "SWALLOWED — the command discards its own output"
+sl red-check --close --ticket T-2
+ck_exit "V2 --close REFUSES a verify that throws its own output away" 1 "$RC"
+ck_has "V2 ...bucketed as SWALLOWED" "1 SWALLOWED"
+
+sl red-check --ticket T-3
+ck_exit "V2 FORCED is advisory in BOTH modes (a linter's red looks identical)" 0 "$RC"
+ck_has "V2 ...and says the exit code did not come from the test run" \
+       "this non-zero exit did not come from the test run"
+sl red-check --close --ticket T-3
+ck_exit "V2 ...--close does not refuse it either, and the limit is stated" 0 "$RC"
+ck_has "V2 ...ADVISORY ONLY, in the output, where it can be read" "ADVISORY ONLY"
+
+# ===========================================================================
+# V3 · the stamp, and the close-time gate that reads it
+#
+# `dispatch --close` is append-only bookkeeping about an AGENT: it never reads
+# the ticket's verify, cannot fail, and records a close even for a ref that was
+# never open. check-branch took no ticket id, so it could not know which gate it
+# was judging. Nothing prevented a ticket being marked done on a gate that
+# cannot go red.
+# ===========================================================================
+section "V3 red-check stamps a durable verdict  [repo: rstamp]"
+mk_repo rstamp
+cat > tickets.json <<'EOF'
+{"version": 1, "project": "e2e", "tickets": [
+ {"id": "T-1", "title": "an honest red gate",
+  "verify": "echo 'collected 3 items'; echo '3 failed'; exit 1",
+  "scope": ["a/**"], "depends_on": []},
+ {"id": "T-2", "title": "a gate that is already green",
+  "verify": "true", "scope": ["b/**"], "depends_on": []}
+]}
+EOF
+gq add -A; gq commit -qm stamp
+ck_nofile "V3 no ledger before the first red-check" ".swarm-loop/redcheck.jsonl"
+sl red-check --ticket T-1
+ck_exit "V3 a red gate passes" 0 "$RC"
+ck_file "V3 ...and the verdict outlives the terminal it was printed in" \
+        ".swarm-loop/redcheck.jsonl"
+ck "V3 ...stamped as red" "red" \
+   "$(python3 -c 'import json;print(json.loads(open(".swarm-loop/redcheck.jsonl").read().splitlines()[-1])["verdict"])')"
+ck "V3 ...against the base SHA, not the ref name (main can move)" "40" \
+   "$(python3 -c 'import json;print(len(json.loads(open(".swarm-loop/redcheck.jsonl").read().splitlines()[-1])["base_sha"]))')"
+sl red-check --ticket T-2
+ck_exit "V3 a VACUOUS gate still fails" 1 "$RC"
+ck "V3 ...and a refused run stamps too — the finding must outlive the refusal" "vacuous" \
+   "$(python3 -c 'import json;print(json.loads(open(".swarm-loop/redcheck.jsonl").read().splitlines()[-1])["verdict"])')"
+
+section "V3 check-branch --ticket, the D4 shape  [repo: rstamp2]"
+mk_repo rstamp2
+gq add -A; gq commit -qm state
+BASE_SHA=$(git rev-parse HEAD)
+gq checkout -b task/T-5
+echo work > src/t5.py
+gq add -A; gq commit -qm t5
+gq checkout main
+
+sl check-branch --branch task/T-5 --ticket T-5
+ck_exit "V3 no ledger at all: ADVISORY, never a veto — a run that predates it must not wedge" 0 "$RC"
+ck_has "V3 ...and it prints the command that would establish the stamp" "red-check --close --ticket T-5"
+
+python3 - "$BASE_SHA" <<'PY'
+import json, sys
+rec = {"ticket": "T-5", "verdict": "red", "base": "main", "base_sha": sys.argv[1],
+       "cmd": "pytest", "mode": "pre-dispatch", "timestamp": "2026-01-01T00:00:00"}
+open(".swarm-loop/redcheck.jsonl", "a").write(json.dumps(rec, sort_keys=True) + "\n")
+PY
+sl check-branch --branch task/T-5 --ticket T-5
+ck_exit "V3 a red stamp at an ancestor of the merge parent clears the branch" 0 "$RC"
+ck_has "V3 ...saying which SHA it was red at" "was RED at"
+
+sl check-branch --branch task/T-5 --ticket T-9
+ck_exit "V3 an unstamped, UNDATEABLE ticket is advisory — 'unknown' must keep a tree" 0 "$RC"
+ck_has "V3 ...and says why it is not refusing" "predates the ledger is not refused"
+
+# Dispatched AFTER the ledger's first stamp: blocking from the first stamp on.
+sl dispatch --agent a-t9 --kind ticket --subject "T-9 thing" --branch task/T-9
+sl check-branch --branch task/T-5 --ticket T-9
+ck_exit "V3 a ticket dispatched AFTER the first stamp and carrying none is REFUSED" 1 "$RC"
+ck_has "V3 ...naming the ledger it is missing from" "Nothing is stamped for T-9 at all"
+
+python3 - <<'PY'
+import json
+p = ".swarm-loop/dispatch.jsonl"
+out = []
+for line in open(p):
+    line = line.strip()
+    if not line:
+        continue
+    r = json.loads(line)
+    if r.get("dispatched_at"):
+        r["dispatched_at"] = "2020-01-01T00:00:00"
+    out.append(json.dumps(r, sort_keys=True))
+open(p, "w").write("\n".join(out) + "\n")
+PY
+sl check-branch --branch task/T-5 --ticket T-9
+ck_exit "V3 ...but the SAME ticket dispatched before the ledger began is advisory" 0 "$RC"
+ck_has "V3 ...saying so with both timestamps" "before this ledger's first stamp"
+
+python3 - "$BASE_SHA" <<'PY'
+import json, sys
+rec = {"ticket": "T-7", "verdict": "weak", "base": "main", "base_sha": sys.argv[1],
+       "cmd": "pytest", "mode": "pre-dispatch", "timestamp": "2026-01-02T00:00:00"}
+open(".swarm-loop/redcheck.jsonl", "a").write(json.dumps(rec, sort_keys=True) + "\n")
+PY
+sl check-branch --branch task/T-5 --ticket T-7
+ck_exit "V3 a ticket whose only stamp is WEAK is refused — a stamp is not a pass" 1 "$RC"
+ck_has "V3 ...and the refusal shows what IS stamped" "What IS stamped for it"
+
+# A red stamp against a base the branch never forked from is a red about a tree
+# this branch has nothing to do with. LATER_SHA is a real commit that main
+# acquired AFTER task/T-5 was cut, so it is genuinely not an ancestor of the
+# fork — as opposed to a sha git cannot resolve at all, which is the UNKNOWN
+# case below and must not veto.
+echo later > src/later.py
+gq add -A; gq commit -qm later
+LATER_SHA=$(git rev-parse HEAD)
+python3 - "$LATER_SHA" <<'PY'
+import json, sys
+rec = {"ticket": "T-6", "verdict": "red", "base": "main",
+       "base_sha": sys.argv[1], "cmd": "pytest", "mode": "pre-dispatch",
+       "timestamp": "2026-01-03T00:00:00"}
+open(".swarm-loop/redcheck.jsonl", "a").write(json.dumps(rec, sort_keys=True) + "\n")
+PY
+sl check-branch --branch task/T-5 --ticket T-6
+ck_exit "V3 a red stamped at a base that is NOT an ancestor does not clear the branch" 1 "$RC"
+ck_has "V3 ...and the reason is spelled out" "a tree this branch never forked from"
+
+# ...but a base sha git CANNOT PLACE is not evidence of anything. _is_ancestor's
+# own contract is that unknown keeps a tree, and a rewritten or pruned history
+# must not be read as "this gate was never red".
+python3 - <<'PY'
+import json
+rec = {"ticket": "T-8", "verdict": "red", "base": "main",
+       "base_sha": "0" * 40, "cmd": "pytest", "mode": "pre-dispatch",
+       "timestamp": "2026-01-04T00:00:00"}
+open(".swarm-loop/redcheck.jsonl", "a").write(json.dumps(rec, sort_keys=True) + "\n")
+PY
+sl check-branch --branch task/T-5 --ticket T-8
+ck_exit "V3 a red stamp whose base sha git cannot resolve is ADVISORY, not a veto" 0 "$RC"
+ck_has "V3 ...saying git could not place it" "git cannot place relative to"
+
+# THE BACKWARD-COMPATIBILITY ASSERTION. Every existing check-branch invocation
+# in SKILL.md, in merge-protocol.md and in every packet omits --ticket, and must
+# keep working verbatim — including on a repo that HAS a populated ledger.
+sl check-branch --branch task/T-5
+ck_exit "V3 check-branch WITHOUT --ticket is unchanged, ledger or no ledger" 0 "$RC"
+ck_hasnt "V3 ...and says nothing about red-check at all" "red-check"
+ck_has "V3 ...still ending in its own verdict line" "check-branch: OK"
+
+
+# ===========================================================================
 cd / 2>/dev/null || true
 ELAPSED=$(( $(date +%s) - START_TS ))
 echo
