@@ -126,3 +126,13 @@ A lane told only to "follow the brief" builds the wrong thing and reports the fa
 APPLY: say in every packet that file:line references may have drifted, that a named test or target may be the wrong one, and that a prescribed fix is a starting point rather than a solution — then require, in the completion report, a list of any premise of the brief the agent found to be false. Hand over the reproduction and the constraint; let the lane derive the fix. The agent executing a brief is the one positioned to falsify it, and the only cost of asking is a line in the packet.
 
 *Coverage: NOT in SKILL.md or references/task-packets.md — the four-part packet contract (objective, output format, guidance, boundaries) has no falsified-premise report field, and no phase asks for one. Propose a `PREMISES-FALSIFIED` field in the packet template alongside `BUGS-OBSERVED` / `NEEDS` / `CONFIG-TOUCHED`.*
+
+## A sabotage witness that cannot see the code defaults to "not caught" — the reassuring answer
+
+Mutation testing is only evidence if the mutated line provably executed; the skill already says to prove it. What it does not say is that the PROOF ITSELF fails in the reassuring direction. Measured: a lane's witness harness traced execution and reported `NEVER RAN` for all eight of its mutations. The mutations had run — the behavioural column showed the sabotaged results plainly — but the harness compared the traced `co_filename` against the package's source path while the package imports through a symlink farm, so the resolved filename never matched the expected one and every comparison silently failed.
+
+Read the failure mode exactly: a broken witness says "the mutation never executed", which an agent reads as "inconclusive, try again", when the truth was "caught". Invert the situation — a real wall with a broken witness — and the same harness says NOT CAUGHT for a wall that is working, or, worse, an agent that trusts a green suite plus a broken witness concludes a gap exists where none does and "fixes" working code. Either way the instrument fails toward a comfortable story.
+
+APPLY: any execution witness must `Path(...).resolve()` BOTH sides before comparing, and must be validated against a known-executing line before it is trusted about an unknown one. State the negative control in the report: "the witness fired for line X, which I know runs." A witness that has never been seen to fire is not evidence, and a sabotage result carrying one is not a measurement.
+
+*Coverage: SKILL.md's rung-2 sabotage duty says to "prove the sabotage reached the code path before believing any result" — correct and insufficient, because it does not say the proof mechanism itself needs a positive control. Propose adding the negative-control requirement there.*
