@@ -582,7 +582,8 @@ rm -f .swarm-loop/history.csv
 sl measure --cycle 0
 ck_exit "measure self-heals a missing history.csv" 0 "$RC"
 # csv.writer emits CRLF line terminators, so strip the CR before comparing.
-ck "the self-healed file has the canonical header" "cycle,metric_id,value,error,timestamp,source" \
+ck "the self-healed file has the canonical header" \
+   "cycle,metric_id,value,error,timestamp,source,selected,deselected" \
    "$(head -1 .swarm-loop/history.csv | tr -d '\r')"
 sl analyze --cycle 0
 ck_exit "analyze reads the self-healed file" 0 "$RC"
@@ -6357,7 +6358,17 @@ import json, os, sys
 sys.path.insert(0, os.environ["SL_DIR"])
 import swarmloop
 state = json.load(open(".swarm-loop/state.json"))
-print(",".join(swarmloop._ticket_test_nodes(os.getcwd(), state, "T-1")))
+nodes, unparsed = swarmloop._ticket_test_nodes(os.getcwd(), state, "T-1")
+print(",".join(nodes))
+PY
+)"
+ck "V2 ...and reports NO unparsed file when every frozen file parses" "[]" \
+   "$(python3 - <<'PY'
+import json, os, sys
+sys.path.insert(0, os.environ["SL_DIR"])
+import swarmloop
+state = json.load(open(".swarm-loop/state.json"))
+print(swarmloop._ticket_test_nodes(os.getcwd(), state, "T-1")[1])
 PY
 )"
 
@@ -6384,7 +6395,9 @@ gq add -A; gq commit -qm ok
 sl red-check --ticket T-2
 ck_exit "V2 SWALLOWED is advisory on the dispatch path too" 0 "$RC"
 ck_has "V2 ...DEVNULL_RE now reads ticket verify strings, not only metric commands" \
-       "SWALLOWED — the command discards its own output"
+       "discards its own output"
+ck_has "V2 ...and names the SEGMENT whose output went away, not just the redirect" \
+       "SWALLOWED — \`python3 -m pytest -q t > /dev/null 2>&1\`"
 sl red-check --close --ticket T-2
 ck_exit "V2 --close REFUSES a verify that throws its own output away" 1 "$RC"
 ck_has "V2 ...bucketed as SWALLOWED" "1 SWALLOWED"
@@ -6533,6 +6546,747 @@ sl check-branch --branch task/T-5
 ck_exit "V3 check-branch WITHOUT --ticket is unchanged, ledger or no ledger" 0 "$RC"
 ck_hasnt "V3 ...and says nothing about red-check at all" "red-check"
 ck_has "V3 ...still ending in its own verdict line" "check-branch: OK"
+
+
+
+# ===========================================================================
+# V4 · the DESELECTION discriminator counted pytest's ECHO OF THE QUESTION
+#
+# `seen()` accepted any collect-only line ending in "/<file>::<test>" — and that
+# is EXACTLY the shape of pytest's own failure lines. Measured, pytest 6.2.4,
+# `--collect-only -q`, exit 4:
+#     ERROR: not found: /abs/.../.swarm-loop/acceptance/test_x.py::test_one
+#     ERROR: file or directory not found: .swarm-loop/acceptance/test_x.py::test_one
+# So a node id that DOES NOT EXIST scored hits == len(nodes), the probe answered
+# ('ok', 'all N frozen test(s) survive collection here'), red-check printed
+# "a real gate" and stamped `red`, and check-branch --ticket accepted it. The
+# whole deselection fix rested on a discriminator that an error message quoting
+# the question back could satisfy. The collect-only RETURN CODE was available on
+# every one of those runs and was never read.
+#
+# The V2 fixture's stand-in pytest could not see this: in "ok" mode it prints the
+# requested node ids back verbatim, which is byte-identical to the not-found
+# echo. So this fixture's stand-in emits the REAL error shapes.
+# ===========================================================================
+section "V4 the probe read pytest's error echo as evidence  [repo: rprobe2]"
+mk_repo rprobe2
+
+# A stand-in pytest that can produce every measured collect-only shape. The
+# modes are named for what REAL pytest does, and the exit codes are the ones it
+# actually returns — 4 for an unresolvable node id (including the ImportError
+# case: naming a node id inside a module that fails to import is a USAGE error,
+# not a collection interrupt), 5 for "ran and collected nothing".
+mkdir -p pytest
+: > pytest/__init__.py
+cat > pytest/__main__.py <<'EOF'
+import os
+import sys
+
+args = [a for a in sys.argv[1:] if not a.startswith("-")]
+mode = open("FAKE_MODE").read().strip() if os.path.exists("FAKE_MODE") else "ok"
+if "--collect-only" in sys.argv:
+    if mode == "notfound":
+        for a in args:
+            print("ERROR: not found: %s" % os.path.join(os.getcwd(), a))
+            print("(no name '%s' in any of [<Module x.py>])" % os.path.join(os.getcwd(), a))
+        sys.exit(4)
+    if mode == "importerr":
+        for a in args:
+            print("ERROR: not found: %s" % os.path.join(os.getcwd(), a))
+        print("==================================== ERRORS ====================================")
+        print("______________ ERROR collecting .swarm-loop/acceptance/test_marked.py __________")
+        print("ImportError while importing test module 'test_marked.py'.")
+        print("E   ModuleNotFoundError: No module named 'src'")
+        print("no tests collected, 1 error in 0.03s")
+        sys.exit(4)
+    if mode == "param":
+        for a in args:
+            print("%s[1]" % a)
+            print("%s[2]" % a)
+        print("%d tests collected in 0.01s" % (2 * len(args)))
+        sys.exit(0)
+    if mode == "silent":
+        sys.exit(5)
+    if mode == "desel":
+        print("no tests collected (2 deselected) in 0.00s")
+        sys.exit(5)
+    for a in args:
+        print(a)
+    print("%d tests collected in 0.01s" % len(args))
+    sys.exit(0)
+print("1 failed in 0.02s")
+sys.exit(1)
+EOF
+cat > .swarm-loop/acceptance/test_marked.py <<'EOF'
+import pytest
+
+
+@pytest.mark.ticket("T-1")
+def test_one():
+    assert False
+EOF
+cat > tickets.json <<'EOF'
+{"version": 1, "project": "e2e", "tickets": [
+ {"id": "T-1", "title": "a red that may or may not be this ticket's",
+  "verify": "echo '1 failed in 0.02s'; exit 1", "scope": ["a/**"], "depends_on": []}
+]}
+EOF
+gq add -A; gq commit -qm probe2
+
+# THE POSITIVE COUNTERPART FIRST, so the negatives below are not "everything
+# refuses". Real collection, real exit 0.
+echo ok > FAKE_MODE
+gq add -A; gq commit -qm ok
+sl red-check --close --ticket T-1
+ck_exit "V4 CONTROL: tests that really are collected still close clean" 0 "$RC"
+ck_has "V4 CONTROL: ...and the affirmative sentence is earned" \
+       "frozen test(s) survive collection here"
+
+# THE DEFECT. Every node id appears in the output — inside an ERROR line.
+echo notfound > FAKE_MODE
+gq add -A; gq commit -qm notfound
+sl red-check --ticket T-1
+ck_hasnt "V4 an ERROR line quoting the node id is NOT evidence of collection" \
+         "frozen test(s) survive collection here"
+ck_has "V4 ...it is reported as unresolvable, with the exit code that said so" \
+       "could not resolve ANY of this ticket's"
+ck_has "V4 ...and names the consequence for the red" \
+       "it was not this ticket's test"
+sl red-check --close --ticket T-1
+ck_exit "V4 --close REFUSES a red whose grading test is not in the tree" 1 "$RC"
+ck "V4 ...and the stamp says so, so check-branch cannot be told otherwise" "deselected" \
+   "$(python3 -c 'import json;print(json.loads(open(".swarm-loop/redcheck.jsonl").read().splitlines()[-1])["verdict"])')"
+
+# A COLLECTION ERROR IS A DIFFERENT FACT AND MUST NOT REFUSE. The throwaway
+# worktree has no venv, so ImportError on a third-party dependency is the
+# DEFAULT for any project that has dependencies; refusing here would refuse
+# every ticket in every such project.
+echo importerr > FAKE_MODE
+gq add -A; gq commit -qm importerr
+sl red-check --close --ticket T-1
+ck_exit "V4 a COLLECTION ERROR is advisory even under --close (no venv is the default)" 0 "$RC"
+ck_has "V4 ...and says the red is unverified rather than disproved" \
+       "this red is simply unverified, not disproved"
+ck_hasnt "V4 ...and still never claims the tests survived" \
+         "frozen test(s) survive collection here"
+
+# PARAMETRIZATION. pytest expands `::test_one` to `::test_one[1]`, which does not
+# equal and does not end with "/test_one" — so the discriminator scored hits == 0
+# on one of the commonest test shapes and reported "a rootdir/path-shape
+# difference, not a finding". Both halves of that sentence were wrong.
+echo param > FAKE_MODE
+gq add -A; gq commit -qm param
+sl red-check --close --ticket T-1
+ck_exit "V4 a PARAMETRIZED grading test is collected, not a phantom deselection" 0 "$RC"
+ck_has "V4 ...and is counted as surviving collection" \
+       "frozen test(s) survive collection here"
+ck_hasnt "V4 ...with no rootdir story invented to explain it" \
+         "rootdir/path-shape difference"
+
+# The `empty` verdict used to be unreachable: it was gated on PYTEST_SHAPE_RE,
+# which deliberately does not match "no tests collected". Keyed off exit 5 it is
+# reachable under real pytest (measured: a conftest `pytest_collection_modifyitems`
+# that empties items exits 5 and prints nothing under -q).
+echo silent > FAKE_MODE
+gq add -A; gq commit -qm silent
+sl red-check --close --ticket T-1
+ck_exit "V4 pytest exiting 5 with no output at all REFUSES under --close" 1 "$RC"
+ck_has "V4 ...and the 'collected NONE' verdict is finally reachable" \
+       "the probe collected NONE of this ticket's"
+
+# And the plain deselection path, on this fixture, still lands where it did.
+echo desel > FAKE_MODE
+gq add -A; gq commit -qm desel2
+sl red-check --close --ticket T-1
+ck_exit "V4 CONTROL: a genuine deselection still refuses under --close" 1 "$RC"
+ck_has "V4 CONTROL: ...named as a DESELECTION, not as a missing test" \
+       "were DESELECTED by this project's own pytest configuration"
+
+
+# ===========================================================================
+# V5 · DEVNULL was matched against the WHOLE verify string
+#
+# `command -v jq >/dev/null 2>&1 || exit 3; pytest -q tests/test_t1.py` scored
+# SWALLOWED — a gate whose test output is entirely visible, refused because a
+# routine shell idiom appears somewhere else in the command. Under --close that
+# is exit 1 AND a `swallowed` stamp, which check-branch --ticket then reads as a
+# permanent veto; the remedy check-branch prints (re-run red-check --close)
+# re-runs the same string and re-stamps `swallowed`. A false refusal on the
+# loop's own merge step that the printed remedy cannot clear.
+# ===========================================================================
+section "V5 the /dev/null match is anchored to the test run  [repo: rdevnull]"
+mk_repo rdevnull
+
+ck "V5 the anchoring table, in one shot (1 = SWALLOWED)" \
+   "1 0 0 1 0 1 0 0 1 0" \
+   "$(python3 - <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["SL_DIR"])
+import swarmloop as s
+cases = [
+    # the shape the check exists for: the test runner output itself goes away
+    "pytest -q tests > /dev/null 2>&1 || echo '1 failed'; exit 1",
+    # the measured FALSE POSITIVE: a precondition probe, tests fully visible
+    "command -v jq >/dev/null 2>&1 || exit 3; pytest -q tests/test_t1.py",
+    # the other measured false positive: a quiet install, tests fully visible
+    "npm ci >/dev/null 2>&1 && npx jest tests/t1.test.ts",
+    # a runner behind a name this code cannot know, with nothing else visible
+    "./gate.sh >/dev/null 2>&1; echo '1 failed'; exit 1",
+    # ...but the same unknown script is NOT flagged when a runner IS visible
+    "./setup.sh >/dev/null; pytest -q tests",
+    # a wrapper script whose NAME says it runs tests
+    "./scripts/verify.sh check > /dev/null 2>&1; echo '1 failed'; exit 1",
+    # no redirect at all
+    "echo '1 failed in 0.02s'; exit 1",
+    # a redirect to a FILE is the remedy the message recommends, never a finding
+    "pytest -q tests > .swarm-loop/reports/t1.log 2>&1; exit 1",
+    "go test ./... > /dev/null 2>&1; echo '1 failed'; exit 1",
+    "mkdir -p out 2>/dev/null; pytest -q tests",
+]
+print(" ".join("1" if s._swallowing_redirect(c) else "0" for c in cases))
+PY
+)"
+
+# END TO END, because a helper's unit table is not the gate. The verify string
+# below is the verifier's measured false positive verbatim.
+mkdir -p pytest
+: > pytest/__init__.py
+cat > pytest/__main__.py <<'EOF'
+import sys
+args = [a for a in sys.argv[1:] if not a.startswith("-")]
+if "--collect-only" in sys.argv:
+    for a in args:
+        print(a)
+    print("%d tests collected in 0.01s" % len(args))
+    sys.exit(0)
+print("1 failed in 0.02s")
+sys.exit(1)
+EOF
+cat > .swarm-loop/acceptance/test_marked.py <<'EOF'
+import pytest
+
+
+@pytest.mark.ticket("T-1")
+def test_one():
+    assert False
+
+
+@pytest.mark.ticket("T-2")
+def test_two():
+    assert False
+EOF
+cat > tickets.json <<'EOF'
+{"version": 1, "project": "e2e", "tickets": [
+ {"id": "T-1", "title": "a precondition probe, and fully visible tests",
+  "verify": "command -v git >/dev/null 2>&1 || exit 3; echo 'collected 4 items'; echo '4 failed in 0.2s'; exit 1",
+  "scope": ["a/**"], "depends_on": []},
+ {"id": "T-2", "title": "the runner's own output is thrown away",
+  "verify": "python3 -m pytest -q tests > /dev/null 2>&1 || echo '4 failed in 0.2s'; exit 1",
+  "scope": ["b/**"], "depends_on": []}
+]}
+EOF
+gq add -A; gq commit -qm devnull
+BASE_DN=$(git rev-parse HEAD)
+
+# The branch is built BEFORE red-check runs: red-check writes an UNCOMMITTED
+# .swarm-loop/redcheck.jsonl, and `git add -A` after it would carry orchestrator
+# state onto the branch, which check-branch vetoes for a different rule entirely.
+gq checkout -b task/T-1 -q
+echo w > a.txt; gq add -A; gq commit -qm t1
+gq checkout main -q
+
+sl red-check --close --ticket T-1
+ck_exit "V5 a precondition probe redirecting to /dev/null is NOT a swallowed gate" 0 "$RC"
+ck_hasnt "V5 ...and nothing is said about swallowing" "discards its own output"
+ck "V5 ...so the stamp is a plain red, which the merge gate accepts" "red" \
+   "$(python3 -c 'import json;print(json.loads(open(".swarm-loop/redcheck.jsonl").read().splitlines()[-1])["verdict"])')"
+sl check-branch --branch task/T-1 --ticket T-1
+ck_exit "V5 ...and the branch is not vetoed at merge by a shell idiom" 0 "$RC"
+
+# THE PAIRED POSITIVE. Identical fixture, and the redirect moved onto the runner.
+sl red-check --close --ticket T-2
+ck_exit "V5 CONTROL: the runner's own output going to /dev/null still REFUSES" 1 "$RC"
+ck_has "V5 CONTROL: ...and the message names the SEGMENT, not just the redirect" \
+       "SWALLOWED — \`python3 -m pytest -q tests > /dev/null 2>&1\`"
+ck_has "V5 CONTROL: ...bucketed" "1 SWALLOWED"
+
+
+# ===========================================================================
+# V6 · the pre-dispatch path printed `red` while STAMPING a refusal
+#
+# red-check with no --close printed `red`, counted the ticket in the `red`
+# bucket and exited 0 — while writing verdict `swallowed`/`deselected` into
+# redcheck.jsonl. SKILL.md justified --close by saying the false positive can
+# only fire at merge; it fired at merge from a stamp written at DISPATCH, with
+# no exit-code signal and a summary line ("1 real") that contradicted the file
+# the merge gate reads.
+# ===========================================================================
+section "V6 the dispatch path says what it stamped  [repo: rpredisp]"
+mk_repo rpredisp
+mkdir -p pytest
+: > pytest/__init__.py
+cat > pytest/__main__.py <<'EOF'
+import sys
+args = [a for a in sys.argv[1:] if not a.startswith("-")]
+if "--collect-only" in sys.argv:
+    for a in args:
+        print(a)
+    print("%d tests collected in 0.01s" % len(args))
+    sys.exit(0)
+print("1 failed in 0.02s")
+sys.exit(1)
+EOF
+cat > .swarm-loop/acceptance/test_marked.py <<'EOF'
+import pytest
+
+
+@pytest.mark.ticket("T-1")
+def test_one():
+    assert False
+
+
+@pytest.mark.ticket("T-2")
+def test_two():
+    assert False
+EOF
+cat > tickets.json <<'EOF'
+{"version": 1, "project": "e2e", "tickets": [
+ {"id": "T-1", "title": "the runner's output is thrown away",
+  "verify": "python3 -m pytest -q tests > /dev/null 2>&1 || echo '4 failed in 0.2s'; exit 1",
+  "scope": ["a/**"], "depends_on": []},
+ {"id": "T-2", "title": "an honest red gate",
+  "verify": "echo 'collected 3 items'; echo '3 failed'; exit 1",
+  "scope": ["b/**"], "depends_on": []}
+]}
+EOF
+gq add -A; gq commit -qm predisp
+
+sl red-check --ticket T-1
+ck_exit "V6 the dispatch path still never refuses (a false positive must not stop a build)" 0 "$RC"
+ck_has "V6 ...but it no longer prints \`red\` and stamps something else silently" \
+       "but STAMPED \`swallowed\`"
+ck_has "V6 ...naming the command that will refuse the branch later" \
+       "will REFUSE at merge"
+ck_has "V6 ...and the summary reconciles the two" \
+       "of those verdict(s) are NOT \`red\`"
+ck_has "V6 ...and says re-running alone cannot clear it" \
+       "re-stamps the same verdict"
+ck "V6 ...the stamp itself stays honest" "swallowed" \
+   "$(python3 -c 'import json;print(json.loads(open(".swarm-loop/redcheck.jsonl").read().splitlines()[-1])["verdict"])')"
+
+sl red-check --ticket T-2
+ck_exit "V6 CONTROL: an honest red gate passes the dispatch path" 0 "$RC"
+ck_hasnt "V6 CONTROL: ...with no merge-time warning attached to it" "will REFUSE at merge"
+ck_hasnt "V6 CONTROL: ...and no reconciliation line" "of those verdict(s) are NOT"
+
+
+# ===========================================================================
+# V7 · the merge gate's evidence store was FAIL-OPEN on truncation
+#
+# `: > .swarm-loop/redcheck.jsonl` turned a live VETO into exit 0 for the whole
+# run: an empty file parsed to {}, _redcheck_gate took its "no ledger yet"
+# branch, and printed `no .swarm-loop/redcheck.jsonl exists` — about a file it
+# had just opened. redcheck.jsonl is ALSO not in git-guard's LEDGER_NAMES, so
+# the redirect that does this is not blocked the way it is for state.json /
+# goals.json / manifest.json (that half is a NEEDS, recorded in SKILL.md).
+# ===========================================================================
+section "V7 an emptied ledger is a finding, not a clean slate  [repo: rledger]"
+mk_repo rledger
+cat > tickets.json <<'EOF'
+{"version": 1, "project": "e2e", "tickets": [
+ {"id": "T-1", "title": "a gate that is already green", "verify": "true",
+  "scope": ["a/**"], "depends_on": []}
+]}
+EOF
+gq add -A; gq commit -qm ledger
+gq checkout -b task/T-1 -q
+echo w > a.txt; gq add -A; gq commit -qm t1
+gq checkout main -q
+
+sl red-check --ticket T-1
+ck_exit "V7 a vacuous gate stamps and refuses" 1 "$RC"
+sl dispatch --agent a-t1 --kind ticket --subject "T-1 thing" --branch task/T-1
+sl check-branch --branch task/T-1 --ticket T-1
+ck_exit "V7 ...so the branch is vetoed at merge" 1 "$RC"
+
+: > .swarm-loop/redcheck.jsonl
+sl check-branch --branch task/T-1 --ticket T-1
+ck_exit "V7 TRUNCATING the ledger does NOT clear the veto" 1 "$RC"
+ck_has "V7 ...and the advisory no longer claims the file is absent" \
+       "EXISTS but holds no usable verdict"
+ck_hasnt "V7 ...specifically, it does not say 'no redcheck.jsonl exists'" \
+         "so nothing here can say whether"
+
+echo 'not json at all' > .swarm-loop/redcheck.jsonl
+sl check-branch --branch task/T-1 --ticket T-1
+ck_exit "V7 a ledger of unparseable lines is refused the same way" 1 "$RC"
+
+# THE POSITIVE COUNTERPART: absent is still absent, and still advisory. The D4
+# rule — a run that has never stamped must not be wedged by a gate it predates —
+# is what this whole change is not allowed to break.
+rm -f .swarm-loop/redcheck.jsonl
+sl check-branch --branch task/T-1 --ticket T-1
+ck_exit "V7 CONTROL: an ABSENT ledger is still an advisory, never a veto" 0 "$RC"
+ck_has "V7 CONTROL: ...and says the file does not exist" "exists, so nothing"
+
+
+# ===========================================================================
+# V8 · check-branch --ticket never validated the id against the graph
+#
+# cmd_check_branch did not load the ticket graph at all, so an unknown id had no
+# stamps and no dispatch record, `when` came back None, and the gate took its
+# "predates the ledger" advisory branch and exited 0. A one-character typo
+# silently disarmed the merge gate while printing a reassuring line, and nothing
+# distinguished it from a genuine resumed-run advisory.
+# ===========================================================================
+section "V8 a mistyped --ticket cannot disarm the merge gate  [repo: rtypo]"
+mk_repo rtypo
+cat > tickets.json <<'EOF'
+{"version": 1, "project": "e2e", "tickets": [
+ {"id": "T-1", "title": "a gate that is already green", "verify": "true",
+  "scope": ["a/**"], "depends_on": []}
+]}
+EOF
+gq add -A; gq commit -qm typo
+gq checkout -b task/T-1 -q
+echo w > a.txt; gq add -A; gq commit -qm t1
+gq checkout main -q
+sl red-check --ticket T-1
+ck_exit "V8 the vacuous gate stamps" 1 "$RC"
+sl dispatch --agent a-t1 --kind ticket --subject "T-1 thing" --branch task/T-1
+sl check-branch --branch task/T-1 --ticket T-1
+ck_exit "V8 CONTROL: the REAL id is judged, and vetoed" 1 "$RC"
+
+sl check-branch --branch task/T-1 --ticket T-l
+ck_exit "V8 a one-character typo is REFUSED, not waved through as 'predates the ledger'" 1 "$RC"
+ck_has "V8 ...naming the graph it is not in" "is not a ticket in"
+ck_has "V8 ...and saying what the typo would otherwise have done" "DISARMING the merge gate"
+ck_hasnt "V8 ...and it is NOT reported as a ticket the ledger predates" \
+         "predates the ledger is not refused"
+
+sl check-branch --branch task/T-1 --ticket t-1
+ck_has "V8 ...a case-only typo gets the near-miss suggestion" "Did you mean: T-1"
+
+# Where there is no graph the id CANNOT be validated, and saying so out loud is
+# the difference between "checked" and "not checkable". Never a veto: refusing
+# every --ticket on a repo with no graph would wedge exactly the resumed runs the
+# D4 shape exists to protect.
+rm -f tickets.json
+gq add -A; gq commit -qm nograph
+sl check-branch --branch task/T-1 --ticket T-zzz
+ck_has "V8 with NO graph the id is unvalidatable, and the output says so" \
+       "could NOT be validated"
+ck_exit "V8 ...but that is an advisory, not a veto" 0 "$RC"
+
+
+# ===========================================================================
+# V9 · a frozen acceptance file that would not PARSE was reported as absent
+#
+# _ticket_test_nodes swallowed OSError/SyntaxError/ValueError per file and
+# continued, so a ticket whose only grading test lived in the unparseable file
+# was reported as "this ticket carries no frozen test at all — freeze's
+# acceptance-coverage gate owns that finding, not this one". Neither half is
+# supportable: the test may be right there, and the coverage gate counts marks
+# with the SAME scanner, so it will not own the finding either.
+# ===========================================================================
+section "V9 an unparseable frozen test is a stated unknown  [repo: rparse]"
+mk_repo rparse
+cat > .swarm-loop/acceptance/test_marked.py <<'EOF'
+import pytest
+
+
+@pytest.mark.ticket("T-1")
+def test_one(:
+    assert False
+EOF
+cat > tickets.json <<'EOF'
+{"version": 1, "project": "e2e", "tickets": [
+ {"id": "T-1", "title": "an honest red gate",
+  "verify": "echo 'collected 3 items'; echo '3 failed'; exit 1",
+  "scope": ["a/**"], "depends_on": []}
+]}
+EOF
+gq add -A; gq commit -qm parse
+ck "V9 the scanner RETURNS the file it could not parse instead of dropping it" "1" \
+   "$(python3 - <<'PY'
+import json, os, sys
+sys.path.insert(0, os.environ["SL_DIR"])
+import swarmloop
+state = json.load(open(".swarm-loop/state.json"))
+print(len(swarmloop._ticket_test_nodes(os.getcwd(), state, "T-1")[1]))
+PY
+)"
+sl red-check --close --ticket T-1
+ck_has "V9 ...and red-check says the question is unanswered, not answered no" \
+       "could not be PARSED"
+ck_hasnt "V9 ...it no longer asserts the ticket has no frozen test" \
+         "carries no frozen test at all"
+ck_exit "V9 ...and an unknown still never refuses" 0 "$RC"
+
+
+# ===========================================================================
+# V10 · the DESELECTION signal reached no durable artifact
+#
+# measure's new warning went to stdout and nowhere else: history.csv gained no
+# column, analysis/cycle-N.json gained no key, and a later reader could not tell
+# a deselected green from a real one. Replayed on this branch before these
+# columns existed — honest freeze, then a marker filter added to pytest.ini with
+# src/ UNTOUCHED — `grep -ic desel` over history.csv, analysis/cycle-1.json and
+# analysis/cycle-1.md returned 0 / 0 / 0 while analyze printed ALL TARGETS MET.
+#
+# freeze's teeth are INTAKE-ONLY and always will be: the attack adds the filter
+# AFTER the freeze, which the intake gate by construction never sees. What CAN
+# see it is the comparison across cycles, which is what these columns are for.
+# ===========================================================================
+section "V10 selection facts reach disk, and analyze reads them  [repo: rdesel]"
+mk_repo rdesel
+cat > run_tests.sh <<'EOF'
+#!/bin/sh
+if [ -f FILTER ]; then
+  echo "2 deselected in 0.00s"
+  echo 0
+elif [ -f DONE ]; then
+  echo "2 passed in 0.03s"
+  echo 0
+else
+  echo "2 failed in 0.03s"
+  echo 2
+fi
+EOF
+chmod +x run_tests.sh
+python3 - <<'PY'
+import json
+p = ".swarm-loop/goals.json"
+g = json.load(open(p))
+g["metrics"] = [{"id": "accept", "name": "acceptance", "command": "./run_tests.sh",
+                 "target": 0, "direction": "minimize"}]
+json.dump(g, open(p, "w"), indent=2)
+PY
+sl freeze
+ck_exit "V10 the honest red baseline freezes" 0 "$RC"
+gq add -A; gq commit -qm harness
+
+sl measure --cycle 0
+ck_exit "V10 cycle 0 measures the honest baseline" 0 "$RC"
+ck "V10 ...and history.csv records what the run SELECTED" "2" \
+   "$(python3 -c '
+import csv
+r = list(csv.DictReader(open(".swarm-loop/history.csv")))
+print(r[-1]["selected"])')"
+ck "V10 ...and that it deselected NOTHING — 0, not blank, so a later cycle has a baseline" "0" \
+   "$(python3 -c '
+import csv
+r = list(csv.DictReader(open(".swarm-loop/history.csv")))
+print(r[-1]["deselected"])')"
+
+touch FILTER
+sl verify
+ck_exit "V10 the frozen harness is INTACT — the filter is not a frozen byte" 0 "$RC"
+sl measure --cycle 1
+ck_exit "V10 cycle 1 measures 0 errors, exactly as the incident did" 0 "$RC"
+ck "V10 ...and the DESELECTION is now on disk, not only on stdout" "2" \
+   "$(python3 -c '
+import csv
+r = list(csv.DictReader(open(".swarm-loop/history.csv")))
+print(r[-1]["deselected"])')"
+
+sl analyze --cycle 1
+ck_exit "V10 analyze does NOT signal all-targets-met over a post-freeze filter (exit 2 withheld)" 0 "$RC"
+# Asserted against the TERMINAL banner's own wording. The withholding notice
+# deliberately quotes the phrase ("ALL TARGETS MET is withheld while this
+# stands"), so a bare grep for it cannot tell the two apart -- which is the
+# "two code paths print the same shape" trap this whole battery is about.
+ck_hasnt "V10 ...the terminal banner does not fire" "**ALL TARGETS MET — act-dependent"
+ck_has "V10 ...and the reason is stated in the report, next to the integrity line" \
+       "TEST SELECTION CHANGED AFTER THE FREEZE"
+ck "V10 ...and analysis/cycle-1.json carries it for a reader who was not there" "False" \
+   "$(jget .swarm-loop/analysis/cycle-1.json 'd["all_targets_met"]')"
+ck "V10 ...naming the metric" "accept" \
+   "$(jget .swarm-loop/analysis/cycle-1.json 'd["selection_regressions"][0]["metric"]')"
+ck_has "V10 ...and the markdown says where the filter can hide" "conftest.py"
+
+# THE POSITIVE COUNTERPART. Same harness, no filter: all-targets-met still fires,
+# so the new condition is not a blanket refusal.
+rm -f FILTER
+touch DONE
+sl measure --cycle 2
+ck_exit "V10 CONTROL: the work lands and the suite goes green, with no filter" 0 "$RC"
+ck "V10 CONTROL: ...selecting the same 2 tests it always did" "2" \
+   "$(python3 -c '
+import csv
+r = list(csv.DictReader(open(".swarm-loop/history.csv")))
+print(r[-1]["selected"])')"
+sl analyze --cycle 2
+ck_exit "V10 CONTROL: with the target met and no selection change, ALL TARGETS MET still fires" 2 "$RC"
+ck_has "V10 CONTROL: ...and says so" "**ALL TARGETS MET — act-dependent"
+ck_hasnt "V10 CONTROL: ...with no selection complaint" "TEST SELECTION CHANGED AFTER THE FREEZE"
+
+# A NON-PYTEST metric must never be dragged into this: its output has no test
+# count at all, so both columns stay BLANK and there is nothing to regress from.
+section "V10 a non-pytest metric records no selection facts  [repo: rdesel2]"
+mk_repo rdesel2
+sl freeze
+gq add -A; gq commit -qm harness
+sl measure --cycle 0
+ck "V10 a cat-style non-pytest metric writes an EMPTY selected column, never 0" "" \
+   "$(python3 -c '
+import csv
+r = list(csv.DictReader(open(".swarm-loop/history.csv")))
+print(r[-1]["selected"])')"
+ck "V10 ...and an EMPTY deselected column" "" \
+   "$(python3 -c '
+import csv
+r = list(csv.DictReader(open(".swarm-loop/history.csv")))
+print(r[-1]["deselected"])')"
+sl analyze --cycle 0
+ck "V10 ...so it can never be reported as a selection regression" "0" \
+   "$(jget .swarm-loop/analysis/cycle-0.json 'len(d["selection_regressions"])')"
+
+# BACKWARD COMPATIBILITY: a history.csv written by a version with no selection
+# columns must still analyze, and must read as "unknown", not as zero.
+python3 - <<'PY'
+import csv
+rows = list(csv.reader(open(".swarm-loop/history.csv")))
+rows = [r[:6] for r in rows]
+with open(".swarm-loop/history.csv", "w", newline="") as f:
+    csv.writer(f).writerows(rows)
+PY
+sl analyze --cycle 0
+ck_exit "V10 a 6-column history.csv from an older version still analyzes" 0 "$RC"
+ck "V10 ...and its rows carry no selection claim either way" "None" \
+   "$(jget .swarm-loop/analysis/cycle-0.json 'd["metrics"][0]["latest_deselected"]')"
+
+
+# ===========================================================================
+# V11 · `bootstrap: true` — the graph's root ticket cannot go red, by design
+#
+# build-docs emits `"bootstrap": false` on every ticket and true on T-0 only.
+# T-0 is the sole root — repo skeleton, test harness, lint/CI config, marker
+# registration — and its declared outcome IS "pipeline green on an empty suite".
+# Run red-check against it in a clean worktree with nothing implemented and it
+# exits 0 (VACUOUS) or non-zero with nothing selected (WEAK): either way
+# red-check exits 1 on the ONE TICKET THAT MUST DISPATCH FIRST. A false refusal
+# on the loop's own dispatch step is strictly worse than the gap it closes.
+#
+# The exemption is exactly one thing wide — exempt from MUST-GO-RED, from
+# nothing else — and it is read from the DATA only. There is deliberately no
+# title heuristic: the live run's root is titled "Monorepo skeleton with green
+# empty verify pipeline", and keying on that string is how a check ends up
+# answering a question nobody asked.
+# ===========================================================================
+section "V11 the bootstrap ticket is exempt from must-go-red  [repo: rboot]"
+mk_repo rboot
+cat > tickets.json <<'EOF'
+{"version": 1, "project": "e2e", "tickets": [
+ {"id": "T-0", "title": "skeleton with a green empty pipeline", "bootstrap": true,
+  "verify": "true", "scope": ["a/**"], "depends_on": []},
+ {"id": "T-9", "title": "an ordinary ticket with the IDENTICAL gate", "bootstrap": false,
+  "verify": "true", "scope": ["b/**"], "depends_on": []}
+]}
+EOF
+gq add -A; gq commit -qm boot
+
+sl red-check --ticket T-0
+ck_exit "V11 a bootstrap ticket whose gate is green on an empty tree PASSES" 0 "$RC"
+ck_has "V11 ...and says why, in its own words" "that IS the outcome"
+ck_has "V11 ...bucketed as BOOTSTRAP, not counted as a real red" "1 BOOTSTRAP"
+ck_has "V11 ...and states how narrow the exemption is" "no gate at all is still NO GATE"
+ck "V11 ...stamped as bootstrap, so the ledger says what happened" "bootstrap" \
+   "$(python3 -c 'import json;print(json.loads(open(".swarm-loop/redcheck.jsonl").read().splitlines()[-1])["verdict"])')"
+
+# THE PAIR THAT PROVES THE EXEMPTION IS DOING THE WORK. Identical verify string,
+# identical output, identical exit code — and no `bootstrap: true`.
+sl red-check --ticket T-9
+ck_exit "V11 CONTROL: the IDENTICAL gate on a non-bootstrap ticket still FAILS" 1 "$RC"
+ck_has "V11 CONTROL: ...as VACUOUS" "VACUOUS"
+ck_hasnt "V11 CONTROL: ...with no bootstrap bucket" "BOOTSTRAP"
+
+# ...and it is not inferable from the title, which is where a heuristic would
+# have keyed. T-9's title says nothing about skeletons; T-0's says everything.
+cat > tickets.json <<'EOF'
+{"version": 1, "project": "e2e", "tickets": [
+ {"id": "T-0", "title": "Monorepo skeleton with green empty verify pipeline",
+  "verify": "true", "scope": ["a/**"], "depends_on": []}
+]}
+EOF
+gq add -A; gq commit -qm titleonly
+sl red-check --ticket T-0
+ck_exit "V11 a bootstrap-SOUNDING title with no bootstrap field is NOT exempt" 1 "$RC"
+ck_hasnt "V11 ...the title is never read for this" "BOOTSTRAP"
+
+# NO GATE is still NO GATE. The exemption removes a ticket from vacuous/weak at
+# the point of classification, so a bootstrap ticket with no verify never
+# reaches it.
+cat > tickets.json <<'EOF'
+{"version": 1, "project": "e2e", "tickets": [
+ {"id": "T-0", "title": "skeleton", "bootstrap": true,
+  "scope": ["a/**"], "depends_on": []}
+]}
+EOF
+gq add -A; gq commit -qm nogate
+sl red-check --ticket T-0
+ck_exit "V11 a bootstrap ticket with NO verify command still FAILS" 1 "$RC"
+ck_has "V11 ...as NO GATE" "NO GATE"
+
+# The contract is "true on T-0 only". A second one is a mistake or someone
+# widening the exemption to get a wave moving.
+cat > tickets.json <<'EOF'
+{"version": 1, "project": "e2e", "tickets": [
+ {"id": "T-0", "title": "skeleton", "bootstrap": true, "verify": "true",
+  "scope": ["a/**"], "depends_on": []},
+ {"id": "T-1", "title": "also claiming to be the root", "bootstrap": true, "verify": "true",
+  "scope": ["b/**"], "depends_on": []}
+]}
+EOF
+gq add -A; gq commit -qm twoboot
+sl red-check --ticket T-0
+ck_exit "V11 TWO bootstrap tickets is a refused graph, not a wider exemption" 3 "$RC"
+ck_has "V11 ...and the refusal names both" "T-0, T-1"
+ck_has "V11 ...and says what widening it silently would mean" \
+       "ships on a gate that cannot fail"
+
+# The graph is JSON written by another tool. `"bootstrap": "false"` is a NON-EMPTY
+# STRING, so plain truthiness would read the graph's own word for "no" as yes.
+cat > tickets.json <<'EOF'
+{"version": 1, "project": "e2e", "tickets": [
+ {"id": "T-0", "title": "skeleton", "bootstrap": "false", "verify": "true",
+  "scope": ["a/**"], "depends_on": []}
+]}
+EOF
+gq add -A; gq commit -qm strfalse
+sl red-check --ticket T-0
+ck_exit "V11 the STRING \"false\" is not truthy here — the ticket is not exempt" 1 "$RC"
+ck_has "V11 ...it is VACUOUS like any other green-on-empty gate" "VACUOUS"
+
+cat > tickets.json <<'EOF'
+{"version": 1, "project": "e2e", "tickets": [
+ {"id": "T-0", "title": "skeleton", "bootstrap": "maybe", "verify": "true",
+  "scope": ["a/**"], "depends_on": []}
+]}
+EOF
+gq add -A; gq commit -qm strmaybe
+sl red-check --ticket T-0
+ck_exit "V11 an unrecognised bootstrap value is REFUSED, never defaulted" 3 "$RC"
+ck_has "V11 ...saying a default either way is a silent exemption or a silent refusal" \
+       "silent exemption or a silent refusal"
+
+# The narrow exemption covers the WEAK shape too — a pipeline that exits non-zero
+# because it has nothing to run yet is the same pre-build fact as one that exits 0.
+cat > tickets.json <<'EOF'
+{"version": 1, "project": "e2e", "tickets": [
+ {"id": "T-0", "title": "skeleton", "bootstrap": true,
+  "verify": "echo 'no tests ran'; exit 5", "scope": ["a/**"], "depends_on": []},
+ {"id": "T-9", "title": "ordinary", "bootstrap": false,
+  "verify": "echo 'no tests ran'; exit 5", "scope": ["b/**"], "depends_on": []}
+]}
+EOF
+gq add -A; gq commit -qm weakboot
+sl red-check --ticket T-0
+ck_exit "V11 a bootstrap pipeline that selects nothing is exempt too" 0 "$RC"
+ck_has "V11 ...named as the pre-build shape it is" "nothing to run yet"
+sl red-check --ticket T-9
+ck_exit "V11 CONTROL: the IDENTICAL no-tests-ran gate without the field is still WEAK" 1 "$RC"
+ck_has "V11 CONTROL: ...as WEAK" "NO tests were"
 
 
 # ===========================================================================
