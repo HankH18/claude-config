@@ -6,8 +6,8 @@ The premise: worktrees moved conflicts from silent runtime corruption to visible
 
 0. **Step zero — PIN THE TIP, before any check reads the branch.** Resolve
    `git rev-parse task/<id>` **once**, at the start of collection, and run every
-   rung-1 check, the per-ticket attribution below, and the test-diff audit against
-   **that SHA** (`check-branch --branch <sha>`, `git diff main...<sha>`). Write the
+   rung-1 check, the per-ticket attribution below, and the removed-lines audit (the
+   WHOLE diff, not the test glob — step 9) against **that SHA** (`check-branch --branch <sha>`, `git diff main...<sha>`). Write the
    SHA into the collection record and the epoch report. **Re-assert it immediately
    before accepting: if `git rev-parse task/<id>` has moved, the collection is
    VOID — redo it against the new tip.**
@@ -32,7 +32,30 @@ The premise: worktrees moved conflicts from silent runtime corruption to visible
    nothing. Never dispatch verification against an unpinned ref, and never dispatch
    it unbounded; they are the same fix at two ends.
 
-1. **Eligibility gate (per branch, from Phase 5):** `check-branch` passed; changed files ⊆ ownership map; completion report received. Ineligible branches don't enter integration at all.
+   *And "clean" is a COMMAND, not an impression — it was prose in this step for its
+   whole life, and prose is exactly the half that did not happen.* Run it per branch at
+   collection, before any other check reads that tree:
+
+   ```bash
+   git -C <worktree> status --porcelain    # required EMPTY. One line is a refusal.
+   ```
+
+   **Measured: a lane's verifier found the worktree dirty at the moment it was briefed —
+   two files carried 112 uncommitted lines relative to the commit it was told to judge —
+   and the "verified facts" it had been handed (46 tests green, `verify` exit 0) had been
+   measured against the DIRTY tree.** The pinned SHA was therefore not what produced the
+   numbers, and nothing in the collection sequence could have revealed it: every other
+   check here reads the *commit*, which is precisely where the uncommitted bytes are not.
+   A tip pins what was committed and says nothing about what sits uncommitted beside it.
+   Non-empty output means the lane has work it never committed — ask the lane for the
+   commit, re-pin per this step, and re-measure. Do not commit it yourself: a tip you
+   wrote is not the lane's delivery, and it merges the one diff no worker's report
+   covers. **The rule the incident earns: never forward a number to a verifier without
+   having established that its provenance is the pinned commit.** That applies to the
+   numbers you pass on as much as the ones you take — the verifier above was handed
+   greens as facts, and had no way to know they came from bytes the SHA does not contain.
+
+1. **Eligibility gate (per branch, from Phase 5):** `check-branch` passed; changed files ⊆ ownership map; completion report received; **worktree clean at the pinned SHA** (`git -C <worktree> status --porcelain` empty — step 0), because a branch whose reported greens were measured against uncommitted bytes has not been measured at the tip you are about to merge. Ineligible branches don't enter integration at all.
 
    **Per-ticket attribution — measure "this ticket is done", do not judge it.** Every
    frozen metric is suite- or epic-level, so `@pytest.mark.ticket(...)` — whose whole
@@ -92,6 +115,10 @@ The premise: worktrees moved conflicts from silent runtime corruption to visible
    An argument list that resolves to **zero** branch names — `""`, `,`, an unset `"$IDS"` — is refused outright rather than answered: nothing compared is not a clean batch, and that is the shortest version of the failure mode below. Branches it could not answer about — a ref that does not resolve, a lane with zero commits — are **named**, never dropped, and make the exit code 1: at this point in the protocol an empty lane is a task that delivered nothing, and a shorter list read as a clean list is this command's whole failure mode. Exit 1 also covers a pair `merge-tree` could not judge, reported `UNKNOWN` rather than folded into CLEAN.
 
    **Its blind spot, which it prints on every run: it compares branches to EACH OTHER, never to the base.** `merge-tree` is unaffected by a stale base — two branches forked 27 commits ago both come back clean and then die at `git merge --ff-only` with exit 128 (reproduced; it is the same finding step 9 exists for). The command names every branch that is behind the base, out of the same commit counts `check-branch` and `check-wave` print — but that line is beside the verdict, never inside it. A clean pairwise verdict is never permission to land.
+
+   **File intersection is the cheap first pass and never the answer — and this protocol reasons that way in two places.** The ADVISORY row above intersects two branches' touched files; `check-branch`'s staleness line intersects the files that moved on the base with the files the lane owns, and clears the lane when that intersection is empty. The case that actually breaks is invisible to both: a lane whose TESTS depend on semantics a sibling changed — a validation rule tightened, a default flipped, an error type swapped, a serialization narrowed — **in files the lane never touches.** Textual mergeability is unaffected by every one of those, so `merge-tree` returns CLEAN, the staleness advisory stays silent, and the branch then fails at runtime or, worse, passes a weaker assertion than the one the base now requires. So when the intersection is empty, spend the second pass before clearing the lane: grep the lane's own directory for REFERENCES to the modules that moved on the base — imports, error types, constants, fixture factories — and read the base's diff for *behavioural* change rather than for moved paths. An empty intersection is a statement about text; the lane's tests encode expectations about behaviour.
+
+   **And when you do warn a lane, hand it the ANCESTRY FACT and let it measure the impact.** An inference about impact, shipped as if it were measured, is its own defect: one brief warned a lane that a rewritten module's "public surface may have moved" and the warning was simply wrong — the exported surface was byte-identical, and only a line number had drifted. State what you measured (this base moved these files, at these SHAs, since your fork) and leave the cost to the lane, which is standing in the tree where it can be measured. A lane sent to re-verify against a fact re-measures one thing and reports what it found; a lane sent to chase an inference you never tested spends its wave on your guess, and reports the failure as its own.
 
    **Do not move this check earlier.** SKILL.md Phase 4 makes `check-wave` a precondition of *spawning*, so at check-wave time every lane holds **zero commits**: run there, this command reports `0 comparable branches` with every member `UNANSWERABLE`, and a variant that printed tidy pairwise verdicts over empty branches would be a clean green about work that does not exist yet.
 
@@ -170,6 +197,24 @@ The premise: worktrees moved conflicts from silent runtime corruption to visible
    obvious shortcut and it is blocked one gate later: `check-branch` refuses any branch whose diff
    touches `.swarm-loop/` — reproduced, `VETO: branch writes orchestrator-owned state under
    .swarm-loop/`, exit 1. The ledger belongs to `main` and to Phase 8; the batch rebases around it.
+   **Mandatory at every landing — re-read the batch's DELETIONS, over the whole integrated range.** The per-branch removed-lines audit at collection (SKILL.md Phase 5 step 3) is a first pass, not a verdict. Measured: the orchestrator read all seven of one branch's deletions and signed them off as benign. One was not — a deletion removed the failure path from a price parse, so the caller swallowed the exception and coerced the resulting empty value to zero, and **a price that could not be parsed became a free item.** It was caught only on the COMBINED diff of the integrated batch, and only after the sign-off had already cleared it. A deletion that is locally benign becomes a fail-open in combination with what the rest of the batch — or an earlier one — leaves around it, which is why the pass that matters is the one over the range, and why the orchestrator's own clearance is the one that most needs a second reader.
+
+   **Audit the WHOLE diff. The `'*test*'` glob orders the reading; it must never decide what is eligible to be read.** That price-parse deletion was SOURCE-side, so a glob-filtered audit could not match it on any branch at any rung — the orchestrator "audited the removed lines" and the removed line was never in the set it read. It is the second time that scoping has cost something: the frozen-metric bypass, a two-line `pyproject.toml` that drove a metric from 50 to 100, also passed the diff audit precisely because the file did not match the glob. A filter deciding what is *eligible* for review is a policy about what can be found, not a convenience.
+
+   The counter-failure is just as real — an unfiltered deletion dump over a batch-sized range is unreadable, and an instruction nobody can follow is another way of not being followed. So read it in this order. The two pathspecs **partition the range exactly** — probed on a real range: the test pathspec listed 1 file, its `:(exclude)` complement 4, and the unfiltered `--stat` the same 5 — so nothing falls out between them:
+
+   ```bash
+   R=main...integration/<epoch>-<batch>
+   git diff -M -C --stat $R                                     # shape first: what moved, and how much
+   git diff -M -C $R -- '*test*' | grep -E '^-[^-]'             # 1. tests — a weakened assertion is the highest-value find
+   git diff -M -C $R -- . ':(exclude)*test*' | grep -E '^-[^-]' \
+     | grep -Ei 'raise|throw|except|catch|assert|valid|verif|require|guard|abort|reject|return (False|None|null)|is None|!= *null'
+                                                                # 2. source — the guard vocabulary, read first
+   git diff -M -C $R -- . ':(exclude)*test*' | grep -E '^-[^-]'  # 3. the rest of the source side — read, never skipped
+   ```
+
+   `-M -C` is what makes a large range tractable at all: without it a moved or renamed file dumps every one of its lines into the removed set and buries the handful that matter. Steps 1–3 are an ORDERING; step 3 is the whole source side and it gets read. **For each removed line, name what now happens on the path that line used to guard** — not "looks benign", but the sentence that says who reaches the code that line stood in front of, and with what value. That is the sentence the price-parse deletion could not have survived. Give the batch's rung-2 verifier the same instruction in its packet (SKILL.md Phase 6), against the same range, because a clearance the orchestrator wrote is exactly what a second reader exists for.
+
    **Mandatory at every landing — tracked-file-count tripwire:**
    ```bash
    git ls-tree -r HEAD --name-only | wc -l
