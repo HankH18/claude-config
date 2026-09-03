@@ -7393,6 +7393,347 @@ ck_has "V11 CONTROL: ...as WEAK" "NO tests were"
 
 
 # ===========================================================================
+# G1 · the ticket graph was the LAST UNGUARDED INPUT TO A GATE
+#
+# V11 above gives `bootstrap: true` the power to exempt a ticket from
+# must-go-red. It is read from the TICKET GRAPH — so a worker could add
+# `bootstrap: true` to its own ticket and exempt itself from the gate that would
+# have caught its defect.
+#
+# git-guard cannot close it, and the agent that hardened LEDGER_NAMES was right
+# not to try: the canonical graph is repo-root `tickets.json`, OUTSIDE
+# `.swarm-loop/` entirely, where the ledger rule can never reach. A name-list
+# entry would have covered the `.swarm-loop/tickets.json` variant alone — half a
+# rule that reads as a whole one.
+#
+# So the answer is the one this skill already found for the frozen acceptance
+# suite: tamper-EVIDENCE, not prevention. freeze hashes the graph, verify
+# catches a moved byte, `freeze --amend` is the sanctioned way to move one, and
+# `findings` — which mints into the graph every audit loop — re-seals and LOGS
+# its own writes instead of quietly breaking one side or the other.
+# ===========================================================================
+section "G1 the ticket graph is frozen with the harness  [repo: rgfreeze]"
+mk_repo rgfreeze
+cat > tickets.json <<'EOF'
+{"version": 1, "project": "e2e", "tickets": [
+ {"id": "T-0", "title": "skeleton", "bootstrap": true, "verify": "true",
+  "scope": ["a/**"], "depends_on": []},
+ {"id": "T-1", "title": "an ordinary ticket", "verify": "exit 1",
+  "scope": ["b/**"], "depends_on": ["T-0"]}
+]}
+EOF
+cat > .swarm-loop/acceptance/test_feature.py <<'EOF'
+@pytest.mark.ticket("T-0")
+def test_skeleton():
+    assert 1 + 1 == 2
+
+
+@pytest.mark.ticket("T-1")
+def test_ordinary():
+    assert 2 + 2 == 4
+EOF
+sl freeze
+ck_exit "G1 a first freeze with a graph present succeeds" 0 "$RC"
+ck_has "G1 it SAYS the graph joined protected_paths" \
+       "the ticket graph tickets.json joins protected_paths"
+ck_has "G1 ...and why: an unhashed input to a gate" \
+       "unhashed input to a gate is a gate a worker can edit around"
+ck_has "G1 ...and that it is frozen, NOT blocked" "It is FROZEN, not blocked"
+ck_has "G1 the graph is listed among the frozen files" "  tickets.json"
+ck "G1 state.json records it as protected, so check-branch vetoes it too" "True" \
+   "$(jget .swarm-loop/state.json "'tickets.json' in d['protected_paths']")"
+ck "G1 the manifest carries the graph's digest" "True" \
+   "$(jget .swarm-loop/manifest.json "'tickets.json' in d['files']")"
+gq add -A; gq commit -qm harness
+sl verify
+ck_exit "G1 verify is green on the frozen graph" 0 "$RC"
+
+# --- THE ATTACK. A worker adds `bootstrap: true` to its own ticket.
+GRAPH_FROZEN="$(sha_of tickets.json)"
+python3 -c '
+import json
+d = json.load(open("tickets.json"))
+for t in d["tickets"]:
+    if t["id"] == "T-1":
+        t["bootstrap"] = True
+json.dump(d, open("tickets.json", "w"), indent=2)'
+sl verify
+ck_exit "G1 a self-granted bootstrap exemption is CAUGHT by verify" 1 "$RC"
+ck_has "G1 ...named as the modified file it is" "[MODIFIED] tickets.json"
+ck_has "G1 ...under the integrity banner, no special case needed" \
+       "INTEGRITY VIOLATION"
+ck_has "G1 ...pointing at the repair that is not blocked by the guard" "restore-harness"
+
+# --- the POSITIVE counterpart: the sanctioned repair puts it back.
+sl restore-harness
+ck_exit "G1 restore-harness repairs the graph from git" 0 "$RC"
+ck_has "G1 ...naming it" "[RESTORED] tickets.json"
+ck "G1 ...back to the exact frozen bytes" "$GRAPH_FROZEN" "$(sha_of tickets.json)"
+sl verify
+ck_exit "G1 ...and verify is green again" 0 "$RC"
+
+# ...and the OTHER half of the exemption's blast radius. `verify` runs on the
+# orchestrator's tree; the edit that matters arrives on a LANE. Because the
+# graph is a protected path, check-branch's existing veto now covers it.
+gq checkout -q -b task/T-1
+python3 -c '
+import json
+d = json.load(open("tickets.json"))
+for t in d["tickets"]:
+    if t["id"] == "T-1":
+        t["bootstrap"] = True
+json.dump(d, open("tickets.json", "w"), indent=2)'
+echo w > b.txt; gq add -A; gq commit -qm "worker exempts itself"
+gq checkout -q main
+sl check-branch --branch task/T-1
+ck_exit "G1 a lane that edits the graph is VETOED at merge" 1 "$RC"
+ck_has "G1 ...as a harness modification" \
+       "VETO: branch modifies the frozen goal harness"
+sl verify
+ck_exit "G1 CONTROL: and main's own tree is untouched by that lane" 0 "$RC"
+
+# --- and the reader of the field still reads it. If freezing the graph had
+#     broken red-check, every assertion above would be green over a dead gate.
+sl red-check --ticket T-0
+ck_exit "G1 CONTROL: the bootstrap exemption itself still works on a frozen graph" 0 "$RC"
+ck_has "G1 CONTROL: ...still bucketed as BOOTSTRAP" "1 BOOTSTRAP"
+
+# --- the LEGITIMATE amendment. The orchestrator adds a ticket the user
+#     approved. Blocking this would be the expensive failure, so it is the
+#     documented path — and it is loud.
+python3 -c '
+import json
+d = json.load(open("tickets.json"))
+d["tickets"].append({"id": "T-2", "title": "approved by the user", "verify": "exit 1",
+                     "scope": ["c/**"], "depends_on": []})
+json.dump(d, open("tickets.json", "w"), indent=2)'
+sl freeze
+ck_exit "G1 a BARE re-freeze over an edited graph is REFUSED" 1 "$RC"
+ck_has "G1 ...naming the graph as the thing that moved" "[MODIFIED] tickets.json"
+sl freeze --amend "user approved adding T-2 to the graph"
+ck_exit "G1 freeze --amend of the graph is ACCEPTED" 0 "$RC"
+ck_has "G1 ...recorded as a moved goalpost" "GOALPOSTS MOVED"
+ck_has "G1 ...printing the graph's old -> new hash" "[MODIFIED] tickets.json"
+ck_has "G1 ...with the user's own reason" "user approved adding T-2 to the graph"
+ck "G1 ...and the append-only log carries the amend record" "amend" \
+   "$(python3 -c '
+import json
+recs = [json.loads(l) for l in open(".swarm-loop/freeze-log.jsonl") if l.strip()]
+print([r for r in recs if "tickets.json" in [m["path"] for m in r.get("modified", [])]][-1]["action"])')"
+sl verify
+ck_exit "G1 ...and verify is green on the amended graph" 0 "$RC"
+gq add -A; gq commit -qm amended
+
+
+# ===========================================================================
+# G2 · `findings` WRITES the graph freeze now HASHES. Solve it deliberately.
+#
+# Two ways to lose, and both were live options: refuse the mint on a frozen run
+# (the audit loop stops turning findings into tickets, which is the whole of act
+# two), or write and say nothing (`verify` reports a tamper every loop for work
+# the harness itself did, until nobody reads it). Neither: a mint is a
+# SANCTIONED write to one protected file, so it re-seals that one path into the
+# manifest and appends a `graph-mint` delta to the append-only freeze log.
+# ===========================================================================
+section "G2 findings mints into a FROZEN graph, and logs it  [repo: rgmint]"
+mk_repo rgmint
+cat > tickets.json <<'EOF'
+{"version": 1, "project": "e2e", "tickets": [
+ {"id": "T-0", "title": "skeleton", "verify": "exit 1", "scope": ["a/**"], "depends_on": []}
+]}
+EOF
+cat > .swarm-loop/acceptance/test_feature.py <<'EOF'
+@pytest.mark.ticket("T-0")
+def test_skeleton():
+    assert 1 + 1 == 2
+EOF
+sl freeze
+ck_exit "G2 freeze" 0 "$RC"
+gq add -A; gq commit -qm harness
+cat > findings.json <<'EOF'
+[
+ {"severity":"HIGH","location":"checkout/domain.py:47","defect":"authorize_discount bypasses approval"},
+ {"severity":"LOW","location":"docs/runbook.md","defect":"runbook names a dead flag"}
+]
+EOF
+AMEND_BEFORE="$(jget .swarm-loop/goals.json "d.get('amendments', 0)")"
+# One second, deliberately, and it is the only sleep in this file. The mint
+# record must carry the FREEZE's `frozen_at`, not its own — _freeze_log_match_index
+# resolves a manifest to a record by (frozen_at, seq), so a fresh stamp leaves the
+# manifest naming a freeze that never happened. `frozen_at` is `%H:%M:%S` (D2's
+# one-second resolution), so without this gap a wrong `now()` is byte-identical to
+# the right value and the assertion below passes over the defect. Measured: with
+# the stamp mutated to now(), this section was RED with the sleep and GREEN
+# without it.
+sleep 1
+sl findings --file findings.json --min-severity MEDIUM
+ck_exit "G2 minting into a frozen graph is NOT refused — the audit loop keeps turning" 0 "$RC"
+ck_has "G2 the mint says the graph is protected and was re-sealed" \
+       "this mint was RE-SEALED and recorded"
+ck_has "G2 ...printing the old -> new digest, like an amendment does" \
+       "the ticket graph is a PROTECTED path"
+ck_has "G2 ...and naming the append-only record it wrote" "action \`graph-mint\`"
+ck_hasnt "G2 ...but a mint is NOT a goalpost move, and never says it is" "GOALPOSTS MOVED"
+sl verify
+ck_exit "G2 verify is GREEN after a mint — no false tamper on the loop's own work" 0 "$RC"
+ck "G2 the freeze log's newest record is the mint" "graph-mint" \
+   "$(python3 -c '
+import json
+recs = [json.loads(l) for l in open(".swarm-loop/freeze-log.jsonl") if l.strip()]
+print(recs[-1].get("action"))')"
+ck "G2 ...naming the ticket it minted, so the write is attributable" "True" \
+   "$(python3 -c '
+import json
+recs = [json.loads(l) for l in open(".swarm-loop/freeze-log.jsonl") if l.strip()]
+print(bool(recs[-1].get("tickets_minted")))')"
+ck "G2 ...as a MODIFIED delta on the graph, which is what replay reads" "tickets.json" \
+   "$(python3 -c '
+import json
+recs = [json.loads(l) for l in open(".swarm-loop/freeze-log.jsonl") if l.strip()]
+print(recs[-1]["modified"][0]["path"])')"
+ck "G2 the manifest points AT that record, or replay would stop one short" "True" \
+   "$(python3 -c '
+import json
+recs = [json.loads(l) for l in open(".swarm-loop/freeze-log.jsonl") if l.strip()]
+m = json.load(open(".swarm-loop/manifest.json"))
+print(m.get("log_seq") == recs[-1].get("seq") and m.get("frozen_at") == recs[-1].get("frozen_at"))')"
+ck "G2 a mint is NOT a goalpost move — amendments must not inflate" "$AMEND_BEFORE" \
+   "$(jget .swarm-loop/goals.json "d.get('amendments', 0)")"
+
+# --- the ANTI-LAUNDERING precondition, which is the whole safety property.
+#     If this command re-sealed a graph whose bytes already disagreed, a worker
+#     would add `bootstrap: true`, the next audit loop's `findings` would re-seal
+#     it, and verify would be green over the exemption forever.
+gq add -A; gq commit -qm minted
+python3 -c '
+import json
+d = json.load(open("tickets.json"))
+d["tickets"][0]["bootstrap"] = True
+json.dump(d, open("tickets.json", "w"), indent=2)'
+BEFORE_LINES="$(grep -c . .swarm-loop/findings.jsonl)"
+cat > findings2.json <<'EOF'
+[{"severity":"HIGH","location":"src/pricing.py:12","defect":"a genuinely new finding"}]
+EOF
+sl findings --file findings2.json --min-severity MEDIUM
+ck_exit "G2 minting over a TAMPERED graph is refused, not laundered" 1 "$RC"
+ck_has "G2 ...named as an integrity violation of the graph itself" \
+       "INTEGRITY VIOLATION — the frozen ticket graph was altered"
+ck_has "G2 ...saying exactly what re-sealing would have hidden" \
+       "hand-added \`bootstrap: true\`"
+ck_has "G2 ...and pointing at the two sanctioned doors out" "restore-harness"
+ck "G2 the new ticket was NOT minted into the tampered graph" "False" \
+   "$(jget tickets.json "any('pricing' in str(t.get('location')) for t in d['tickets'])")"
+# The positive counterpart: refusing to MINT must not discard the FINDING. The
+# whole reason this command exists is a HIGH that reached no repo artifact.
+ck "G2 ...but the finding itself IS on disk — the refusal loses nothing" \
+   "$((BEFORE_LINES + 1))" "$(grep -c . .swarm-loop/findings.jsonl)"
+ck_has "G2 ...and it says so, rather than leaving the operator guessing" \
+       "The findings are safe (recorded in .swarm-loop/findings.jsonl above)"
+
+# --- and once repaired, the same report mints.
+sl restore-harness
+ck_exit "G2 restore-harness repairs the graph" 0 "$RC"
+sl findings --file findings2.json --min-severity MEDIUM
+ck_exit "G2 CONTROL: the identical report mints once the graph matches again" 0 "$RC"
+ck "G2 CONTROL: ...and the ticket lands" "True" \
+   "$(jget tickets.json "any('pricing' in str(t.get('location')) for t in d['tickets'])")"
+sl verify
+ck_exit "G2 CONTROL: ...with verify still green" 0 "$RC"
+
+
+# ===========================================================================
+# G3 · a mint of ZERO tickets must not move the graph's bytes.
+#
+# `findings` rewrote the graph unconditionally, and re-serialising is a BYTE
+# CHANGE — indent, key order, trailing newline. Harmless while the graph was an
+# ordinary project file. Now that freeze hashes it, a report whose findings are
+# all below threshold minted nothing, rewrote the file anyway, and turned
+# `verify` RED over a mint of zero tickets, with no re-seal to explain it.
+# ===========================================================================
+section "G3 a mint of nothing writes nothing  [repo: rgzero]"
+mk_repo rgzero
+# Authored the way a PROJECT authors it — 4-space indent, key order of its own.
+# save_json's 2-space re-serialisation of the same data is different bytes.
+cat > tickets.json <<'EOF'
+{
+    "version": 1,
+    "tickets": [
+        {
+            "id": "T-0",
+            "verify": "exit 1",
+            "title": "skeleton",
+            "scope": ["a/**"],
+            "depends_on": []
+        }
+    ]
+}
+EOF
+cat > .swarm-loop/acceptance/test_feature.py <<'EOF'
+@pytest.mark.ticket("T-0")
+def test_skeleton():
+    assert 1 + 1 == 2
+EOF
+sl freeze
+ck_exit "G3 freeze" 0 "$RC"
+gq add -A; gq commit -qm harness
+GRAPH_BEFORE="$(sha_of tickets.json)"
+cat > findings.json <<'EOF'
+[{"severity":"LOW","location":"docs/runbook.md","defect":"a nit, below any threshold"}]
+EOF
+sl findings --file findings.json --min-severity HIGH
+ck_exit "G3 a report that mints nothing exits 0" 0 "$RC"
+ck_has "G3 ...and still records the finding at its own severity" "not ticketed"
+ck "G3 the graph's BYTES are untouched when nothing is minted" \
+   "$GRAPH_BEFORE" "$(sha_of tickets.json)"
+sl verify
+ck_exit "G3 ...so verify stays green — no phantom tamper from a re-serialise" 0 "$RC"
+
+
+# ===========================================================================
+# G4 · the two shapes that must NOT be touched: no graph at all, and a graph
+#      that lives outside the repo. The first is greenfield / plain-description
+#      intake and must be a silent no-op, exactly like the read gate. The second
+#      cannot be frozen honestly — freeze would hash bytes git never held, no
+#      branch diff could show an edit, restore-harness could not repair one — so
+#      it is said out loud rather than protected wrongly.
+# ===========================================================================
+section "G4 no graph is a silent no-op; an out-of-repo graph is LOUD  [repo: rgnone]"
+mk_repo rgnone
+rm -f tickets.json backlog.json
+sl freeze
+ck_exit "G4 a greenfield run with no ticket graph freezes normally" 0 "$RC"
+ck_hasnt "G4 ...and says nothing about a graph it does not have" "joins protected_paths"
+ck "G4 ...protecting exactly the two mandatory paths" \
+   "['.swarm-loop/acceptance', '.swarm-loop/goals.json']" \
+   "$(jget .swarm-loop/state.json "d['protected_paths']")"
+sl verify
+ck_exit "G4 ...and verify is green" 0 "$RC"
+
+mk_repo rgout
+mkdir -p "$TMP/rgout-outside"
+cat > "$TMP/rgout-outside/graph.json" <<'EOF'
+{"tickets": [{"id": "T-0", "title": "s", "bootstrap": true, "verify": "true",
+              "scope": ["a/**"], "depends_on": []}]}
+EOF
+cat > .swarm-loop/acceptance/test_feature.py <<'EOF'
+@pytest.mark.ticket("T-0")
+def test_skeleton():
+    assert 1 + 1 == 2
+EOF
+set_state ticket_graph "\"../rgout-outside/graph.json\""
+sl freeze
+ck_exit "G4 an out-of-repo graph does not break the freeze" 0 "$RC"
+ck_has "G4 ...but it is named as unfreezable, loudly" \
+       "THE TICKET GRAPH LIVES OUTSIDE THIS REPO"
+ck_has "G4 ...saying what is left ungraded because of it" \
+       "bootstrap exemption is ungraded for this whole run"
+ck "G4 ...and it is NOT pretended into protected_paths" "False" \
+   "$(jget .swarm-loop/state.json "any('graph.json' in p for p in d['protected_paths'])")"
+ck "G4 ...nor into the manifest, which could never restore it" "False" \
+   "$(jget .swarm-loop/manifest.json "any('graph.json' in p for p in d['files'])")"
+
+
+# ===========================================================================
 cd / 2>/dev/null || true
 ELAPSED=$(( $(date +%s) - START_TS ))
 echo

@@ -338,6 +338,22 @@ the T-0 scaffold's surface is unguarded for that ticket.
   the un-started tail of the backlog (EXECUTION.md and this loop agree on this). It
   never licenses touching frozen goals; reality contradicting a *frozen* success
   criterion is the "goal genuinely wrong" terminal case — stop and ask.
+- **The graph itself is frozen** — `freeze` puts it in `protected_paths` and hashes it,
+  so `verify` fails on a moved byte and `check-branch` vetoes any lane that touches it.
+  This is **not** a ban on re-planning: rewriting the un-started tail is still normal,
+  it just goes through `freeze --amend "<reason the user approved>"`, which prints the
+  old → new hash with a unified diff and writes it to the append-only freeze log.
+  `swarmloop.py findings` re-seals its own mints without an amendment (a `graph-mint`
+  record naming the minted ids), so the audit loop is never forced to choose between
+  minting tickets and a green `verify`. **Why the graph and not just the suite:**
+  `red-check` reads `bootstrap: true` out of it to exempt a ticket from must-go-red, so
+  the graph is an input to a gate, and an unhashed input to a gate is a gate a worker
+  can edit around — a worker adding `bootstrap: true` to its own ticket exempts itself
+  from the check that would have caught its defect. The git-guard cannot reach it (the
+  canonical graph is repo-root `tickets.json`, outside `.swarm-loop/`), which is why the
+  answer is evidence rather than prevention. Keep the graph **inside the repo**: an
+  out-of-repo path (`init --ticket-graph ../elsewhere.json`) cannot be frozen at all —
+  freeze says so loudly and the bootstrap exemption goes ungraded for the whole run.
 - **Reporting:** cycle reports and the final report reference T-IDs and R-IDs
   throughout, and the final report carries a **plan-divergence section** — tickets
   split, merged, dropped, or added, and any success criterion unmet or reinterpreted

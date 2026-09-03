@@ -848,6 +848,102 @@ def _protected_hashes(root, state):
     return files, missing
 
 
+def _graph_protected_rel(root, state):
+    """(rel, outside) — the ticket graph's path for protected_paths, or (None, None).
+
+    G-1: the ticket graph was the LAST UNGUARDED INPUT TO A GATE. `red-check`
+    exempts a ticket from the must-go-red requirement when the graph says
+    `bootstrap: true`, and it reads that field from the graph — so a worker could
+    add `bootstrap: true` to its OWN ticket and exempt itself from the gate that
+    would have caught its defect.
+
+    The git-guard cannot close this and it was right not to try. The canonical
+    graph is repo-root `tickets.json`, OUTSIDE `.swarm-loop/` entirely, and the
+    guard's ledger rule only ever fires on a name under the state dir; a
+    `LEDGER_NAMES` entry would have covered the `.swarm-loop/tickets.json`
+    variant alone — half a rule that reads as a whole one, which is worse than
+    none.
+
+    So this is the answer the skill already found once, for the frozen
+    acceptance suite: tamper-EVIDENCE, not prevention. The suite is editable on
+    purpose (the guard deliberately does not block `Edit` there) and is held by
+    manifest hashing — `verify` fails if a byte moved, and the sanctioned way to
+    move one is `freeze --amend`, which is logged, prints old -> new hashes, and
+    is a user-awake action. The graph gets the same treatment for the same
+    reason: the orchestrator legitimately amends it (and `findings` mints into
+    it every audit loop), so BLOCKING is wrong; an unhashed input to a gate is a
+    gate a worker can edit around, so SILENCE is wrong too.
+
+    `outside` is the relpath of a graph that lives outside the repo, which
+    cannot be protected and must not be pretended into the manifest: freeze
+    would hash bytes git never held, no branch diff could show an edit to them,
+    and restore-harness could not repair one. Reported loudly by the caller
+    rather than protected wrongly.
+
+    A run with no graph — greenfield, or plain-description intake — returns
+    (None, None) and every caller is a silent no-op, exactly like the read gate.
+    """
+    p, _tickets = _load_graph(root, state, None, required=False)
+    if not p:
+        return None, None
+    rel = os.path.relpath(p, root).replace(os.sep, "/")
+    if os.path.isabs(rel) or rel == os.pardir or rel.startswith(os.pardir + "/"):
+        return None, rel
+    return rel, None
+
+
+def _reseal_protected(root, d, rel, old_digest, new_digest, action, reason, extra=None):
+    """Re-hash ONE protected path into the manifest and record the delta in the
+    append-only freeze log. Returns the new log seq.
+
+    This is how a SANCTIONED write to a protected file that is not a goalpost
+    move gets recorded — `findings` minting tickets into the frozen ticket
+    graph, and nothing else so far. It is deliberately the same machinery
+    `freeze --amend` uses, so the reconciliation in _authenticate_manifest keeps
+    working with no special case: the record is an ordinary forward delta, so
+    _replay_freeze_log picks the new digest up, and
+
+      * `frozen_at` is the FREEZE'S OWN timestamp, never `now()`. This record is
+        a delta INSIDE that freeze, not a new freeze; _freeze_log_match_index
+        resolves a manifest to a record by (frozen_at, seq), so a fresh
+        timestamp here would leave the manifest naming a freeze that never
+        happened and `verify` printing [UNLOGGED] over a clean tree.
+      * `log_seq` moves with it, so that same lookup lands on THIS record and
+        the replay runs through it rather than stopping one short.
+      * `action` is NOT "initial" (replay resets on those) and there is no
+        `goals_canon` key, so the goals digest in force carries forward
+        untouched — this says nothing about goals.json, because it changed
+        nothing about goals.json.
+      * `amendments` is NOT incremented. A minted ticket is not a moved
+        goalpost, and inflating that counter would put "GOALPOSTS MOVED" in
+        every report of every audit loop until the word meant nothing.
+    """
+    mpath = os.path.join(d, MANIFEST_FILE)
+    manifest = load_json(mpath, "manifest")
+    recs, _exists = _freeze_log_records(d)
+    seq = len(recs)
+    files = dict(manifest.get("files") or {})
+    files[rel] = new_digest
+    manifest["files"] = files
+    manifest["log_seq"] = seq
+    save_json(mpath, manifest)
+    rec = {
+        "action": action,
+        "amendment": int(manifest.get("amendments", 0) or 0),
+        "reason": reason,
+        "frozen_at": manifest.get("frozen_at"),
+        "prev_frozen_at": manifest.get("frozen_at"),
+        "seq": seq,
+        "head": _git(root, "rev-parse", "HEAD").stdout.strip() or None,
+        "modified": [{"path": rel, "old": old_digest, "new": new_digest}],
+        "added": [],
+        "removed": [],
+    }
+    rec.update(extra or {})
+    _append_freeze_log(d, rec)
+    return seq
+
+
 def _dupe_metric_ids(goals, warn_only=False):
     """Metric ids used more than once. P-14: nothing rejected them, and the
     consequences compound silently — `measure` appends a row per definition,
@@ -1334,11 +1430,19 @@ def _authenticate_manifest(root, d, manifest, disk_ok):
     unanchored = [rel for rel in anchor_pool
                   if _commit_with_blob(root, rel, manifest["files"][rel], limit=40) is None]
     if unanchored:
-        notes.append("%d of %d frozen file(s) are not in git history yet — commit "
-                     "%s/ so 'restore-harness' can repair a tamper (first: %s)"
+        # "commit .swarm-loop/" was the whole of this advice, and G-1 made it
+        # wrong: the ticket graph is a protected path and its canonical home is
+        # repo-root tickets.json, so the one command the note prints does not
+        # cover the file the note is complaining about. It names the outside
+        # paths too now — an unrecoverable file is exactly the case where the
+        # operator follows the printed remedy literally.
+        outside = sorted(set(r for r in unanchored
+                             if not (r == STATE_DIR or r.startswith(STATE_DIR + "/"))))
+        notes.append("%d of %d frozen file(s) are not in git history yet — commit %s so "
+                     "'restore-harness' can repair a tamper (first: %s)"
                      % (len(unanchored),
                         len([r for r in manifest.get("files", {}) if r != grel]),
-                        STATE_DIR, unanchored[0]))
+                        ", ".join([STATE_DIR + "/"] + outside), unanchored[0]))
     return violations, notes
 
 
@@ -1995,6 +2099,34 @@ def cmd_freeze(args):
                       already_frozen=(os.path.exists(os.path.join(d, MANIFEST_FILE))
                                       or bool(goals.get("frozen"))))
 
+    # G-1: the ticket graph joins the protected set, when there is one. See
+    # _graph_protected_rel for why the guard could not do this and why evidence
+    # beats prevention here. Added to the IN-MEMORY list now, so every hash
+    # below covers it, and persisted to state.json only once the manifest has
+    # actually been written — a freeze that refuses must leave check-branch and
+    # verify agreeing about what is protected, which is P-9's whole lesson.
+    graph_rel, graph_outside = _graph_protected_rel(root, state)
+    graph_newly_protected = False
+    if graph_outside:
+        bar = "!" * 74
+        print(bar)
+        print(f"!!! THE TICKET GRAPH LIVES OUTSIDE THIS REPO ({graph_outside}) — IT CANNOT BE FROZEN")
+        print("!!! `red-check` reads `bootstrap: true` from it to exempt a ticket from the")
+        print("!!! must-go-red gate, so it is an INPUT TO A GATE. freeze can only hash files")
+        print("!!! git can hold: outside the repo nothing shows an edit in a branch diff and")
+        print("!!! 'restore-harness' has nothing to restore from. Move the graph into the repo")
+        print("!!! (and re-point it with 'init --ticket-graph <path>'), or accept that the")
+        print("!!! bootstrap exemption is ungraded for this whole run and say so at cycle 0.")
+        print(bar)
+    elif graph_rel and graph_rel not in state["protected_paths"]:
+        state["protected_paths"].append(graph_rel)
+        graph_newly_protected = True
+        print(f"note: the ticket graph {graph_rel} joins protected_paths — `red-check` reads "
+              "`bootstrap: true` from it to exempt a ticket from the must-go-red gate, and an "
+              "unhashed input to a gate is a gate a worker can edit around. It is FROZEN, not "
+              "blocked: amend it with 'freeze --amend', and 'findings' re-seals and logs its "
+              "own mints.")
+
     # --- goalpost gate -------------------------------------------------------
     # A bare re-freeze over an ALREADY-frozen harness re-locks whatever bytes are
     # on disk. After tampering that silently turns 'verify' green and erases the
@@ -2379,6 +2511,20 @@ def cmd_freeze(args):
     })
     os.replace(gtmp, gpath)
     head = _git(root, "rev-parse", "HEAD").stdout.strip() or None
+
+    # Only now — the manifest exists, so the two halves of the protection model
+    # (verify's manifest and check-branch's prefix veto) start protecting the
+    # graph in the same breath. Persisting it above would have left a refused
+    # freeze with a state.json naming a path no manifest covers.
+    if graph_newly_protected:
+        with _state_lock(d):
+            spath = os.path.join(d, STATE_FILE)
+            live = load_json(spath, "state")
+            paths = list(live.get("protected_paths") or [])
+            if graph_rel not in paths:
+                paths.append(graph_rel)
+                live["protected_paths"] = paths
+                save_json(spath, live)
 
     if target_moves:
         with _state_lock(d):
@@ -5799,6 +5945,57 @@ def cmd_findings(args):
     idx, _dupes = _graph_index(tickets)
     already = {str(t.get("finding_id") or "") for t in tickets if isinstance(t, dict)}
 
+    # --- G-1, the interesting half: freeze now hashes the ticket graph, and
+    #     THIS command writes to it on every audit loop. Two ways to lose, and
+    #     both were live options:
+    #
+    #       * refuse the mint on a frozen run — the audit loop stops turning
+    #         findings into tickets, which is the whole of act two; or
+    #       * write and say nothing — 'verify' then reports a tamper for work
+    #         the harness itself did, every loop, until nobody reads it.
+    #
+    #     Neither. A mint is a SANCTIONED write to one protected file, so it is
+    #     recorded the way an amendment is: re-hash exactly that path into the
+    #     manifest and append a delta to the append-only freeze log naming the
+    #     tickets minted (_reseal_protected).
+    #
+    #     The precondition is the whole safety property. Re-sealing a graph whose
+    #     bytes ALREADY disagree with the manifest would make this command the
+    #     laundry — a worker adds `bootstrap: true` to its own ticket, the next
+    #     audit loop's `findings` re-seals it, and `verify` goes green over the
+    #     exemption forever. So a graph that does not match is refused here, and
+    #     the findings are already on disk when it happens.
+    #
+    #     Scoped to the graph ALONE, deliberately: an unrelated harness tamper is
+    #     `verify`'s to report and must not be blessed here, and equally must not
+    #     stop the audit loop from recording what it found.
+    grel_graph = os.path.relpath(gpath, root).replace(os.sep, "/")
+    _mpath = os.path.join(d, MANIFEST_FILE)
+    _manifest = {}
+    if os.path.exists(_mpath):
+        try:
+            with open(_mpath) as _mf:
+                _manifest = json.load(_mf) or {}
+        except (OSError, ValueError):
+            _manifest = {}
+    frozen_graph_digest = (_manifest.get("files") or {}).get(grel_graph)
+    if frozen_graph_digest is not None:
+        on_disk = sha256_file(gpath)
+        if on_disk != frozen_graph_digest:
+            print("INTEGRITY VIOLATION — the frozen ticket graph was altered:")
+            print(f"  [MODIFIED] {grel_graph}")
+            print(f"    frozen {frozen_graph_digest[:16]}… / on disk {on_disk[:16]}…")
+            die("refusing to mint into a ticket graph that no longer matches %s/%s. The "
+                "findings are safe (%s) — but minting would re-hash whatever ELSE was "
+                "changed in the same file into the manifest, and a hand-added "
+                "`bootstrap: true` on a worker's own ticket is exactly what that would "
+                "launder. Run 'verify', then 'restore-harness', then re-run this command; "
+                "if the change was a legitimate amendment, record it with "
+                "'freeze --amend \"<reason>\"' first."
+                % (STATE_DIR, MANIFEST_FILE,
+                   "this is a --dry-run: nothing was written" if args.dry_run
+                   else f"recorded in {STATE_DIR}/{FINDINGS_FILE} above"))
+
     nums = []
     for tid in idx:
         m = re.match(r"^([A-Za-z]+-)(\d+)$", tid)
@@ -5808,6 +6005,7 @@ def cmd_findings(args):
     width = max(3, max((len(str(n)) for n in nums), default=3))
 
     minted, below, dup = [], [], []
+    resealed, reseal_seq = None, None
     for out in stamped:
         if out["finding_id"] in already:
             dup.append(out)
@@ -5859,11 +6057,18 @@ def cmd_findings(args):
     if args.dry_run:
         print(f"\n[DRY RUN] would mint {len(minted)} ticket(s) into "
               f"{os.path.relpath(gpath, root)}:")
-    else:
+    elif minted:
         # Re-read and write back through the SAME shape the project uses: the
         # graph is a project file whose schema this harness does not own, so a
         # bare list stays a bare list and {"tickets": [...]} keeps its siblings
         # (version, project) rather than being flattened out from under them.
+        #
+        # `elif minted` and not `else`: this used to rewrite the file even when
+        # it had nothing to add, and re-serialising is a BYTE CHANGE (indent,
+        # key order, trailing newline). Harmless while the graph was an ordinary
+        # project file; now that freeze hashes it, the second run of an
+        # unchanged report would have moved the hash and turned `verify` red
+        # over a mint of zero tickets.
         with open(gpath) as _gf:
             full = json.load(_gf)
         if isinstance(full, list):
@@ -5872,9 +6077,25 @@ def cmd_findings(args):
             full["tickets"] = list(full.get("tickets") or []) + minted
             save_json(gpath, full)
         print(f"\nminted {len(minted)} ticket(s) into {os.path.relpath(gpath, root)}:")
+        if frozen_graph_digest is not None:
+            resealed = sha256_file(gpath)
+            reseal_seq = _reseal_protected(
+                root, d, grel_graph, frozen_graph_digest, resealed,
+                "graph-mint",
+                "findings minted %d ticket(s): %s"
+                % (len(minted), ", ".join(t["id"] for t in minted)),
+                extra={"tickets_minted": [t["id"] for t in minted]})
+    else:
+        print(f"\nminted 0 ticket(s) into {os.path.relpath(gpath, root)}:")
     for t in minted:
         print(f"  {t['id']:<9} {t['severity']:<8} {t['location'] or '(no location)'}")
         print(f"            {t['title'][:96]}")
+    if reseal_seq is not None:
+        print(f"\nthe ticket graph is a PROTECTED path, so this mint was RE-SEALED and recorded "
+              "— it is a sanctioned write, not a silent one:")
+        print(f"  {grel_graph}  {frozen_graph_digest[:16]}… -> {resealed[:16]}…")
+        print(f"  {STATE_DIR}/{FREEZE_LOG_FILE} record #{reseal_seq}, action `graph-mint` "
+              "(append-only). 'verify' is green on exactly these bytes and no others.")
     if below:
         print(f"\n{len(below)} finding(s) BELOW --min-severity {args.min_severity} — recorded, "
               "not ticketed. They are on disk and can be ticketed later by lowering the "
