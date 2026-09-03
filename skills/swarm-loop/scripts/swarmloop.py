@@ -8042,6 +8042,18 @@ def cmd_distil(args):
 # incident cost. Every blind spot is printed WITH the verdicts (_reach_limits)
 # rather than left for the reader to already know about — a clean report from
 # this command is not proof of wiring and must never be quoted as one.
+#
+# There is a THIRD error, and the first version of this command committed it: a
+# confident verdict about a hop it never took. Measured read-only against a live
+# FastAPI project, 24.5% of public top-level functions came back not-wired, and
+# 20 of the 31 "NO CALL SITES" — 'defined, and NOTHING references it' — were
+# route handlers registered by @router.get/@router.post, i.e. the most-wired code
+# in the repo. Overclaiming the completeness of its own analysis is the same
+# defect this command was built to catch, committed by the command itself; at
+# that rate a reader stops believing the one verdict it exists to produce. So a
+# registering decorator on the definition now gets its own verdict, its own line
+# naming the decorator and where it sits, and a diagnosis that says the table on
+# the other side was NOT followed. Named cause beats small number.
 
 REACH_SKIP_DIRS = frozenset((
     ".git", "__pycache__", "node_modules", ".venv", "venv", ".tox", ".nox",
@@ -8052,6 +8064,52 @@ REACH_SKIP_DIRS = frozenset((
 # How many definitions / call sites / hints are enumerated before the list is
 # elided. The COUNT on the header line is always exact; only the listing caps.
 REACH_LIST_CAP = 8
+
+# Decorators that WRAP a definition in place and register it with nothing. A
+# symbol carrying only these and no callers is still the incident's shape, so it
+# keeps NO CALL SITES. Everything else — @router.post, @app.task, @click.command,
+# @pytest.fixture, @foo.register, and every decorator this list has never heard
+# of — is treated as a POSSIBLE registration, because decorator registration is
+# not an edge case in Python: it is how routes, CLI commands, event handlers,
+# plugins and fixtures are wired. Matching is on the WHOLE dotted label, never
+# the last component, so `@app.cache` is not mistaken for `@functools.cache`.
+REACH_INERT_DECORATORS = frozenset((
+    "staticmethod", "classmethod", "property", "cached_property",
+    "functools.cached_property",
+    "abstractmethod", "abstractproperty", "abc.abstractmethod",
+    "abc.abstractproperty", "abc.abstractclassmethod", "abc.abstractstaticmethod",
+    "wraps", "functools.wraps",
+    "lru_cache", "functools.lru_cache", "cache", "functools.cache",
+    "total_ordering", "functools.total_ordering",
+    "contextmanager", "contextlib.contextmanager",
+    "asynccontextmanager", "contextlib.asynccontextmanager",
+    "overload", "typing.overload", "final", "typing.final",
+    "no_type_check", "typing.no_type_check",
+    "runtime_checkable", "typing.runtime_checkable",
+    "dataclass", "dataclasses.dataclass",
+))
+
+# What a decorator this scanner cannot render down to a dotted name is called in
+# the report. It counts as a POSSIBLE registration for the same reason: an
+# expression we could not read is not an expression we know to be inert.
+REACH_DEC_OPAQUE = "@<expression>"
+
+
+def _reach_dec_label(node):
+    """A decorator expression -> '@router.post', or REACH_DEC_OPAQUE.
+
+    Rendered by its CALLEE only: `@router.post("/x", status_code=201)` reads
+    `@router.post`, because which table it registers into is the question and
+    the arguments are not."""
+    n = node.func if isinstance(node, ast.Call) else node
+    parts = []
+    while isinstance(n, ast.Attribute):
+        parts.append(n.attr)
+        n = n.value
+    if not isinstance(n, ast.Name):
+        return REACH_DEC_OPAQUE
+    parts.append(n.id)
+    return "@" + ".".join(reversed(parts))
 
 
 def _reach_is_test(relf):
@@ -8071,28 +8129,36 @@ def _reach_is_test(relf):
 
 
 def _reach_files(root, paths):
-    """The .py files to parse, sorted and deduplicated.
+    """(files, unresolved specs) — the .py files to parse, sorted and deduped.
 
     A directory named in --path is scanned even when REACH_SKIP_DIRS would have
     skipped it during a walk: the skip list exists to keep a vendored copy of
     the world out of an unqualified repo-root scan, not to refuse an explicit
-    instruction to look somewhere."""
-    out = []
+    instruction to look somewhere.
+
+    A spec that names nothing this scan can read comes back UNRESOLVED rather
+    than being dropped. Silently ignoring it produced a confident NO CALL SITES
+    on genuinely wired code whenever some OTHER --path happened to find files,
+    while the header line went on asserting the typo'd path had been scanned."""
+    out, unresolved = [], []
     for spec in paths:
         base = spec if os.path.isabs(spec) else os.path.join(root, spec)
         base = os.path.normpath(base)
         if os.path.isfile(base):
             if base.endswith(".py"):
                 out.append(base)
+            else:
+                unresolved.append(spec)
             continue
         if not os.path.isdir(base):
+            unresolved.append(spec)
             continue
         for dirpath, dirnames, filenames in os.walk(base):
             dirnames[:] = sorted(x for x in dirnames if x not in REACH_SKIP_DIRS)
             for fn in sorted(filenames):
                 if fn.endswith(".py"):
                     out.append(os.path.join(dirpath, fn))
-    return sorted(set(out))
+    return sorted(set(out)), unresolved
 
 
 def _reach_scan(root, paths, wanted):
@@ -8103,11 +8169,11 @@ def _reach_scan(root, paths, wanted):
     unparsed file here is a hole in the ANSWER — its call sites are invisible —
     so it is printed next to the verdicts and not only in --json."""
     res = {
-        "files": 0, "unparsed": [],
+        "files": 0, "unparsed": [], "unresolved_paths": [],
         "defs": {}, "refs": {}, "imports": {}, "exports": {}, "strings": {},
         "edges": {}, "children": {}, "modules": {},
     }
-    files = _reach_files(root, paths)
+    files, res["unresolved_paths"] = _reach_files(root, paths)
     res["files"] = len(files)
     wanted = set(wanted)
 
@@ -8128,9 +8194,13 @@ def _reach_scan(root, paths, wanted):
         is_init = os.path.basename(relf) == "__init__.py"
         res["modules"][mod] = relf
 
-        def add_def(name, qual, lineno, kind, parent, _f=relf, _t=is_test):
+        def add_def(name, qual, lineno, kind, parent, decs=(), _f=relf, _t=is_test):
             res["defs"].setdefault(name, []).append(
-                {"file": _f, "line": lineno, "kind": kind, "qual": qual, "test": _t})
+                {"file": _f, "line": lineno, "kind": kind, "qual": qual, "test": _t,
+                 "decorators": list(decs),
+                 "registering": any(d["label"] == REACH_DEC_OPAQUE
+                                    or d["label"][1:] not in REACH_INERT_DECORATORS
+                                    for d in decs)})
             res["children"].setdefault(parent, []).append((qual, kind))
 
         def add_ref(name, how, lineno, holder, _f=relf, _t=is_test):
@@ -8163,10 +8233,18 @@ def _reach_scan(root, paths, wanted):
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 kind = "class" if isinstance(n, ast.ClassDef) else "function"
                 qual = "%s.%s" % (holder, n.name)
-                add_def(n.name, qual, n.lineno, kind, holder)
-                # A decorator expression evaluates in the ENCLOSING scope, so
-                # `@registry.register` is a reference held by that scope — and it
-                # is also one of the ways a registry hides the only call site a
+                # The decorators ON the definition are recorded WITH it. The
+                # scanner used to visit this list and then throw it away, so a
+                # decorator-registered function — the whole HTTP surface of a
+                # FastAPI app — got the most confident failure verdict this
+                # command has with no hint that the wiring was sitting on the
+                # line above its own def.
+                add_def(n.name, qual, n.lineno, kind, holder,
+                        [{"label": _reach_dec_label(d), "file": relf, "line": d.lineno}
+                         for d in n.decorator_list])
+                # A decorator expression also evaluates in the ENCLOSING scope,
+                # so `@registry.register` is a reference held by that scope — and
+                # it is one of the ways a registry hides the only call site a
                 # symbol has.
                 for dec in n.decorator_list:
                     visit(dec, holder)
@@ -8185,8 +8263,12 @@ def _reach_scan(root, paths, wanted):
             if isinstance(n, ast.ImportFrom):
                 add_import(n)
                 return
-            if isinstance(n, ast.Import):
-                return
+            # `import M` had an early return of its own here. It was provably a
+            # no-op — an alias node exposes no visitable children, so the generic
+            # descent below does nothing either — and a branch that cannot be
+            # made to fail is a claim this suite cannot defend. The rule it was
+            # standing in for is real and IS defended, in add_import above and by
+            # the attribute case below.
             if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and holder == _mod:
                 tgts = (list(n.targets) if isinstance(n, ast.Assign) else [n.target])
                 names = [t.id for t in tgts if isinstance(t, ast.Name)]
@@ -8332,9 +8414,21 @@ def _reach_verdict(res, sym, reached, have_entries):
     prod = [r for r in refs if not r["test"]]
     tests = [r for r in refs if r["test"]]
     reached_here = bool(own) and any(q in reached for q in own)
+    decs = []
+    for d in defs:
+        decs += d.get("decorators", [])
+    registering = any(d.get("registering") for d in defs)
 
     if not defs:
         verdict = "UNDEFINED"
+    elif not prod and registering:
+        # A registering decorator IS a reference to this definition, made by the
+        # enclosing module at import time — it is simply one this scanner cannot
+        # follow into the table on the other side. Reporting it as NO CALL SITES
+        # ('defined, and NOTHING references it') was the tool committing the
+        # exact overclaim it exists to catch: on the repo this was measured
+        # against, that verdict landed on the application's entire HTTP surface.
+        verdict = "DECORATOR-REGISTERED"
     elif not refs:
         verdict = "NO CALL SITES"
     elif not prod:
@@ -8349,6 +8443,7 @@ def _reach_verdict(res, sym, reached, have_entries):
         "test_call_sites": len(tests), "exported": res["exports"].get(sym, []),
         "imported_by": res["imports"].get(sym, []),
         "dynamic_hints": res["strings"].get(sym, []),
+        "decorators": decs, "registering_decorator": registering,
         "ambiguous": len(defs) > 1,
         "reached_from_entry": (reached_here if have_entries else None),
     }
@@ -8363,6 +8458,13 @@ REACH_DIAGNOSIS = {
         "defined, and NOTHING references it. This is the recovered commit's exact shape: "
         "a function, a docstring asserting a behaviour, and no wiring. A suite stays "
         "GREEN over it.",
+    "DECORATOR-REGISTERED":
+        "no PRODUCT code references it by name, but its definition carries a decorator "
+        "that can register it — a route table, a CLI group, an event handler, a plugin, "
+        "a fixture. That is how such code is wired in Python, so this is NOT the "
+        "recovered commit's shape. It is NOT an all-clear either: this scanner does not "
+        "follow a decorator into whatever holds it, so confirm BY EYE that the table it "
+        "registers into is itself imported and reached.",
     "TESTS ONLY":
         "every caller is a test. Something goes green over this symbol and nothing the "
         "user runs reaches it — the zero-caller defect wearing a passing suite.",
@@ -8376,7 +8478,7 @@ REACH_DIAGNOSIS = {
 }
 
 
-def _reach_limits(res, have_entries):
+def _reach_limits(have_entries):
     """[lines] — printed with EVERY report, an all-WIRED one included.
 
     A blind spot the reader has to already know about is not a stated limit, and
@@ -8391,6 +8493,19 @@ def _reach_limits(res, have_entries):
         "      listed above as a dynamic hint and the verdict is NOT upgraded on it: that",
         "      errs toward the false ALARM (ten seconds of a human's time) over the false",
         "      OK (what the incident cost).",
+        "    * Python source that lives inside a STRING is text, not code, to an ast",
+        "      pass — a subprocess probe built with textwrap.dedent, an exec(), a",
+        "      generated module. Measured: one symbol on the live repo this was tuned",
+        "      against is called ONLY from such a probe and reads NO CALL SITES here.",
+        "    * a DECORATOR on the definition is reported and NOT followed. This scanner",
+        "      sees that @router.post is there; it cannot see whether that router is",
+        "      itself imported and mounted. DECORATOR-REGISTERED therefore means 'the",
+        "      wiring is a hop I did not take', never 'wired' — the hop is yours to check.",
+        "    * a caller counts as a TEST by its PATH alone: conftest.py, test_*.py,",
+        "      *_test.py, anything under tests/ test/ testing/ __tests__/ spec/ specs/,",
+        "      and the frozen acceptance directory. Product code under a directory named",
+        "      `spec` is read as a test here, which downgrades WIRED to TESTS ONLY —",
+        "      the false-ALARM direction, and one look settles it.",
         "    * references are matched BY NAME, not resolved through imports. Two",
         "      same-named symbols in different modules are one node — it over-counts",
         "      callers, in the false-OK direction. Every symbol with more than one",
@@ -8424,7 +8539,11 @@ def cmd_reachable(args):
             if x and x not in wanted:
                 wanted.append(x)
     if not wanted:
-        die("--symbol needs at least one name (every value given was empty)")
+        # Exit 3, not die()'s 1. task-packets.md tells the orchestrator to read
+        # this command's exit code, and 1 already means "a symbol is not wired" —
+        # so the tool FAILING must not be spelled the same as the tool FINDING
+        # something. 3 is this file's usage-error code (see _Parser.error).
+        die("--symbol needs at least one name (every value given was empty)", code=3)
     entries = []
     for chunk in (args.entries or []):
         for x in chunk.split(","):
@@ -8438,6 +8557,12 @@ def cmd_reachable(args):
     reached = _reach_bfs(res, seeds) if seeds else set()
     rows = [_reach_verdict(res, s, reached, bool(entries)) for s in wanted]
     bad = [r for r in rows if r["verdict"] != "WIRED"]
+    # What the EXIT CODE is about is narrower than what `not_wired` is about. A
+    # DECORATOR-REGISTERED symbol is not proven wired and stays in not_wired, but
+    # it does not fail the run: the commonest wiring idiom in Python cannot be a
+    # hard failure, or the mandatory check fires on every route in the repo and
+    # its readers learn to pass --no-fail.
+    findings = [r for r in bad if r["verdict"] != "DECORATOR-REGISTERED"]
     shown = [os.path.relpath(p, root) if os.path.isabs(p) else p for p in paths]
     shown = [p if p != "." else "the repo root" for p in shown]
 
@@ -8445,6 +8570,7 @@ def cmd_reachable(args):
         print(json.dumps({
             "scanned_files": res["files"],
             "scan_roots": shown,
+            "paths_unresolved": res["unresolved_paths"],
             "unparsed": [{"file": a, "error": b} for a, b in res["unparsed"]],
             "entry_points": entries,
             "entry_scopes_resolved": seeds,
@@ -8452,7 +8578,8 @@ def cmd_reachable(args):
             "scopes_reached": len(reached),
             "symbols": rows,
             "not_wired": [r["symbol"] for r in bad],
-            "limits": _reach_limits(res, bool(entries)),
+            "findings": [r["symbol"] for r in findings],
+            "limits": _reach_limits(bool(entries)),
         }, indent=2, sort_keys=True))
     else:
         print("reachable: %d symbol(s) against %d python file(s) under %s"
@@ -8460,6 +8587,15 @@ def cmd_reachable(args):
         if entries:
             print("  entry points: %s  -> %d scope(s) seeded, %d scope(s) reached"
                   % (", ".join(entries), len(seeds), len(reached)))
+        if res["unresolved_paths"]:
+            # A --path naming nothing used to be dropped in silence while the
+            # header line above went on asserting it had been scanned — the one
+            # place this command was not meticulous about the failure class it
+            # is meticulous about everywhere else.
+            print("  --path DID NOT RESOLVE: %s — it names no directory and no .py file "
+                  "that exists, so NOTHING under it was scanned. The file count above is "
+                  "about the paths that DID resolve."
+                  % ", ".join(res["unresolved_paths"]))
         if unresolved:
             print("  ENTRY POINT DID NOT RESOLVE: %s — it names no file, module or symbol "
                   "in the scan." % ", ".join(unresolved))
@@ -8511,6 +8647,19 @@ def cmd_reachable(args):
                 print("      imported   %s" % ", ".join(
                     "%s:%d" % (i["file"], i["line"])
                     for i in r["imported_by"][:REACH_LIST_CAP]))
+            if r["decorators"]:
+                print("      decorated  %s%s" % (
+                    "; ".join("%s at %s:%d" % (d["label"], d["file"], d["line"])
+                              for d in r["decorators"][:REACH_LIST_CAP]),
+                    (" ... and %d more" % (len(r["decorators"]) - REACH_LIST_CAP)
+                     if len(r["decorators"]) > REACH_LIST_CAP else "")))
+                if r["registering_decorator"]:
+                    print("                 a route/registry/plugin table may be its only "
+                          "call site. This scanner does NOT follow a decorator into the "
+                          "table on the other side.")
+                else:
+                    print("                 every one of these WRAPS IN PLACE and registers "
+                          "nothing, so the verdict above is not softened on them.")
             if r["reached_from_entry"] is not None:
                 print("      reachable  %s from %s"
                       % ("YES" if r["reached_from_entry"] else "NO", ", ".join(entries)))
@@ -8530,11 +8679,12 @@ def cmd_reachable(args):
             counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
         print("  summary: " + " · ".join(
             "%d %s" % (counts.get(v, 0), v)
-            for v in ("WIRED", "NO CALL SITES", "TESTS ONLY", "UNREACHED", "UNDEFINED")))
-        for line in _reach_limits(res, bool(entries)):
+            for v in ("WIRED", "DECORATOR-REGISTERED", "NO CALL SITES", "TESTS ONLY",
+                      "UNREACHED", "UNDEFINED")))
+        for line in _reach_limits(bool(entries)):
             print(line)
 
-    if (bad or unresolved) and not args.no_fail:
+    if (findings or unresolved or res["unresolved_paths"]) and not args.no_fail:
         sys.exit(1)
     sys.exit(0)
 

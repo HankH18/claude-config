@@ -5346,6 +5346,24 @@ def loop_ref(n):
 class Widget:
     def paint(self):
         return wired_ref(1)
+
+
+# Appended AFTER Widget on purpose: every assertion above pins a line number in
+# this file, so this fixture may only ever grow at the bottom.
+def register(fn):
+    return fn
+
+
+@register
+def registered_only(x):
+    """Nothing references this name. The decorator above it is the wiring."""
+    return x
+
+
+@staticmethod
+def inert_only(x):
+    """Decorated too — but @staticmethod registers with nothing at all."""
+    return x
 EOF
 cat > pkg/cli.py <<'EOF'
 from . import core
@@ -5407,7 +5425,12 @@ sl reachable --symbol wired_ref
 ck_exit "a wired symbol exits 0" 0 "$RC"
 ck "...and reads WIRED" "WIRED" "$(verdict_of wired_ref)"
 ck_has "...with its product call sites enumerated" "callers    2 (2 product, 0 test)"
-ck_has "...one of which is an ATTRIBUTE call through a method" \
+# This pins a call held by a METHOD BODY — the holder qualname is the method,
+# not the module. It was labelled 'an ATTRIBUTE call' for a while, which it is
+# not: `wired_ref(1)` there is a bare ast.Name. The attribute form has its own
+# repo below, because nothing in THIS fixture exercised it and deleting the whole
+# ast.Attribute arm of the scanner left the section green.
+ck_has "...one of which is held by a METHOD, not by the module scope" \
        "pkg/core.py:38  in pkg.core.Widget.paint"
 ck_has "...and both export routes named" "package __init__ (pkg/__init__.py:1)"
 ck_has "...including __all__" "__all__ (pkg/__init__.py:3)"
@@ -5434,11 +5457,20 @@ ck_exit "dead_ref has a product caller, so the caller layer alone passes it" 0 "
 ck "...reading WIRED with no --from" "WIRED" "$(verdict_of dead_ref)"
 ck_has "...and the report says so out loud rather than implying reachability" \
        "NO --from WAS GIVEN, so nothing was checked for reachability"
+# The limits block is an if/else and only its positive arm was ever asserted, so
+# forcing the branch either way left the suite green while a report printed both
+# halves at once. Both directions are pinned now, on both arms.
+ck_hasnt "...and NOT the arm that only applies when --from IS given" \
+         "--from reachability is a NAME-KEYED forward closure"
 sl reachable --symbol dead_ref --from pkg/cli.py
 ck_exit "...but with a real entry point named it exits 1" 1 "$RC"
 ck "...because its only caller is itself unreached" "UNREACHED" "$(verdict_of dead_ref)"
 ck_has "...and the reachable line says NO against the entry point" \
        "reachable  NO from pkg/cli.py"
+ck_has "...and the limits block switches to the --from arm" \
+       "--from reachability is a NAME-KEYED forward closure"
+ck_hasnt "...and does NOT also claim no --from was given, three lines below a verdict that used one" \
+         "NO --from WAS GIVEN"
 sl reachable --symbol wired_ref --from pkg/cli.py
 ck_exit "the same entry point passes the symbol that IS on the path" 0 "$RC"
 ck_has "...with reachable YES" "reachable  YES from pkg/cli.py"
@@ -5486,10 +5518,32 @@ ck_has "...but a --path that names it IS honoured (the file is really there)" \
        "defined    node_modules/vendored/copy.py:1"
 
 # --- everything at once: the summary line ---------------------------------
-sl reachable --symbol wired_ref,scoped_ref,suite_ref,dead_ref,never_written --from pkg/cli.py
+# One symbol per verdict class, so the ORDER and the LABELS of the summary line
+# are pinned as well as the counts. A class that never appears here is a class
+# the summary could silently stop printing.
+sl reachable --symbol wired_ref,registered_only,scoped_ref,suite_ref,dead_ref,never_written \
+   --from pkg/cli.py
 ck_exit "a mixed run exits 1 when any symbol is not wired" 1 "$RC"
 ck_has "the summary counts every verdict class" \
-       "summary: 1 WIRED · 1 NO CALL SITES · 1 TESTS ONLY · 1 UNREACHED · 1 UNDEFINED"
+       "summary: 1 WIRED · 1 DECORATOR-REGISTERED · 1 NO CALL SITES · 1 TESTS ONLY · 1 UNREACHED · 1 UNDEFINED"
+
+# --- a decorator is also a REFERENCE held by the enclosing scope ----------
+# `@register` is the only mention of `register` anywhere in the tree. If the
+# scanner stops visiting decorator EXPRESSIONS, every decorator a codebase
+# implements itself reads as dead code — the opposite error to the one below.
+sl reachable --symbol register --path pkg
+ck_exit "a function used only AS a decorator is wired" 0 "$RC"
+ck "...and reads WIRED" "WIRED" "$(verdict_of register)"
+ck_has "...counting the decorator line as the call site" "callers    1 (1 product, 0 test)"
+ck_has "...held by the scope the decorator evaluates in" "pkg/core.py:47  in pkg.core"
+
+# --- and the symbol it decorates is NOT the recovered commit's shape ------
+sl reachable --symbol registered_only,inert_only --path pkg
+ck_exit "a registering decorator is no hard finding; an inert one still is" 1 "$RC"
+ck "the decorated symbol gets the decorator verdict" \
+   "DECORATOR-REGISTERED" "$(verdict_of registered_only)"
+ck "...and @staticmethod, which registers nothing, does not" \
+   "NO CALL SITES" "$(verdict_of inert_only)"
 
 # --- the limits ship WITH the answer, including a clean one ---------------
 # The whole value of this command is that its OK can be trusted; a blind spot
@@ -5561,6 +5615,360 @@ ck_has "...as a blind spot in this answer, not a footnote" \
        "its call sites are invisible to this answer"
 ck "...and the rest of the scan still answers" "WIRED" "$(verdict_of wired_ref)"
 ck_hasnt "...with no traceback escaping the parse failure" "Traceback"
+
+
+# ===========================================================================
+section "reachable: a decorator IS wiring, and the report names which  [repo: rdec]"
+# Measured, read-only, against a live FastAPI project: 24.5% of its public
+# top-level functions came back not-wired, and 20 of the 31 'NO CALL SITES' —
+# 'defined, and NOTHING references it' — were @router.get/@router.post handlers,
+# i.e. the application's entire HTTP surface, i.e. the most-wired code in the
+# repo. The scanner was already holding n.decorator_list and throwing it away.
+# Decorator registration is not an edge case in Python: it is how routes, CLI
+# commands, event handlers, plugins and fixtures are wired.
+mk_repo rdec
+
+mkdir -p app
+cat > app/routes.py <<'EOF'
+from fastapi import APIRouter
+
+router = APIRouter()
+app = router
+
+
+@router.post("/auctions", status_code=201)
+def create_auction(body):
+    """Registered by the decorator above, and by nothing else at all."""
+    return {"ok": True}
+
+
+@lru_cache
+def memoised_and_dead(x):
+    """Decorated too — and @lru_cache registers it with nothing at all."""
+    return x
+
+
+@app.cache
+def cached_by_app(x):
+    """@app.cache is NOT @functools.cache; only the WHOLE label may match."""
+    return x
+
+
+def helper(x):
+    return x
+
+
+@router.get("/things")
+def read_things():
+    return helper(1)
+EOF
+cat > app/main.py <<'EOF'
+from fastapi import FastAPI
+
+from .routes import router
+
+app = FastAPI()
+app.include_router(router)
+EOF
+
+# --- the headline: a live route handler is not the recovered commit -------
+sl reachable --symbol create_auction --path app --from app/main.py
+ck "a decorator-registered handler gets its own verdict" \
+   "DECORATOR-REGISTERED" "$(verdict_of create_auction)"
+ck_exit "...and does NOT fail the run: the commonest wiring idiom in Python cannot be a hard failure" \
+        0 "$RC"
+ck_has "...the decorator is named, with the line it sits on" \
+       "decorated  @router.post at app/routes.py:7"
+ck_has "...and what that means is spelled out" \
+       "a route/registry/plugin table may be its only call site"
+ck_has "...including the hop that was NOT taken" \
+       "This scanner does NOT follow a decorator into the table on the other side"
+ck_hasnt "...and the incident's own text is NOT put on live wired code" \
+         "defined, and NOTHING references it"
+ck_has "...while the diagnosis still refuses to call it an all-clear" \
+       "confirm BY EYE that the table it registers into is itself imported and reached"
+ck_has "...and the limits block says the hop is the reader's" \
+       "a DECORATOR on the definition is reported and NOT followed"
+
+# --- the counterpart: a decorator that registers with NOTHING -------------
+# Without this the softening above is satisfied by softening everything, and
+# the zero-caller defect walks straight through wearing @staticmethod.
+sl reachable --symbol memoised_and_dead --path app
+ck_exit "a decorator that only WRAPS leaves the finding intact (exit 1)" 1 "$RC"
+ck "...and the verdict is unchanged" "NO CALL SITES" "$(verdict_of memoised_and_dead)"
+ck_has "...the decorator is still reported" "decorated  @lru_cache at app/routes.py:13"
+ck_has "...and said to register nothing" \
+       "every one of these WRAPS IN PLACE and registers nothing"
+ck_has "...so the incident's text DOES appear here" \
+       "This is the recovered commit's exact shape"
+
+# --- the inert list matches the WHOLE label, never the last component -----
+sl reachable --symbol cached_by_app --path app
+ck "@app.cache is not @functools.cache" \
+   "DECORATOR-REGISTERED" "$(verdict_of cached_by_app)"
+ck_has "...and is reported by its full dotted label" \
+       "decorated  @app.cache at app/routes.py:19"
+
+# --- ordinary accounting is untouched by the decorator layer --------------
+sl reachable --symbol helper --path app
+ck_exit "a plain function called from a decorated body is still just WIRED" 0 "$RC"
+ck "...with no softening applied" "WIRED" "$(verdict_of helper)"
+ck_has "...and the caller is the decorated function's body" \
+       "app/routes.py:31  in app.routes.read_things"
+
+# --- the exit code separates 'a hop I did not take' from 'a finding' ------
+sl reachable --symbol create_auction,read_things --path app
+ck_exit "a run of nothing but decorator-registered symbols exits 0" 0 "$RC"
+ck_has "...and says how many there were" \
+       "summary: 0 WIRED · 2 DECORATOR-REGISTERED · 0 NO CALL SITES"
+sl reachable --symbol create_auction,memoised_and_dead --path app
+ck_exit "...but one real finding alongside them still exits 1" 1 "$RC"
+
+# --- --json keeps the two questions apart --------------------------------
+sl reachable --symbol create_auction,helper --path app --json
+ck_exit "json: a decorator-registered symbol alone exits 0" 0 "$RC"
+ck "json: it is still NOT claimed wired" "['create_auction']" \
+   "$(jget "$OUT" "d['not_wired']")"
+ck "json: ...but it is not what the exit code is about" "[]" \
+   "$(jget "$OUT" "d['findings']")"
+ck "json: the decorator travels with the symbol" "@router.post" \
+   "$(jget "$OUT" "d['symbols'][0]['decorators'][0]['label']")"
+ck "json: and is marked as a possible registration" "True" \
+   "$(jget "$OUT" "d['symbols'][0]['registering_decorator']")"
+
+# --- a decorator expression this scanner cannot read is not called inert --
+# PEP 614 spellings (@x[0], @lambda...) are 3.9+, so the label renderer is
+# exercised directly rather than through a fixture the suite may not parse.
+ck "a dotted decorator renders to its callee" "@router.post" \
+   "$(python3 -c 'import ast, os, sys; sys.path.insert(0, os.environ["SL_DIR"]); import swarmloop as S; print(S._reach_dec_label(ast.parse("router.post(\"/x\", status_code=201)").body[0].value))')"
+ck "...and one that is not a dotted name is OPAQUE, not silently inert" "@<expression>" \
+   "$(python3 -c 'import ast, os, sys; sys.path.insert(0, os.environ["SL_DIR"]); import swarmloop as S; print(S._reach_dec_label(ast.parse("TABLE[0]").body[0].value))')"
+ck "...and an opaque decorator counts as a POSSIBLE registration" "False" \
+   "$(python3 -c 'import os, sys; sys.path.insert(0, os.environ["SL_DIR"]); import swarmloop as S; print(S.REACH_DEC_OPAQUE[1:] in S.REACH_INERT_DECORATORS)')"
+
+
+# ===========================================================================
+section "reachable: call-site forms, classifiers and --path  [repo: rform]"
+# Every case in this block corresponds to a mutation that changed real,
+# demonstrated behaviour and left the whole suite green. `mod.f()` and `self.f()`
+# are the dominant way a symbol is called in real Python and had NO red path at
+# all: deleting the ast.Attribute arm flipped a wired symbol to NO CALL SITES
+# with 70/70 still passing.
+mk_repo rform
+
+mkdir -p pkg tests
+cat > pkg/core.py <<'EOF'
+REGISTRY = {}
+
+
+def attr_called(x):
+    """Called ONLY as core.attr_called(...) — the dominant form in real Python."""
+    return x
+
+
+def self_called(x):
+    return x
+
+
+def outer(n):
+    """Its ONLY reference is from the function nested inside its own body."""
+    def inner():
+        return outer(n - 1)
+    return inner
+
+
+def helper_called(x):
+    return x
+
+
+def fixture_called(x):
+    return x
+
+
+def conftest_called(x):
+    return x
+
+
+def suffix_called(x):
+    return x
+
+
+def many_callers(x):
+    return x
+
+
+class Holder:
+    def go(self):
+        return self.self_called(1)
+
+
+__all__ = ["attr_called", "REGISTRY"]
+EOF
+cat > pkg/cli.py <<'EOF'
+from . import core
+
+
+def main():
+    core.attr_called(1)
+    return core.Holder().go()
+
+
+class Boot:
+    SEEDED = core.helper_called(1)
+
+
+if __name__ == "__main__":
+    main()
+EOF
+cat > pkg/uses.py <<'EOF'
+from pkg.core import many_callers
+
+
+def u01(): return many_callers(1)
+def u02(): return many_callers(2)
+def u03(): return many_callers(3)
+def u04(): return many_callers(4)
+def u05(): return many_callers(5)
+def u06(): return many_callers(6)
+def u07(): return many_callers(7)
+def u08(): return many_callers(8)
+def u09(): return many_callers(9)
+def u10(): return many_callers(10)
+EOF
+# Three files that are tests for three DIFFERENT reasons. Each of the classifier's
+# arms gets exactly one caller that no other arm would catch.
+cat > pkg/conftest.py <<'EOF'
+from pkg.core import conftest_called
+
+
+def fixture():
+    return conftest_called(1)
+EOF
+cat > pkg/thing_test.py <<'EOF'
+from pkg.core import suffix_called
+
+
+def check():
+    return suffix_called(1)
+EOF
+cat > tests/helpers.py <<'EOF'
+from pkg.core import fixture_called
+
+
+def use():
+    return fixture_called(1)
+EOF
+echo "not python" > notes.txt
+
+# --- mod.f() : the form the suite could not see -------------------------
+sl reachable --symbol attr_called --path pkg
+ck_exit "a symbol called only as mod.f() is wired" 0 "$RC"
+ck "...and reads WIRED, not NO CALL SITES" "WIRED" "$(verdict_of attr_called)"
+ck_has "...with the attribute call site located" "pkg/cli.py:5  in pkg.cli.main"
+ck_has "...and counted as product" "callers    1 (1 product, 0 test)"
+
+# --- self.f() : the same arm, through a method --------------------------
+sl reachable --symbol self_called --path pkg
+ck "a symbol called only as self.f() is wired too" "WIRED" "$(verdict_of self_called)"
+ck_has "...held by the method that calls it" "pkg/core.py:42  in pkg.core.Holder.go"
+
+# --- a helper nested INSIDE the symbol is not an external caller ---------
+# The equality half of this rule was pinned by the recursion cases; the
+# startswith half was not, and it fails in the false-OK direction.
+sl reachable --symbol outer --path pkg
+ck_exit "a function referenced only from its own nested inner() exits 1" 1 "$RC"
+ck "...because a helper nested inside it is still its own body" \
+   "NO CALL SITES" "$(verdict_of outer)"
+
+# --- the __all__ branch records an EXPORT, not a dynamic hint -----------
+sl reachable --symbol attr_called --path pkg
+ck_has "a name inside __all__ is an export" "exported   __all__ (pkg/core.py:45)"
+# Anchored on the per-symbol line, because the LIMITS block legitimately uses
+# the same wording to describe the hint in general.
+ck_hasnt "...and NOT a string literal a getattr might resolve" \
+         "dynamic    the bare name appears as a STRING at"
+
+# --- a module-level assignment IS a definition ---------------------------
+# Without this rule a constant reads UNDEFINED, whose diagnosis asserts 'the
+# commit does not contain what its message claims' — flatly false.
+sl reachable --symbol REGISTRY --path pkg
+ck "a module-level assignment is defined, not UNDEFINED" \
+   "NO CALL SITES" "$(verdict_of REGISTRY)"
+ck_has "...and is located, with its kind" "defined    pkg/core.py:1  (assignment)"
+
+# --- the listing caps; the COUNT on the header line does not -------------
+sl reachable --symbol many_callers --path pkg
+ck_has "the caller COUNT is exact even past the listing cap" \
+       "callers    10 (10 product, 0 test)"
+ck_has "...and the elision says how many were not printed" "... and 2 more"
+ck_has "...having printed exactly the cap" "pkg/uses.py:11  in pkg.uses.u08"
+ck_hasnt "...and nothing past it" "pkg/uses.py:12  in pkg.uses.u09"
+ck_has "the symbols a file IMPORTS are reported" "imported   pkg/uses.py:1"
+
+# --- each arm of the test classifier gets its own caller ----------------
+sl reachable --symbol fixture_called --path pkg --path tests
+ck_exit "a caller under tests/ that is NOT named test_* still counts as a test" 1 "$RC"
+ck "...so the symbol is TESTS ONLY, not WIRED" "TESTS ONLY" "$(verdict_of fixture_called)"
+ck_has "...and is marked" "tests/helpers.py:5  in tests.helpers.use  [TEST]"
+sl reachable --symbol conftest_called --path pkg
+ck "a conftest.py caller is a test caller" "TESTS ONLY" "$(verdict_of conftest_called)"
+sl reachable --symbol suffix_called --path pkg
+ck "a *_test.py caller is a test caller" "TESTS ONLY" "$(verdict_of suffix_called)"
+sl reachable --symbol attr_called --path pkg
+ck_has "...and the limits block says the classifier goes by PATH alone" \
+       "a caller counts as a TEST by its PATH alone"
+
+# --- reaching a scope reaches the CLASS BODIES inside it ----------------
+# A class body executes when its enclosing scope does; a nested function does
+# not. helper_called is referenced ONLY from a class body in the entry module.
+sl reachable --symbol helper_called --path pkg --from pkg/cli.py
+ck_exit "a symbol referenced only from a class body in the entry module is reached" 0 "$RC"
+ck "...and reads WIRED" "WIRED" "$(verdict_of helper_called)"
+ck_has "...with the class body named as the holder" "pkg/cli.py:10  in pkg.cli.Boot"
+
+# --- the other two documented --from spellings actually work ------------
+sl reachable --symbol helper_called --path pkg --from pkg.cli
+ck_exit "--from accepts a DOTTED MODULE" 0 "$RC"
+ck_has "...and resolves it rather than reporting it unresolved" "reachable  YES from pkg.cli"
+sl reachable --symbol attr_called,helper_called --path pkg --from pkg/cli.py:main
+ck_exit "--from accepts module:symbol, seeding ONE scope" 1 "$RC"
+ck_hasnt "...and does not report the spelling as unresolved" "ENTRY POINT DID NOT RESOLVE"
+ck "...reaching what that scope reaches" "WIRED" "$(verdict_of attr_called)"
+ck "...and not what it does not" "UNREACHED" "$(verdict_of helper_called)"
+
+# --- a typo'd --from fails the run even when every symbol is wired ------
+# Otherwise the clause is dead: an empty seed set already forces UNREACHED on
+# everything, so the only live path is 'some entries resolved, one did not'.
+sl reachable --symbol attr_called --path pkg --from pkg/cli.py --from nope_typo
+ck_exit "one unresolvable entry point fails a run whose symbols are all WIRED" 1 "$RC"
+ck "...the symbol really is wired" "WIRED" "$(verdict_of attr_called)"
+ck_has "...and the typo is what failed it" "ENTRY POINT DID NOT RESOLVE: nope_typo"
+
+# --- a --path that names nothing is NOT silently dropped -----------------
+# It used to be, while the header line went on asserting it had been scanned —
+# a confident NO CALL SITES on wired code, from a typo.
+sl reachable --symbol attr_called --path pkg
+ck_exit "a --path that resolves is quiet about it" 0 "$RC"
+ck_hasnt "...saying nothing about unresolved paths" "--path DID NOT RESOLVE"
+sl reachable --symbol attr_called --path pkg --path does_not_exist_typo
+ck_exit "a --path naming nothing fails the run" 1 "$RC"
+ck_has "...and is named" "--path DID NOT RESOLVE: does_not_exist_typo"
+ck_has "...and says what that cost the answer" "NOTHING under it was scanned"
+ck "...while the symbols that WERE scanned are still graded" \
+   "WIRED" "$(verdict_of attr_called)"
+sl reachable --symbol attr_called --path pkg --path notes.txt
+ck_exit "a --path naming a file this scan cannot read fails too" 1 "$RC"
+ck_has "...and names it" "--path DID NOT RESOLVE: notes.txt"
+sl reachable --symbol attr_called --path pkg/core.py --path pkg/cli.py --no-fail
+ck_hasnt "...but a .py file named directly resolves" "--path DID NOT RESOLVE"
+ck_has "...and only those two files were scanned" "against 2 python file(s)"
+sl reachable --symbol attr_called --path pkg --path does_not_exist_typo --json
+ck "json: the unresolved path is a field of its own" "['does_not_exist_typo']" \
+   "$(jget "$OUT" "d['paths_unresolved']")"
+
+# --- the tool FAILING must not be spelled like the tool FINDING ---------
+sl reachable --symbol ,, --path pkg
+ck_exit "an all-empty --symbol is a usage error (3), not a wiring finding (1)" 3 "$RC"
 
 # ===========================================================================
 cd / 2>/dev/null || true
