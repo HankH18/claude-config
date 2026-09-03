@@ -2868,6 +2868,12 @@ for role in ("watchdog", "fixer"):
     env = dict(base, ROLE=role, OUT_PATH=os.path.join(out, role + ".json"),
                WORK_DIR=("/p/runs/r1/skill" if role == "fixer" else ""))
     subprocess.run([sys.executable, os.path.join(out, "gen.py")], env=env, check=True)
+# and again in the `all` shape, where the watchdog also wears the CTO hat
+for role in ("watchdog", "fixer"):
+    env = dict(base, ROLE=role, OUT_PATH=os.path.join(out, role + "-cto.json"),
+               WORK_DIR=("/p/runs/r1/skill" if role == "fixer" else ""),
+               CTO_ROLE="watchdog", CTO_DIR="/p/runs/r1/authority")
+    subprocess.run([sys.executable, os.path.join(out, "gen.py")], env=env, check=True)
 PYGEN
 ck "the profile generator runs for both roles" "2" \
    "$(ls "$CBGEN"/watchdog.json "$CBGEN"/fixer.json 2>/dev/null | wc -l | tr -d ' ')"
@@ -2965,6 +2971,43 @@ print('Edit(//p/runs/r1/skill/**)' in d['permissions']['allow']
 ck "...and the watchdog keeps its notebook" "True" \
    "$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print('Edit(//p/runs/r1/**)' in d['permissions']['allow'])" "$CBGEN/watchdog.json")"
 
+# Under `all` the watcher issues approvals into a store the BUILD cannot reach.
+# The property that makes "read-only observer" and "can grant" compatible is
+# that nobody else can write it either — a fixer that could append to the log
+# would make the record unusable as evidence about the CTO.
+ck "the CTO may write the approvals store" "True" \
+   "$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print('Edit(//p/runs/r1/authority/**)' in d['permissions']['allow'])" "$CBGEN/watchdog-cto.json")"
+ck "the FIXER is denied the approvals store" "True" \
+   "$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print('Edit(//p/runs/r1/authority/**)' in d['permissions']['deny'])" "$CBGEN/fixer-cto.json")"
+ck "a watchdog with NO CTO hat is denied it too" "True" \
+   "$(python3 -c "
+import json,sys
+d=json.load(open(sys.argv[1]))
+print('Edit(//p/runs/r1/authority/**)' not in d['permissions']['allow'])" "$CBGEN/watchdog.json")"
+
+# The store has to be CREATED, not merely announced: a --dry-run line saying
+# where approvals would go is not a store.
+ck "the approvals store is created only when someone wears the CTO hat" "1" \
+   "$(grep -A1 'if \[ -n "\$CTO_ROLE" \]; then' "$CB_SRC" | grep -c 'mkdir -p "\$CTO_DIR"')"
+ck "...and the log is seeded append-only, saying what each record carries" "1" \
+   "$(grep -c 'append only, one record per line' "$CB_SRC")"
+ck "...naming the requesting session, the operation, the reason and a time" "1" \
+   "$(grep -c 'REQUESTING session, the exact operation, the' "$CB_SRC")"
+
+# The CTO contract lives in the prompt, and it is the half that cannot be
+# mechanised — so its absence must be a red line here rather than a quiet
+# omission at launch.
+ck "the watchdog prompt carries the CTO role slot" "1" \
+   "$(grep -c '@@CTO_ROLE@@' "$SCRIPT_DIR/../templates/watchdog-prompt.md")"
+ck "...and the approvals log, in the ledger AND in the rule that uses it" "2" \
+   "$(grep -c '@@CTO_LOG@@' "$SCRIPT_DIR/../templates/watchdog-prompt.md")"
+ck "...and the reversibility bound, not a justification bound" "1" \
+   "$(grep -c 'reversibility, not by justification' "$SCRIPT_DIR/../templates/watchdog-prompt.md")"
+ck "...and that a destructive operation has no ask-the-CTO path at all" "1" \
+   "$(grep -c 'no "ask the CTO" path at all' "$SCRIPT_DIR/../templates/watchdog-prompt.md")"
+ck "...and the ESCALATE rule for an approval tracing back to its own suggestion" "1" \
+   "$(grep -c 'you do not grant it. You escalate to' "$SCRIPT_DIR/../templates/watchdog-prompt.md")"
+
 ck "the provisioned hook points at the launcher's OWN guard" "True" \
    "$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d['hooks']['PreToolUse'][0]['hooks'][0]['command'].endswith('/p/skill/hooks/git-guard.py\"'))" "$CBGEN/watchdog.json")"
 
@@ -3056,8 +3099,17 @@ ck "the watchdog prompt actually carries it" "1" \
 
 # W09030034-02: the build role left no record of what was executed, so a build
 # that died at startup could not be told apart from one never started.
+# Asserted on the WRITE, not on the announcement: a mutation that silences the
+# `ok` line while still writing the file must not be able to pass here, and a
+# mutation that deletes the block must fail on all three.
 ck "the build's command is recorded before the exec" "1" \
-   "$(grep -c 'build command recorded' "$CB_SRC")"
+   "$(grep -c '> "\$STATE_DIR/build-launch.sh"' "$CB_SRC")"
+ck "...as an executable file" "1" \
+   "$(grep -c 'chmod +x "\$STATE_DIR/build-launch.sh"' "$CB_SRC")"
+ck "...with the prompt beside it" "1" \
+   "$(grep -c '> "\$STATE_DIR/build-prompt.txt"' "$CB_SRC")"
+ck "...and the operator is told where it went" "1" \
+   "$(grep -c 'ok "build command recorded' "$CB_SRC")"
 ck "...from the SAME array the exec uses, so it cannot drift" "2" \
    "$(grep -c 'for a in "\${LAUNCH_ARGS\[@\]}"' "$CB_SRC")"
 ck "...and never under --dry-run" "1" \
