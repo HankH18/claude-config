@@ -21,7 +21,7 @@ The design borrows deliberately: from the Ralph-loop school, that **progress liv
 
 ## Workflow at a glance
 
-- **Phase 0 — Initialize** (once, interactive): read the docs, ask the audit-loop count, confirm autonomy, **choose the run's worktree root**, detect greenfield/brownfield, confirm `.claude/settings.local.json` (permissions **and** git-guard) is in place — written before the session started for preference, **probed green either way**, `init`.
+- **Phase 0 — Initialize** (once, interactive): read the docs, ask the audit-loop count, confirm autonomy, **choose the run's worktree root**, detect greenfield/brownfield, confirm `.claude/settings.local.json` (permissions **and** git-guard) is in place (written before the session started for preference, **probed green either way**), `init`.
 - **Phase 1 — Context** (every epoch): full codebase survey first (brownfield) or scaffold (greenfield); incremental map update from merges thereafter.
 - **Phase 2 — Goals** (once): tickets seeded from the docs (or decomposed), machine-checkable metrics with numeric targets, acceptance tests written *before any implementation* → **CHECKPOINT: plan approval** → `freeze` → baseline → commit `.swarm-loop/`.
 - **Phase 3 — Schedule**: compute the ready frontier (dependencies closed, blast radius clear); dispatch is rolling, waves are emergent.
