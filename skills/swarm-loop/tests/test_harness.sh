@@ -767,8 +767,147 @@ sl analyze --cycle 1;     ck_exit "(q) analyze with no escalations.jsonl"    0 "
 ck_hasnt "(q) analyze reports no disputed goals once the log is gone" "DISPUTED GOALS"
 sl checkpoint --cycle 1;  ck_exit "(q) checkpoint with no escalations.jsonl" 0 "$RC"; cat "$OUT" >> "$TMP/compat-all.txt"
 sl escalate --list;       ck_exit "(q) escalate --list on a run that never filed one" 0 "$RC"; cat "$OUT" >> "$TMP/compat-all.txt"
+sl escalate --open-asks;  ck_exit "(q) escalate --open-asks with no escalations.jsonl" 0 "$RC"; cat "$OUT" >> "$TMP/compat-all.txt"
 cp "$TMP/compat-all.txt" "$OUT"
 ck_hasnt "(q) not one traceback across every command" "Traceback"
+
+# ===========================================================================
+# (r) THE END-OF-TURN BLOCK
+#
+# The defect: a non-blocking escalation is filed, the loop is told to keep
+# building, and the ask sits in a file the user never opens while hours of
+# output scroll past it. The ask had a durable home and no path to the eyes of
+# the one person allowed to answer it — this project's recurring failure class
+# (a mechanism with no red path) in a new hat.
+#
+# So `escalate --open-asks` ends every user-facing turn, and the property that
+# makes a rule like that followable is SILENCE when nothing is waiting. Both
+# halves are pinned below: a command that always printed nothing would satisfy
+# the silence assertion on its own, so every negative here has a positive
+# counterpart that proves it prints when it should.
+# ===========================================================================
+section "(r) --open-asks: the end-of-turn block  [repo: rasks]"
+mk_repo rasks
+sl freeze
+gq add -A; gq commit -qm harness
+
+sl escalate --open-asks
+ck_exit "(r) --open-asks with nothing open exits 0" 0 "$RC"
+ck "(r) --open-asks with nothing open prints NOTHING AT ALL" "" "$(cat "$OUT")"
+
+# POSITIVE COUNTERPART to the silence above.
+sl escalate --kind frozen-goal --subject accept \
+   --reason "the accept target cannot be reached without editing a frozen test" \
+   --proposed "lower the accept target from 100 to 80"
+ck_exit "(r) a non-blocking ask is filed" 0 "$RC"
+sl escalate --open-asks
+ck_exit "(r) --open-asks with one non-blocking ask exits 0" 0 "$RC"
+ck_has "(r) the open ask is printed"                     "ESC-001"
+ck_has "(r) ... naming what it is about"                 "frozen-goal"
+ck_has "(r) ... what was asked"                          "the accept target cannot be reached"
+ck_has "(r) ... the specific change proposed"            "lower the accept target from 100 to 80"
+ck_has "(r) ... and the command that closes it"          "escalate --resolve ESC-001"
+ck_hasnt "(r) a non-blocking ask is not labelled BLOCKING" "[BLOCKING]"
+
+# the block is a READ: printing what is waiting changes nothing
+for f in goals.json manifest.json history.csv state.json escalations.jsonl ESCALATIONS.md; do
+  echo "$f $(sha_of ".swarm-loop/$f")"
+done > "$TMP/asks-before.txt"
+sl escalate --open-asks
+for f in goals.json manifest.json history.csv state.json escalations.jsonl ESCALATIONS.md; do
+  echo "$f $(sha_of ".swarm-loop/$f")"
+done > "$TMP/asks-after.txt"
+: > "$OUT"
+for f in goals.json manifest.json history.csv state.json escalations.jsonl ESCALATIONS.md; do
+  B="$(grep "^$f " "$TMP/asks-before.txt" | awk '{print $2}')"
+  A="$(grep "^$f " "$TMP/asks-after.txt"  | awk '{print $2}')"
+  ck "(r) --open-asks left .swarm-loop/$f byte-identical" "$B" "$A"
+done
+
+# an unanswered ask comes back EVERY turn — that is the whole mechanism
+sl escalate --open-asks
+ck_has "(r) the unresolved ask is still there on the second call" "ESC-001"
+sl escalate --open-asks
+ck_has "(r) ... and on the third"                                 "ESC-001"
+
+# blocking is distinguished, loudly, and it is not a failure
+sl escalate --blocking --kind blocked-ticket --subject T-42 \
+   --reason "the ticket needs a scope call only the user can make" \
+   --proposed "decide whether T-42 is in scope"
+ck_exit "(r) the blocking ask exits 2 when filed" 2 "$RC"
+sl escalate --open-asks
+ck_exit "(r) --open-asks exits 2 while a BLOCKING ask is open" 2 "$RC"
+ck_has "(r) the blocking ask is marked"                     "[BLOCKING]"
+ck_has "(r) it says the run is waiting on a human"          "WAITING ON A HUMAN"
+ck_has "(r) ... which is neither done nor failed"           "neither done nor failed"
+ck_has "(r) the non-blocking ask is still listed alongside" "ESC-001"
+
+# ORDER: newest first, but blocking above everything regardless of age. The
+# third ask is filed AFTER the blocking one precisely so "newest first" alone
+# cannot pass this.
+sl escalate --kind other --subject scope \
+   --reason "a scope decision is needed and nothing blocks on it" \
+   --proposed "confirm the scope"
+ck_exit "(r) a third, newer, non-blocking ask is filed" 0 "$RC"
+sl escalate --open-asks
+ck_exit "(r) --open-asks still exits 2 with three open and one blocking" 2 "$RC"
+ck "(r) the BLOCKING ask prints first though it is NOT the newest" \
+   "ESC-002" "$(grep -o 'ESC-00[0-9]' "$OUT" | uniq | sed -n 1p)"
+ck "(r) ... then the newest non-blocking one" \
+   "ESC-003" "$(grep -o 'ESC-00[0-9]' "$OUT" | uniq | sed -n 2p)"
+ck "(r) ... then the oldest" \
+   "ESC-001" "$(grep -o 'ESC-00[0-9]' "$OUT" | uniq | sed -n 3p)"
+ck_has "(r) the count is stated so the block cannot be skimmed past" "3 awaiting YOUR decision"
+
+# RESOLUTION. An agent may ask; only the user may grant — so an ask cannot be
+# closed without a recorded decision.
+sl escalate --resolve ESC-001
+ck_exit "(r) --resolve with no --note is refused" 3 "$RC"
+ck_has "(r) ... because an undecided close is indistinguishable from a retirement" \
+       "retiring its own unanswered question"
+sl escalate --open-asks
+ck_has "(r) the refused resolve left the ask OPEN" "ESC-001"
+
+sl escalate --resolve ESC-001 --note "declined - the accept target stands"
+ck_exit "(r) --resolve with a recorded decision is accepted" 0 "$RC"
+sl escalate --open-asks
+ck_hasnt "(r) a resolved ask stops appearing in the block" "ESC-001"
+ck_has   "(r) ... while the still-open blocking ask keeps appearing" "ESC-002"
+
+# WITHDRAWAL. The loop may retract a question that became moot. It may never
+# retract a BLOCKING one — that would be the loop answering itself.
+sl escalate --withdraw ESC-002 --note "not relevant any more"
+ck_exit "(r) the loop may NOT withdraw a blocking ask" 1 "$RC"
+ck_has "(r) ... and is told why"                      "the loop may not withdraw it"
+sl escalate --open-asks
+ck_exit "(r) the blocking ask survived the withdrawal attempt" 2 "$RC"
+ck_has "(r) ... and is still printed"                          "ESC-002"
+
+sl escalate --resolve ESC-002 --note "granted - T-42 is out of scope"
+ck_exit "(r) the user's decision closes the blocking ask" 0 "$RC"
+sl escalate --open-asks
+ck_exit "(r) with the blocking ask decided the block exits 0 again" 0 "$RC"
+ck_has "(r) ... and the third ask is still waiting" "ESC-003"
+
+sl escalate --withdraw ESC-003
+ck_exit "(r) --withdraw with no --note is refused" 3 "$RC"
+sl escalate --open-asks
+ck_has "(r) the refused withdrawal left the ask OPEN" "ESC-003"
+sl escalate --withdraw 3 --note "route pivoted; nothing depends on the answer now"
+ck_exit "(r) a non-blocking ask may be withdrawn WITH a reason" 0 "$RC"
+ck_has "(r) withdrawing is recorded as never answered" "NEVER ANSWERED"
+sl escalate --open-asks
+ck_exit "(r) a withdrawn ask stops appearing, and the block exits 0" 0 "$RC"
+ck "(r) ... leaving it silent again" "" "$(cat "$OUT")"
+
+sl escalate --list --all
+ck_has "(r) the withdrawal is on the permanent record" "WITHDRAWN, never answered,"
+: > "$OUT"; cat .swarm-loop/ESCALATIONS.md > "$OUT"
+ck_has "(r) the mirror labels it a retraction, not a decision" "WITHDRAWN by the loop"
+ck_has "(r) ... and says nobody answered it" "NEVER ANSWERED. The loop withdrew the question"
+
+sl escalate --resolve ESC-001 --withdraw ESC-001 --note "both at once"
+ck_exit "(r) --resolve and --withdraw together are refused" 3 "$RC"
 
 # ===========================================================================
 # argparse defaults + per-metric timeout handling (the cost-free half of A5)
