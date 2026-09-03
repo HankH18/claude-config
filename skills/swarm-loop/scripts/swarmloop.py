@@ -4199,6 +4199,9 @@ def cmd_dispatch(args):
     d = sd(root)
     os.makedirs(d, exist_ok=True)
     path = os.path.join(d, DISPATCH_FILE)
+    if (args.ticket or args.verdict) and not args.close:
+        die("--ticket/--verdict record a COLLECTION verdict and only mean something with "
+            "--close <agent-ref>: an open dispatch has not been judged yet", 3)
     if args.do_list:
         open_recs = _open_dispatches(d)
         if not open_recs:
@@ -4229,15 +4232,37 @@ def cmd_dispatch(args):
         if branch:
             out = _git(root, "rev-parse", "--verify", "--quiet", branch + "^{commit}")
             tip = (out.stdout or "").strip() or None
+        # THE CLOSE RECORD CARRIED NO TICKET ID AND NO MACHINE-READABLE VERDICT.
+        # agent_ref/action/closed_at/note/branch/sha: a REJECTED branch closed
+        # byte-identically to an accepted one, with only free-text `note` between
+        # them, and nothing tied the verdict to the ticket it was about. Both keys
+        # are OPTIONAL and additive — a close without them is exactly what it was.
         rec = {"agent_ref": args.close, "action": "close",
                "closed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
                "note": args.note}
+        tickets = _split_ids(args.ticket)
+        if tickets:
+            rec["tickets"] = tickets
+        if args.verdict:
+            rec["verdict"] = args.verdict
         if branch:
             rec["branch"] = branch
             rec["sha"] = tip
         with open(path, "a") as f:
             f.write(json.dumps(rec, sort_keys=True) + "\n")
         print(f"dispatch: {args.close} closed")
+        if tickets and args.verdict:
+            print("  ledger: %s -> %s.  This record outlives the branch: `retire` deletes "
+                  "task/* once it lands, and `frontier --closed-from-ledger` still reads "
+                  "this." % (", ".join(tickets), args.verdict))
+        elif tickets:
+            print("  !! --ticket %s recorded with NO --verdict, so it closes NOTHING — "
+                  "--closed-from-ledger reads accepted verdicts ONLY. Re-close with "
+                  "--verdict accepted|rejected." % ", ".join(tickets))
+        elif args.verdict:
+            print("  !! --verdict %s names no ticket (--ticket T-nnn), so no ticket's "
+                  "closure is recorded and --closed-from-ledger cannot see this."
+                  % args.verdict)
         if branch:
             was = (prior or {}).get("sha")
             print(f"  verdict is bound to {branch}@{(tip or 'UNRESOLVABLE')[:12]}")
@@ -4285,19 +4310,212 @@ def cmd_dispatch(args):
     print(f"  close it at collection:  swarmloop.py dispatch --close {args.agent}")
 
 
-def _closed_from_args(root, args):
-    closed = set()
-    for chunk in (args.closed or []):
+def _split_ids(chunks):
+    """['T-1,T-2', ' T-3'] -> ['T-1', 'T-2', 'T-3']. Order preserved, deduped."""
+    out = []
+    for chunk in (chunks or []):
         for tid in re.split(r"[,\s]+", chunk):
-            if tid.strip():
-                closed.add(tid.strip())
+            tid = tid.strip()
+            if tid and tid not in out:
+                out.append(tid)
+    return out
+
+
+def _leading_ticket_id(suffix):
+    """'T-010' -> 'T-010'.  'T-010-supersedes-T-011' -> 'T-010'.  junk -> None.
+
+    The id is anchored at the START of a task branch's suffix and must be followed
+    by a separator or nothing. What this replaces was `re.findall(r"\bT-\d+\b")`
+    over the whole `git branch` LINE, which closed BOTH ids named by
+    `task/T-010-supersedes-T-011` — and the second one was never built."""
+    m = re.match(r"^(T-\d+)(?:[-_./].*)?$", suffix or "")
+    return m.group(1) if m else None
+
+
+def _closed_from_merged(root, base):
+    """(ids, notes) — tickets whose task/* branch has merged into `base`.
+
+    Two guards. Both can only REDUCE what is reported closed, and that direction
+    is deliberate: a false-CLOSED silently drops real work out of the frontier,
+    while a false-OPEN merely burns a lane on something already done.
+
+      * A branch whose tip IS the base commit has zero commits of its own.
+        `git branch task/T-003 main` — a provisioned-and-not-yet-dispatched lane,
+        which Phase 3 calls "the normal state" — is trivially `--merged main`, and
+        used to report T-003 CLOSED with nothing built.
+      * The id is parsed from the branch NAME, never scanned out of the line.
+
+    Every skip is REPORTED. A branch that looks landed and is being ignored is
+    exactly the thing an operator has to see; a silent drop is the same defect
+    wearing the other sign."""
+    ids, notes = set(), []
+    out = _git(root, "branch", "--merged", base, "--list", "task/*")
+    if out.returncode != 0:
+        msg = " ".join(((out.stderr or "") + " " + (out.stdout or "")).split())
+        return ids, ["--closed-from-merged: git could not list branches merged into %s "
+                     "(%s) — NOTHING was derived from git" % (base, msg or "no output")]
+    base_sha = (_git(root, "rev-parse", "--verify", "--quiet",
+                     base + "^{commit}").stdout or "").strip() or None
+    for line in (out.stdout or "").splitlines():
+        name = line[2:].strip() if line[:2] in ("  ", "* ", "+ ") else line.strip()
+        if not name:
+            continue
+        suffix = _ticket_of_branch(name)
+        tid = _leading_ticket_id(suffix)
+        if not tid:
+            notes.append("--closed-from-merged: SKIPPED %s — no T-nnn ticket id at the "
+                         "front of the branch name, so it closes nothing" % name)
+            continue
+        tip = (_git(root, "rev-parse", "--verify", "--quiet",
+                    name + "^{commit}").stdout or "").strip() or None
+        if tip and base_sha and tip == base_sha:
+            notes.append("--closed-from-merged: SKIPPED %s (%s) — its tip IS %s@%s, so the "
+                         "lane has ZERO commits of its own. Provisioned, not built."
+                         % (name, tid, base, base_sha[:12]))
+            continue
+        if suffix != tid:
+            notes.append("--closed-from-merged: %s closes %s ONLY — the rest of that branch "
+                         "name is not a second ticket" % (name, tid))
+        ids.add(tid)
+    return ids, notes
+
+
+def _closed_from_ledger(d):
+    """(ids, notes) — tickets closed by an explicit `dispatch --close --ticket …
+    --verdict accepted` record.
+
+    Why this exists at all: closure derived from git is NON-MONOTONIC, because
+    the harness erases its own signal. `retire` deletes every landed task branch
+    (_landed_branches), so `--closed-from-merged` FORGETS a ticket the moment its
+    worktree is reclaimed — the work is still in `main`, the evidence is not.
+    This record is append-only and outlives the branch it judged.
+
+    LAST verdict per ticket wins: a ticket accepted in one cycle and rejected by
+    a later audit is open again, and the ordering of an append-only log is the
+    only thing that can say so. A record with no `verdict` key closes nothing —
+    the free-text `note` is not a verdict and never was, which is why a REJECTED
+    branch used to close exactly like an accepted one."""
+    path = os.path.join(d, DISPATCH_FILE)
+    if not os.path.exists(path):
+        return set(), ["--closed-from-ledger: no %s/%s — nothing has been closed with an "
+                       "explicit --ticket/--verdict yet" % (STATE_DIR, DISPATCH_FILE)]
+    verdict, bad = {}, 0
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    bad += 1
+                    continue
+                if not isinstance(rec, dict) or rec.get("action") != "close":
+                    continue
+                if rec.get("verdict") not in ("accepted", "rejected"):
+                    continue
+                for tid in (rec.get("tickets") or []):
+                    if isinstance(tid, str) and tid.strip():
+                        verdict[tid.strip()] = rec["verdict"]
+    except OSError as e:
+        return set(), ["--closed-from-ledger: cannot read %s (%s)" % (path, e)]
+    rejected = sorted(t for t, v in verdict.items() if v == "rejected")
+    notes = []
+    if rejected:
+        notes.append("--closed-from-ledger: %d ticket(s) carry a REJECTED verdict and stay "
+                     "OPEN: %s" % (len(rejected), ", ".join(rejected)))
+    if bad:
+        notes.append("--closed-from-ledger: %d unparseable line(s) in %s were skipped"
+                     % (bad, DISPATCH_FILE))
+    return set(t for t, v in verdict.items() if v == "accepted"), notes
+
+
+def _closure_banner(root, d, base, sources, n_closed):
+    """The lines `frontier` prints ABOUT its own `closed` count.
+
+    `0 closed` is a well-formed, confident number that on the default path cannot
+    be anything else. No ticket field anywhere in this file is read for status —
+    closure enters ONLY through the flags below — so with none of them supplied
+    every ticket reads OPEN, the READY set is the graph's ROOTS, and work that
+    already shipped sorts to the TOP of it. Measured on a live run: 108 tickets ·
+    0 closed · 27 READY, ranked `T-000 depth 0 unblocks 81 "Monorepo skeleton
+    with green empty verify pipeline"` — a ticket that had shipped long before —
+    while the five tickets actually worth dispatching read `blocked` behind it.
+    Handing the same graph the 50 ids that had landed turned it into 110 · 50
+    closed · 36 READY with the real work on top.
+
+    A number with no path to being wrong is this project's dominant defect class,
+    so the no-source case now says so in the loudest terms the command has."""
+    if sources:
+        if n_closed:
+            return []
+        return ["  NOTE: a closure source WAS supplied (%s) and it found NOTHING closed."
+                % ", ".join(sources),
+                "  On a first wave that is correct. Later it means the source has gone "
+                "blind: --closed-from-merged stops seeing landed work the moment `retire` "
+                "deletes the landed branches. --closed-from-ledger does not."]
+    lines = [
+        "  !! 0 closed because NO CLOSURE SOURCE WAS SUPPLIED — it is NOT a measurement.",
+        "     Nothing here reads a ticket status field (the graph carries none), so every "
+        "ticket reads OPEN, the READY set below is the graph's ROOTS rather than a work "
+        "queue, and anything already built sorts to the TOP of it.",
+        "     Supply one:  --closed T-001,T-002  ·  --closed-from-merged  ·  "
+        "--closed-from-ledger",
+    ]
+    # Evidence, not heuristic: a landed task branch or an accepted ledger verdict
+    # is direct proof that this run is past its first wave. Its ABSENCE proves
+    # nothing (retire deletes landed branches), so this can only under-report —
+    # which is why the quiet case says "consistent with" and not "therefore".
+    ev, blind = [], []
+    landed, landed_notes = _closed_from_merged(root, base)
+    # A git call that FAILED must not read as "nothing has landed" — that is the
+    # same silent-wrong this whole banner exists to kill, one level down.
+    blind += [n for n in landed_notes if "git could not list branches" in n]
+    if landed:
+        shown = sorted(landed)
+        ev.append("%d ticket(s) have a task/* branch LANDED on %s (%s%s)"
+                  % (len(shown), base, ", ".join(shown[:6]),
+                     ", …" if len(shown) > 6 else ""))
+    accepted, _ = _closed_from_ledger(d)
+    if accepted:
+        ev.append("%d ticket(s) carry an ACCEPTED verdict in %s" % (len(accepted),
+                                                                    DISPATCH_FILE))
+    if blind:
+        lines.append("     COULD NOT LOOK: " + " / ".join(blind)
+                     + ". Absence of evidence below is absence of a working query, not "
+                       "absence of landed work — check --base.")
+    if ev:
+        lines.append("     EVIDENCE that this run is NOT at its first wave: " + "; ".join(ev)
+                     + ". Every one of those is being ranked below as if it were unbuilt.")
+    elif not blind:
+        lines.append("     (No landed task/* branch and no accepted ledger verdict found — "
+                     "CONSISTENT with a first wave, and proof of nothing: `retire` deletes "
+                     "landed branches, so this evidence goes quiet on a run that is far "
+                     "along.)")
+    return lines
+
+
+def _closed_from_args(root, args):
+    """(closed ids, {"sources": [...], "notes": [...]}).
+
+    `sources` is the load-bearing half: it is the difference between "nothing is
+    done" and "nobody said what is done", which the bare count cannot express."""
+    closed, notes, sources = set(), [], []
+    closed.update(_split_ids(args.closed))
+    if args.closed:
+        sources.append("--closed")
     if getattr(args, "closed_from_merged", False):
-        out = subprocess.run(["git", "branch", "--merged", args.base, "--list", "task/*"],
-                             capture_output=True, text=True, cwd=root).stdout
-        for line in out.splitlines():
-            for tid in re.findall(r"\bT-\d+\b", line):
-                closed.add(tid)
-    return closed
+        sources.append("--closed-from-merged")
+        ids, n = _closed_from_merged(root, args.base)
+        closed |= ids
+        notes += n
+    if getattr(args, "closed_from_ledger", False):
+        sources.append("--closed-from-ledger")
+        ids, n = _closed_from_ledger(sd(root))
+        closed |= ids
+        notes += n
+    return closed, {"sources": sources, "notes": notes}
 
 
 def cmd_frontier(args):
@@ -4309,7 +4527,8 @@ def cmd_frontier(args):
     path, tickets = _load_graph(root, state, args.graph)
     idx, dupes = _graph_index(tickets)
     errors = _graph_unusable(tickets) + _graph_validate(idx, dupes)
-    closed = _closed_from_args(root, args)
+    closed, closure = _closed_from_args(root, args)
+    closure_banner = _closure_banner(root, d, args.base, closure["sources"], len(closed))
     unknown_closed = sorted(c for c in closed if c not in idx)
     depth, unblocks = _graph_depth(idx), _graph_unblocks(idx)
 
@@ -4323,7 +4542,7 @@ def cmd_frontier(args):
     ready.sort(key=lambda r: (-unblocks.get(r[0], 0), depth.get(r[0], 0), r[0]))
 
     if args.json:
-        print(json.dumps({
+        payload = {
             "graph": os.path.relpath(path, root),
             "tickets": len(idx), "closed": sorted(closed),
             "unknown_closed_ids": unknown_closed,
@@ -4332,13 +4551,26 @@ def cmd_frontier(args):
                        "verify": idx[t].get("verify"),
                        "owns": _ticket_owns(idx[t])[0]} for t, _ in ready],
             "blocked": [{"id": t, "waiting_on": od} for t, od in blocked],
-        }, indent=2))
+        }
+        # Additive, and only when there is something to say: a reader written
+        # against the old shape sees an unchanged document on the path where
+        # closure was supplied and behaved.
+        if closure_banner or closure["notes"]:
+            payload["closure"] = {"sources": closure["sources"],
+                                  "notes": closure["notes"],
+                                  "warning": closure_banner}
+        print(json.dumps(payload, indent=2))
     else:
         print(f"graph: {os.path.relpath(path, root)}  ·  {len(idx)} ticket(s)  ·  "
               f"{len(closed)} closed  ·  {len(ready)} READY  ·  {len(blocked)} blocked")
+        for line in closure_banner:
+            print(line)
+        for line in closure["notes"]:
+            print("  " + line)
         if unknown_closed:
-            print("  NOTE: --closed named ids that are not in the graph: "
-                  + ", ".join(unknown_closed))
+            print("  NOTE: closure (%s) named ids that are not in the graph: %s"
+                  % (", ".join(closure["sources"]) or "--closed",
+                     ", ".join(unknown_closed)))
         for e in errors:
             print(f"  GRAPH ERROR: {e}")
         print("")
@@ -5523,7 +5755,8 @@ def cmd_reads(args):
     idx, dupes = _graph_index(tickets)
     _graph_refuse_if_invalid(root, path, tickets, idx, dupes,
                              "the read edges this command gates 'freeze' on")
-    res = _scan_read_edges(root, state, idx, args.tests, _closed_from_args(root, args))
+    reads_closed, _closure = _closed_from_args(root, args)
+    res = _scan_read_edges(root, state, idx, args.tests, reads_closed)
 
     if args.json:
         out = dict(res)
@@ -6417,8 +6650,13 @@ def main():
     s.add_argument("--closed", action="append", default=None, metavar="IDS",
                    help="repeatable, comma-separated: tickets already merged/closed")
     s.add_argument("--closed-from-merged", action="store_true",
-                   help="also treat every T-nnn named by a task/* branch merged into --base "
-                        "as closed")
+                   help="also treat as closed every ticket whose task/* branch has merged "
+                        "into --base. Skips (and names) a branch whose tip IS --base: zero "
+                        "commits is a provisioned lane, not delivered work")
+    s.add_argument("--closed-from-ledger", action="store_true",
+                   help="also treat as closed every ticket named by a `dispatch --close "
+                        "--ticket … --verdict accepted` record. Unlike --closed-from-merged "
+                        "this survives `retire` deleting the landed branch")
     s.add_argument("--base", default="main")
     s.add_argument("--json", action="store_true", help="machine-readable output")
     s.set_defaults(func=cmd_frontier)
@@ -6501,6 +6739,15 @@ def main():
                         "measured against and a branch that moved under the agent is reported "
                         "instead of silently accepted")
     s.add_argument("--close", default=None, metavar="REF", help="mark a dispatch collected")
+    s.add_argument("--ticket", action="append", default=None, metavar="IDS",
+                   help="with --close: repeatable, comma-separated ticket ids this verdict "
+                        "is about. Recorded on the close record, which outlives the branch "
+                        "`retire` deletes")
+    s.add_argument("--verdict", default=None, choices=["accepted", "rejected"],
+                   help="with --close: the machine-readable verdict. Only 'accepted' closes "
+                        "a ticket for `frontier --closed-from-ledger`; the free-text --note "
+                        "never could, which is why a rejected branch used to close exactly "
+                        "like an accepted one")
     s.add_argument("--note", default=None, metavar="TEXT")
     s.add_argument("--list", action="store_true", dest="do_list",
                    help="print dispatches that were never closed")

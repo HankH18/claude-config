@@ -3355,6 +3355,177 @@ ck_hasnt "(x2) CONTROL: no complaint" "discards its own failure output"
 
 
 # ===========================================================================
+# W48 · the scheduler was INVERTED because closure never entered it
+#
+# Measured on a live run: `frontier` printed `108 ticket(s) · 0 closed · 27
+# READY · 81 blocked` and ranked `T-000 depth 0 unblocks 81 "Monorepo skeleton"`
+# first — a ticket that had shipped long before — while the five tickets worth
+# dispatching read `blocked`. No ticket field is read for status anywhere in
+# swarmloop.py; closure enters ONLY through these flags, and the flags were
+# documented NOWHERE, so an orchestrator following SKILL.md literally could
+# only ever get `0 closed`. Four defects, one section:
+#   (1) `0 closed` printed as if it were a measurement, with no red path.
+#   (2) a zero-commit provisioned lane read as CLOSED (false-closed).
+#   (3) one branch name closed two tickets (false-closed).
+#   (4) closure derived from git is erased by `retire`.
+# ===========================================================================
+section "W48 frontier closure derivation  [repo: rclose]"
+mk_repo rclose
+cat > tickets.json <<'EOF'
+{"version": 1, "project": "e2e", "tickets": [
+ {"id": "T-000", "title": "scaffold", "verify": "true",
+  "scope": ["**"], "depends_on": []},
+ {"id": "T-001", "title": "alpha", "verify": "false",
+  "scope": ["a/**"], "depends_on": ["T-000"]},
+ {"id": "T-002", "title": "beta", "verify": "false",
+  "scope": ["b/**"], "depends_on": ["T-001"]},
+ {"id": "T-003", "title": "gamma", "verify": "false",
+  "scope": ["c/**"], "depends_on": ["T-000"]},
+ {"id": "T-010", "title": "delta", "verify": "false",
+  "scope": ["d/**"], "depends_on": ["T-000"]},
+ {"id": "T-011", "title": "epsilon", "verify": "false",
+  "scope": ["e/**"], "depends_on": ["T-000"]}
+]}
+EOF
+gq add -A; gq commit -qm "ticket graph"
+# T-000 lands for real.
+gq checkout -b task/T-000
+mkdir -p scaffold; echo x > scaffold/x; gq add -A; gq commit -qm "T-000 scaffold"
+gq checkout main; gq merge --no-ff -m "merge T-000" task/T-000
+# A landed branch whose NAME mentions a second ticket that was never built.
+gq checkout -b task/T-010-supersedes-T-011
+mkdir -p d; echo x > d/x; gq add -A; gq commit -qm "T-010"
+gq checkout main; gq merge --no-ff -m "merge T-010" task/T-010-supersedes-T-011
+# T-003: a lane provisioned and never dispatched. `git branch task/T-003 main`
+# is trivially `--merged main`, and Phase 3 calls this "the normal state".
+gq branch task/T-003 main
+
+# --- (1) the no-source warning, and the count it is about --------------------
+sl frontier
+ck_exit "W48 frontier with no closure source still exits 0" 0 "$RC"
+ck_has "W48 '0 closed' with no source is called out, not printed as a measurement" \
+       "NO CLOSURE SOURCE WAS SUPPLIED"
+ck_has "W48 the warning names every flag that would fix it" \
+       "--closed T-001,T-002  ·  --closed-from-merged  ·  --closed-from-ledger"
+ck_has "W48 the warning says the ready set is the graph's ROOTS, not a queue" \
+       "the graph's ROOTS rather than a work queue"
+# EVIDENCE, not heuristic: a task/* branch that LANDED is proof this is not a
+# first wave. A greenfield cycle-1 run has none and must not see this line.
+ck_has "W48 landed task branches are cited as evidence the run is past wave 1" \
+       "EVIDENCE that this run is NOT at its first wave"
+# ...and the numbers themselves are untouched. The live build is running against
+# this file; a changed count under it is the defect class, not the fix.
+ck_has "W48 UNCHANGED: the count line is what it always was" \
+       "6 ticket(s)  ·  0 closed  ·  1 READY  ·  5 blocked"
+ck_has "W48 UNCHANGED: with no closure the shipped root still ranks first" \
+       "T-000     depth 0   unblocks 5"
+
+# --- (1b) supplying a source SILENCES the loud line ---------------------------
+sl frontier --closed T-000
+ck_exit "W48 frontier --closed exits 0" 0 "$RC"
+ck_hasnt "W48 the loud line is ABSENT once a closure source is supplied" \
+         "NO CLOSURE SOURCE WAS SUPPLIED"
+ck_hasnt "W48 ...and the evidence line goes with it" \
+         "EVIDENCE that this run is NOT at its first wave"
+ck_has "W48 supplied closure actually moves the number" \
+       "1 closed  ·  4 READY  ·  1 blocked"
+
+# --- (2) + (3) the two false-CLOSED defects in --closed-from-merged -----------
+sl frontier --closed-from-merged --json
+ck_exit "W48 --closed-from-merged --json exits 0" 0 "$RC"
+ck "W48 a zero-commit provisioned lane is NOT closed; a two-id branch closes ONE" \
+   "T-000,T-010" "$(jget "$OUT" '",".join(d["closed"])')"
+sl frontier --closed-from-merged
+ck_has "W48 the skipped provisioned lane is REPORTED, not silently dropped" \
+       "SKIPPED task/T-003 (T-003)"
+ck_has "W48 ...with the discriminator that decided it" \
+       "the lane has ZERO commits of its own"
+ck_has "W48 the two-ticket branch name says which id it closed" \
+       "task/T-010-supersedes-T-011 closes T-010 ONLY"
+ck_has "W48 the falsely-closed lane is back in the ready set" "T-003     depth 1"
+ck_has "W48 the never-built second id is back in the ready set" "T-011     depth 1"
+
+# --- (4) closure that `retire` cannot erase ----------------------------------
+sl dispatch --agent w-000 --kind ticket --subject T-000 --branch task/T-000
+sl dispatch --close w-000 --ticket T-000 --verdict accepted --note "verifier green"
+ck_exit "W48 dispatch --close --ticket --verdict is accepted" 0 "$RC"
+ck_has "W48 the close says the record outlives the branch" "ledger: T-000 -> accepted"
+sl dispatch --agent w-001 --kind ticket --subject T-001 --branch task/T-000
+sl dispatch --close w-001 --ticket T-001 --verdict rejected --note "gate was vacuous"
+sl frontier --closed-from-ledger --json
+ck "W48 --closed-from-ledger closes the ACCEPTED ticket and only that one" \
+   "T-000" "$(jget "$OUT" '",".join(d["closed"])')"
+sl frontier --closed-from-ledger
+ck_has "W48 the REJECTED verdict is reported as still open, never as closed" \
+       "carry a REJECTED verdict and stay OPEN: T-001"
+ck_hasnt "W48 a ledger source silences the no-source warning too" \
+         "NO CLOSURE SOURCE WAS SUPPLIED"
+
+# `retire` deletes every landed task branch (_landed_branches). That is what
+# makes git-derived closure NON-MONOTONIC: the work stays in main, the signal
+# does not. Run the real command, not a hand-rolled `git branch -D`.
+sl retire
+ck_exit "W48 retire runs" 0 "$RC"
+ck_has "W48 retire deleted the landed branch this closure was derived from" \
+       "branches deleted (landed on main): task/T-000"
+sl frontier --closed-from-merged --json
+ck "W48 AFTER retire, git-derived closure has FORGOTTEN the landed work" \
+   "" "$(jget "$OUT" '",".join(d["closed"])')"
+sl frontier --closed-from-merged
+ck_has "W48 a source that was supplied and found nothing says so differently" \
+       "a closure source WAS supplied"
+ck_hasnt "W48 ...and is NOT the no-source alarm" "NO CLOSURE SOURCE WAS SUPPLIED"
+sl frontier --closed-from-ledger --json
+ck "W48 AFTER retire, the ledger verdict SURVIVES the branch's deletion" \
+   "T-000" "$(jget "$OUT" '",".join(d["closed"])')"
+
+# --- the new dispatch flags refuse to be recorded where they mean nothing -----
+sl dispatch --agent w-x --kind ticket --subject T-002 --ticket T-002
+ck_exit "W48 --ticket on an OPEN dispatch is refused at intake (exit 3)" 3 "$RC"
+sl dispatch --agent w-y --kind ticket --subject T-002 --verdict accepted
+ck_exit "W48 --verdict on an OPEN dispatch is refused at intake (exit 3)" 3 "$RC"
+sl dispatch --agent w-002 --kind ticket --subject T-002
+sl dispatch --close w-002 --ticket T-002
+ck_has "W48 --ticket with NO --verdict is loudly inert, not silently inert" \
+       "recorded with NO --verdict, so it closes NOTHING"
+sl dispatch --agent w-003 --kind ticket --subject T-003
+sl dispatch --close w-003 --verdict accepted
+ck_has "W48 --verdict naming no ticket is loudly inert too" \
+       "names no ticket (--ticket T-nnn)"
+sl frontier --closed-from-ledger --json
+ck "W48 neither half alone closes anything" \
+   "T-000" "$(jget "$OUT" '",".join(d["closed"])')"
+
+# --- a genuinely first-wave run must NOT see the evidence line ----------------
+# This is the false-positive the warning could have had: cycle 1 legitimately
+# has zero closed and legitimately ranks the scaffold ticket first.
+section "W48b a first-wave run  [repo: rclose2]"
+mk_repo rclose2
+cat > tickets.json <<'EOF'
+{"version": 1, "project": "e2e", "tickets": [
+ {"id": "T-000", "title": "scaffold", "verify": "true", "scope": ["**"], "depends_on": []},
+ {"id": "T-001", "title": "alpha", "verify": "false", "scope": ["a/**"],
+  "depends_on": ["T-000"]}
+]}
+EOF
+gq add -A; gq commit -qm "ticket graph"
+sl frontier
+ck_has "W48b the no-source line still fires on a first-wave run" \
+       "NO CLOSURE SOURCE WAS SUPPLIED"
+ck_hasnt "W48b but nothing claims it is past wave 1 — no landed branch exists" \
+         "EVIDENCE that this run is NOT at its first wave"
+ck_has "W48b the quiet case says CONSISTENT WITH, and admits what it cannot see" \
+       "CONSISTENT with a first wave, and proof of nothing"
+# A git query that FAILED must not read as "nothing landed" — that is the same
+# silent-wrong the banner exists to kill, one level down.
+sl frontier --base no-such-base
+ck_has "W48b a --base git cannot resolve is reported, not read as 'nothing landed'" \
+       "COULD NOT LOOK:"
+ck_hasnt "W48b ...and it does NOT then claim the run is consistent with a first wave" \
+         "CONSISTENT with a first wave, and proof of nothing"
+
+
+# ===========================================================================
 cd / 2>/dev/null || true
 ELAPSED=$(( $(date +%s) - START_TS ))
 echo
