@@ -67,7 +67,7 @@ A tip pins what was committed and says nothing about what sits uncommitted besid
 
 APPLY: at collection, run `git -C <worktree> status --porcelain` and require it EMPTY before accepting a branch or dispatching a verifier at it. Non-empty means the lane has work it never committed — ask for the commit, re-pin, and re-measure, rather than merging a tip whose reported greens came from other bytes. Never forward a number to a verifier without having established that its provenance is the pinned commit.
 
-*Coverage: PARTIAL. The merge protocol's step 0 already says to treat a completion notification as "may still be moving" until the worktree is clean AND the tip is stable — but it names no command, puts no check at collection, and does not carry this failure (facts measured against uncommitted bytes). Propose mechanizing it there; delete this entry when that edit lands.*
+*Coverage: PROSE HALF LANDED, MECHANICAL HALF STILL OWED — re-measured 2026-09-03 against merge-protocol.md. Step 0 now names the command (`git -C <worktree> status --porcelain`, required EMPTY, "one line is a refusal") and step 1 makes "worktree clean at the pinned SHA" a fourth eligibility condition carrying this failure. What is NOT done is the veto: `check-branch --worktree <path>` refusing on a non-empty status and printing the dirty paths. This entry stays until that exists, because a runbook line is the thing this project has measured agents skipping — the entry is the only durable record that the mechanism is still owed.*
 
 ## A gitignored code-intelligence index does not exist in a worktree — and the CLI answers anyway
 
