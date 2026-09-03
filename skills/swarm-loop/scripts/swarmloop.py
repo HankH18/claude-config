@@ -2959,8 +2959,19 @@ def cmd_check_branch(args):
         # reassuring line, and nothing in the output told that apart from a genuine
         # resumed-run advisory. An id the graph has never heard of is not a ticket
         # this ledger predates; it is a question about nothing.
-        gpath, gtickets = _load_graph(root, state, getattr(args, "graph", None),
-                                      required=False)
+        # SystemExit is caught on purpose. _load_graph `die`s on a graph that is
+        # not readable JSON, which is right for red-check (the graph IS its
+        # input) and wrong here: check-branch's three real vetoes are statements
+        # about the DIFF and hold whatever the graph says, so a broken
+        # tickets.json must not take down a merge gate that was working before
+        # this validation existed. Degrade to the same advisory as "no graph".
+        try:
+            gpath, gtickets = _load_graph(root, state, getattr(args, "graph", None),
+                                          required=False)
+        except SystemExit:
+            gpath, gtickets = None, None
+            print("ADVISORY — the ticket graph could not be read (see the error above), so "
+                  f"--ticket {args.ticket} could not be validated against it.")
         if gtickets is None:
             print(f"ADVISORY (not a veto) — --ticket {args.ticket} could NOT be validated: "
                   "no ticket graph was found, so this run cannot tell a real id from a typo. "

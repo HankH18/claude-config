@@ -7050,6 +7050,18 @@ ck_has "V8 ...a case-only typo gets the near-miss suggestion" "Did you mean: T-1
 # the difference between "checked" and "not checkable". Never a veto: refusing
 # every --ticket on a repo with no graph would wedge exactly the resumed runs the
 # D4 shape exists to protect.
+# A graph that is not readable JSON must not take the merge gate down with it:
+# check-branch's three real vetoes are statements about the DIFF and hold
+# whatever the graph says, so this validation is not allowed to turn a working
+# gate into a hard error on a repo with a broken tickets.json.
+echo 'this is not json' > tickets.json
+gq add -A; gq commit -qm brokengraph
+sl check-branch --branch task/T-1 --ticket T-1
+ck_exit "V8 an UNREADABLE graph degrades to an advisory, it does not wedge the gate" 1 "$RC"
+ck_has "V8 ...saying the id could not be validated against it" "could not be validated"
+ck_has "V8 ...and the red-check gate still ran, and still vetoed on its own evidence" \
+       "has no red-check verdict of \`red\`"
+
 rm -f tickets.json
 gq add -A; gq commit -qm nograph
 sl check-branch --branch task/T-1 --ticket T-zzz
