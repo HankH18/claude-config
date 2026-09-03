@@ -6965,9 +6965,13 @@ ck_hasnt "V6 CONTROL: ...and no reconciliation line" "of those verdict(s) are NO
 # `: > .swarm-loop/redcheck.jsonl` turned a live VETO into exit 0 for the whole
 # run: an empty file parsed to {}, _redcheck_gate took its "no ledger yet"
 # branch, and printed `no .swarm-loop/redcheck.jsonl exists` — about a file it
-# had just opened. redcheck.jsonl is ALSO not in git-guard's LEDGER_NAMES, so
-# the redirect that does this is not blocked the way it is for state.json /
-# goals.json / manifest.json (that half is a NEEDS, recorded in SKILL.md).
+# had just opened. The WRITE half was a second defect and is closed separately:
+# `redcheck.jsonl` is in git-guard's LEDGER_NAMES now (with `dispatch.jsonl` and
+# `findings.jsonl`), so that redirect is blocked exactly as it is for state.json
+# / goals.json / manifest.json. This section is about the READ half, and it
+# would still matter if the guard were bypassed — which it can be, since the
+# guard is a PreToolUse hook over argv and fails open on anything it cannot
+# tokenize (`references/run-permissions.md`, "Not a set, and not exact").
 # ===========================================================================
 section "V7 an emptied ledger is a finding, not a clean slate  [repo: rledger]"
 mk_repo rledger
@@ -7731,6 +7735,60 @@ ck "G4 ...and it is NOT pretended into protected_paths" "False" \
    "$(jget .swarm-loop/state.json "any('graph.json' in p for p in d['protected_paths'])")"
 ck "G4 ...nor into the manifest, which could never restore it" "False" \
    "$(jget .swarm-loop/manifest.json "any('graph.json' in p for p in d['files'])")"
+
+
+# ===========================================================================
+# S1 · the ledger-name list is quoted in prose, and prose drifts.
+#
+# `redcheck.jsonl`, `dispatch.jsonl` and `findings.jsonl` joined git-guard's
+# LEDGER_NAMES and FIVE places went on describing the old world — three of them
+# by reciting a bare COUNT of the list, which is exactly why they went stale
+# invisibly: a number stays true-looking until someone edits a different file,
+# and nothing anywhere connected the two. So the docs name the RULE, enumerate
+# the list in exactly ONE place, and that place is tied to the guard's own
+# constant here — the same shape as the matcher-drift check in
+# tests/test_git_guard.py that ties bin/claude-build to REQUIRED_MATCHER.
+# ===========================================================================
+section "S1 the documented ledger names cannot drift from the guard's"
+cat > "$TMP/ledger_drift.py" <<'PYEOF'
+import re, sys
+guard, doc = open(sys.argv[1]).read(), open(sys.argv[2]).read()
+m = re.search(r"LEDGER_NAMES\s*=\s*frozenset\(\{(.*?)\}\)", guard, re.S)
+if not m:
+    print("git-guard.py no longer defines LEDGER_NAMES as a frozenset literal")
+    raise SystemExit
+want = set(re.findall(r'"([^"]+)"', m.group(1)))
+# The doc's single enumeration, anchored on the phrase that introduces it.
+dm = re.search(r"the run \*\*ledger\*\*(.*?)— via", doc, re.S)
+if not dm:
+    print("references/run-permissions.md no longer enumerates the ledger names "
+          "between 'the run **ledger**' and '-- via'")
+    raise SystemExit
+got = set(re.findall(r"`([^`]+)`", dm.group(1)))
+if got != want:
+    print("LEDGER DRIFT: doc has %s extra, is missing %s"
+          % (sorted(got - want) or "nothing", sorted(want - got) or "nothing"))
+else:
+    print("OK")
+PYEOF
+LEDGER_DRIFT="$(python3 "$TMP/ledger_drift.py" "$SCRIPT_DIR/../hooks/git-guard.py" "$SCRIPT_DIR/../references/run-permissions.md" 2>&1)"
+ck "S1 references/run-permissions.md enumerates EXACTLY git-guard's LEDGER_NAMES" \
+   "OK" "$LEDGER_DRIFT"
+
+# The negative half. A bare count is what went stale in three of the five
+# places; it must not come back anywhere the guard's list is described.
+STALE_COUNTS="$(cd "$SCRIPT_DIR/.." && grep -rniE \
+  '(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|[0-9]+) ledger names?' \
+  SKILL.md references tests 2>/dev/null | wc -l | tr -d ' ')"
+ck "S1 nothing states the ledger list as a bare COUNT — counts are what went stale" \
+   "0" "$STALE_COUNTS"
+
+# The positive counterpart to that negative: the recovery path documented for
+# `freeze-log.jsonl` is a property of BEING a ledger name, so it has to be
+# written as one. Three files inherited it silently when the guard's list grew;
+# a reader who meets `> .swarm-loop/redcheck.jsonl` at 3am must find it.
+ck "S1 goal-setting.md states the blocked recovery as a RULE over the whole list" "1" \
+   "$(cd "$SCRIPT_DIR/.." && grep -c 'every name in .LEDGER_NAMES' references/goal-setting.md)"
 
 
 # ===========================================================================
