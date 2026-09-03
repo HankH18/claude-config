@@ -1241,6 +1241,165 @@ PAYLOAD_CASES = [
     ("rm-rf-glob-cwd-not-critical", ALLOW,
      {"tool_name": "Bash", "cwd": "{WT}/build",
       "tool_input": {"command": "rm -rf *"}}),
+
+    # -- PHASE 7'S PUSH GATE, which was prose with no mechanism. "everything
+    #    `.swarm-loop/` currently holds is committed" is a condition on repo
+    #    STATE, and no command string can express it: the same `git push origin
+    #    main` is the loop's sanctioned final step against a clean ledger and a
+    #    silent loss of the epoch's evidence against a dirty one. So these live
+    #    here, pinned to a cwd, on the `fetch-force-*-in-repo` precedent above.
+    #
+    #    Every ALLOW below has a BLOCK counterpart differing in exactly ONE
+    #    property, because an ALLOW on its own passes against a guard that does
+    #    nothing:
+    #      dirty ledger        vs  clean ledger ({REPO})      vs  none ({NOLEDGER})
+    #      the run's `main`    vs  a worker's `task/T-010`
+    #      a real push         vs  `--dry-run` / `-n`
+    #      git present         vs  no git binary (ENV_CASES)
+    ("push-main-dirty-ledger", BLOCK,
+     {"tool_name": "Bash", "cwd": "{DIRTYRUN}",
+      "tool_input": {"command": "git push origin main"}}),
+    #    The loop's own spelling: no refspec at all, so git pushes the current
+    #    branch. A rule that only read argv would miss it entirely.
+    ("push-bare-dirty-ledger", BLOCK,
+     {"tool_name": "Bash", "cwd": "{DIRTYRUN}",
+      "tool_input": {"command": "git push"}}),
+    ("push-remote-only-dirty-ledger", BLOCK,
+     {"tool_name": "Bash", "cwd": "{DIRTYRUN}",
+      "tool_input": {"command": "git push origin"}}),
+    #    The other spellings of the same ref. `HEAD:main` and the fully
+    #    qualified form publish exactly what `origin main` does.
+    ("push-head-refspec-dirty", BLOCK,
+     {"tool_name": "Bash", "cwd": "{DIRTYRUN}",
+      "tool_input": {"command": "git push origin HEAD:main"}}),
+    ("push-full-refspec-dirty", BLOCK,
+     {"tool_name": "Bash", "cwd": "{DIRTYRUN}",
+      "tool_input": {"command": "git push origin refs/heads/main:refs/heads/main"}}),
+    ("push-upstream-dirty", BLOCK,
+     {"tool_name": "Bash", "cwd": "{DIRTYRUN}",
+      "tool_input": {"command": "git push -u origin main"}}),
+    #    `-o <value>` takes its argument separately, so a naive operand scan
+    #    reads `ci.skip` as the remote and `origin` as the refspec — and then
+    #    `main` is never examined at all.
+    ("push-push-option-dirty", BLOCK,
+     {"tool_name": "Bash", "cwd": "{DIRTYRUN}",
+      "tool_input": {"command": "git push -o ci.skip origin main"}}),
+    #    Reached however the shell dresses it up, like every other rule here.
+    ("push-dirty-after-and", BLOCK,
+     {"tool_name": "Bash", "cwd": "{DIRTYRUN}",
+      "tool_input": {"command": "make test && git push origin main"}}),
+    ("push-dirty-in-bash-c", BLOCK,
+     {"tool_name": "Bash", "cwd": "{DIRTYRUN}",
+      "tool_input": {"command": "bash -c 'git push origin main'"}}),
+    #    ...and named from somewhere else. The command says where it means, so
+    #    the answer must not depend on the process cwd — the bug this whole
+    #    file was rebuilt around.
+    ("push-dirty-gitC-from-outside", BLOCK,
+     {"tool_name": "Bash", "cwd": "{ELSEWHERE}",
+      "tool_input": {"command": "git -C {DIRTYRUN} push origin main"}}),
+    ("push-dirty-cd-from-outside", BLOCK,
+     {"tool_name": "Bash", "cwd": "{ELSEWHERE}",
+      "tool_input": {"command": "cd {DIRTYRUN} && git push origin main"}}),
+    ("push-dirty-gitC-from-repo", BLOCK,
+     {"tool_name": "Bash", "cwd": "{REPO}",
+      "tool_input": {"command": "git -C {DIRTYRUN} push origin main"}}),
+    #    A push of the run's `main` issued FROM a worker's worktree still
+    #    publishes the ledger-carrying branch.
+    ("push-main-from-worker-wt-dirty", BLOCK,
+     {"tool_name": "Bash", "cwd": "{DIRTYWT}",
+      "tool_input": {"command": "git push origin main"}}),
+
+    #    ---- and the ALLOW half, which is the load-bearing half ----
+    #    CLEAN ledger, same command, same shape: {REPO}'s `.swarm-loop` is
+    #    committed. The string battery's `push` / `push-plain-refspec` /
+    #    `push-lease` cases all run there too, so "clean -> allowed" is pinned
+    #    across the whole cwd matrix as well as here.
+    ("push-main-clean-ledger", ALLOW,
+     {"tool_name": "Bash", "cwd": "{REPO}",
+      "tool_input": {"command": "git push origin main"}}),
+    ("push-bare-clean-ledger", ALLOW,
+     {"tool_name": "Bash", "cwd": "{REPO}",
+      "tool_input": {"command": "git push"}}),
+    #    NO `.swarm-loop` at all: not this run's repo, nothing to gate on. A
+    #    rule that blocked here would false-block every push on the machine.
+    ("push-main-no-ledger", ALLOW,
+     {"tool_name": "Bash", "cwd": "{NOLEDGER}",
+      "tool_input": {"command": "git push origin main"}}),
+    ("push-bare-no-ledger", ALLOW,
+     {"tool_name": "Bash", "cwd": "{NOLEDGER}",
+      "tool_input": {"command": "git push"}}),
+    ("push-no-ledger-gitC-from-dirty", ALLOW,
+     {"tool_name": "Bash", "cwd": "{DIRTYRUN}",
+      "tool_input": {"command": "git -C {NOLEDGER} push origin main"}}),
+    #    A WORKER pushing its own branch, from its own worktree, while the
+    #    run's ledger is dirty. Nothing about this push publishes the ledger,
+    #    and blocking it is the false block that would matter.
+    ("push-task-branch-from-worker-wt", ALLOW,
+     {"tool_name": "Bash", "cwd": "{DIRTYWT}",
+      "tool_input": {"command": "git push origin task/T-010"}}),
+    ("push-bare-from-worker-wt", ALLOW,
+     {"tool_name": "Bash", "cwd": "{DIRTYWT}",
+      "tool_input": {"command": "git push"}}),
+    ("push-task-branch-in-dirty-run", ALLOW,
+     {"tool_name": "Bash", "cwd": "{DIRTYRUN}",
+      "tool_input": {"command": "git push origin task/T-010"}}),
+    #    `--dry-run` publishes nothing, and run-permissions.md step 3
+    #    PRESCRIBES it as the pre-flight probe — blocking it would break the
+    #    check that exists to prove the push will not prompt.
+    ("push-dry-run-dirty-ledger", ALLOW,
+     {"tool_name": "Bash", "cwd": "{DIRTYRUN}",
+      "tool_input": {"command": "git push --dry-run origin main"}}),
+    ("push-dry-run-short-dirty", ALLOW,
+     {"tool_name": "Bash", "cwd": "{DIRTYRUN}",
+      "tool_input": {"command": "git push -n origin main"}}),
+    ("push-dry-run-abbrev-dirty", ALLOW,
+     {"tool_name": "Bash", "cwd": "{DIRTYRUN}",
+      "tool_input": {"command": "git push --dry origin main"}}),
+    #    A cwd outside every repository. There is no repo, so no ledger, so no
+    #    answer — and an unanswerable question allows, as everywhere else.
+    ("push-main-outside-any-repo", ALLOW,
+     {"tool_name": "Bash", "cwd": "{ELSEWHERE}",
+      "tool_input": {"command": "git push origin main"}}),
+    #    A push whose refspec is a TAG, not the run's branch.
+    ("push-tag-dirty-ledger", ALLOW,
+     {"tool_name": "Bash", "cwd": "{DIRTYRUN}",
+      "tool_input": {"command": "git push origin v1.0.0"}}),
+    #    THE TWO NO-REFSPEC OPTION FORMS, which are not the same thing and were
+    #    read as one by the first draft of the rule. `--tags` publishes
+    #    refs/tags and NO branch, so there is no evidence to be missing;
+    #    `--all` publishes every local branch, the run's `main` included, and
+    #    it does so whatever branch the caller is standing on — which is why
+    #    the worktree spelling below blocks while `push-bare-from-worker-wt`
+    #    above does not. Measured, not assumed: `--all` was a FALSE BLOCK
+    #    asserted as ALLOW until the pair was split.
+    ("push-tags-only-dirty-ledger", ALLOW,
+     {"tool_name": "Bash", "cwd": "{DIRTYRUN}",
+      "tool_input": {"command": "git push --tags origin"}}),
+    ("push-all-branches-dirty-ledger", BLOCK,
+     {"tool_name": "Bash", "cwd": "{DIRTYRUN}",
+      "tool_input": {"command": "git push --all origin"}}),
+    ("push-all-from-worker-wt-dirty", BLOCK,
+     {"tool_name": "Bash", "cwd": "{DIRTYWT}",
+      "tool_input": {"command": "git push --all origin"}}),
+    ("push-all-clean-ledger", ALLOW,
+     {"tool_name": "Bash", "cwd": "{REPO}",
+      "tool_input": {"command": "git push --all origin"}}),
+    #    Non-push git in the dirty repo is untouched — the rule is on `push`,
+    #    not on "the ledger is dirty".
+    ("status-in-dirty-run", ALLOW,
+     {"tool_name": "Bash", "cwd": "{DIRTYRUN}",
+      "tool_input": {"command": "git status --porcelain"}}),
+    ("commit-in-dirty-run", ALLOW,
+     {"tool_name": "Bash", "cwd": "{DIRTYRUN}",
+      "tool_input": {"command": "git add .swarm-loop && git commit -m 'epoch'"}}),
+    #    ...and the destructive spellings in the dirty repo still block for
+    #    THEIR reason, so a green above is not the ledger rule swallowing them.
+    ("push-force-in-dirty-run", BLOCK,
+     {"tool_name": "Bash", "cwd": "{DIRTYRUN}",
+      "tool_input": {"command": "git push --force origin task/T-010"}}),
+    ("stash-in-dirty-run", BLOCK,
+     {"tool_name": "Bash", "cwd": "{DIRTYRUN}",
+      "tool_input": {"command": "git stash"}}),
 ]
 
 
@@ -1371,14 +1530,110 @@ def build_repo(root):
     if p.returncode != 0 or not os.path.isdir(os.path.join(vend, ".git")):
         raise SystemExit("test setup failed: vendored clone\n%s%s" % (p.stdout, p.stderr))
 
-    # The run-state directory. Left UNTRACKED so no existing verdict shifts.
+    # The run-state directory, COMMITTED — a CLEAN ledger.
+    #
+    # It used to be left untracked "so no existing verdict shifts", and that was
+    # true right up until a rule started reading `git status -- .swarm-loop`:
+    # untracked content IS uncommitted, so every `git push origin main` in this
+    # fixture became a block and nine declared ALLOWs went red. Committing it is
+    # also the faithful shape — `init`'s gitignore block ignores `worktrees/`,
+    # `archive/` and tool caches, so a real run's ledger is TRACKED, which is
+    # the whole reason `measure`/`analyze`/`checkpoint` dirty it every epoch.
+    # The committed state is what makes the push ALLOWs load-bearing: they now
+    # pin "clean ledger -> push allowed", against `{DIRTYRUN}` below which pins
+    # the same command blocking on the same shape with the ledger dirty.
+    # Scoped commit (`-- <path>`) so the staged submodule stays staged and
+    # nothing else about this fixture moves.
     os.makedirs(os.path.join(repo, SWARM_DIR, "acceptance"))
     os.makedirs(os.path.join(repo, SWARM_DIR, "worktrees"))
     for rel in ("state.json", "goals.json", "manifest.json", "history.csv",
                 "acceptance/test_frozen.py", "worker-preamble.md"):
         with open(os.path.join(repo, SWARM_DIR, rel), "w") as f:
             f.write("{}\n")
+    g("add", SWARM_DIR)
+    g("commit", "-qm", "chore(swarm-loop): epoch evidence", "--", SWARM_DIR)
+    st = subprocess.run(["git", "status", "--porcelain", "--", SWARM_DIR],
+                        cwd=repo, env=git_env(root), capture_output=True, text=True)
+    if st.returncode != 0 or st.stdout.strip():
+        raise SystemExit("test setup failed: {REPO} ledger is not clean:\n%s%s"
+                         % (st.stdout, st.stderr))
+
+    build_ledger_repos(root)
     return repo
+
+
+def build_ledger_repos(root):
+    """The two repos that differ in ONE property: does `.swarm-loop` hold
+    anything uncommitted?
+
+    `{DIRTYRUN}` reproduces the state Phase 7 actually pushes from, measured in
+    a fresh fixture running the real harness after its own four commands:
+
+         M .swarm-loop/history.csv    (`measure` appends)
+         M .swarm-loop/state.json     (`checkpoint` rewrites)
+        ?? .swarm-loop/analysis/      (`analyze` writes cycle-N.json)
+
+    `{NOLEDGER}` is byte-for-byte the same repo with no `.swarm-loop` at all —
+    the control that says the block comes from the LEDGER and not from "some
+    repository named a branch called main". Both sit outside the primary
+    fixture's repo and worktree list on purpose: a push rule keyed on repo
+    state needs a repo whose state it alone decides.
+    """
+    def mkrepo(path):
+        os.makedirs(path)
+        for cmd in (["init", "-q"],
+                    ["symbolic-ref", "HEAD", "refs/heads/main"],
+                    ["config", "user.email", "t@example.invalid"],
+                    ["config", "user.name", "t"],
+                    ["config", "commit.gpgsign", "false"]):
+            p = subprocess.run(["git", "-C", path] + cmd, env=git_env(root),
+                               capture_output=True, text=True)
+            if p.returncode != 0:
+                raise SystemExit("test setup failed: git %s in %s\n%s%s"
+                                 % (" ".join(cmd), path, p.stdout, p.stderr))
+        with open(os.path.join(path, "src.py"), "w") as f:
+            f.write("x = 1\n")
+
+    def commit(path):
+        for cmd in (["add", "-A"], ["commit", "-qm", "seed"]):
+            subprocess.run(["git", "-C", path] + cmd, env=git_env(root),
+                           capture_output=True, text=True)
+
+    dirty = os.path.join(root, "dirty-run")
+    mkrepo(dirty)
+    os.makedirs(os.path.join(dirty, SWARM_DIR))
+    for rel in ("state.json", "history.csv", "goals.json"):
+        with open(os.path.join(dirty, SWARM_DIR, rel), "w") as f:
+            f.write("{}\n")
+    commit(dirty)
+    # ...and now dirty it exactly the way an epoch does.
+    with open(os.path.join(dirty, SWARM_DIR, "history.csv"), "a") as f:
+        f.write("1,coverage,0.71\n")                       # `measure`
+    with open(os.path.join(dirty, SWARM_DIR, "state.json"), "w") as f:
+        f.write('{"cycle": 1}\n')                          # `checkpoint`
+    os.makedirs(os.path.join(dirty, SWARM_DIR, "analysis"))
+    with open(os.path.join(dirty, SWARM_DIR, "analysis", "cycle-1.json"), "w") as f:
+        f.write("{}\n")                                    # `analyze`
+    # A worker's worktree of the DIRTY run, on its own task branch. This is the
+    # tree where a false block would actually cost something: the ledger it can
+    # see is the primary tree's, and its own branch is not the run's `main`.
+    subprocess.run(["git", "-C", dirty, "worktree", "add", "-q", "-b",
+                    "task/T-010", os.path.join(root, "dirty-wt"), "main"],
+                   env=git_env(root), capture_output=True, text=True)
+
+    st = subprocess.run(["git", "status", "--porcelain", "--", SWARM_DIR],
+                        cwd=dirty, env=git_env(root), capture_output=True, text=True)
+    if st.returncode != 0 or not st.stdout.strip():
+        raise SystemExit("test setup failed: {DIRTYRUN} ledger is not dirty:\n%s%s"
+                         % (st.stdout, st.stderr))
+    if not os.path.isdir(os.path.join(root, "dirty-wt")):
+        raise SystemExit("test setup failed: {DIRTYWT} worktree was not created")
+
+    noledger = os.path.join(root, "no-ledger")
+    mkrepo(noledger)
+    commit(noledger)
+    if os.path.exists(os.path.join(noledger, SWARM_DIR)):
+        raise SystemExit("test setup failed: {NOLEDGER} has a .swarm-loop")
 
 
 def git_env(root):
@@ -1652,9 +1907,22 @@ ENV_CASES = [
     ("nogit-unbalanced-quote",    ALLOW, True,  "echo 'unterminated"),
     ("nogit-heredoc-packet",      ALLOW, True,
      "cat > p.md <<'EOF'\n- never run git stash\nEOF"),
+    # The push ledger-gate is answered ENTIRELY by asking git, so with no git
+    # binary it must fail OPEN like everything else — it is not the second
+    # fail-closed rule. Note the `-C`: ENV_CASES all run with cwd = the primary
+    # (CLEAN) fixture repo, so without it "allowed" would be the clean answer
+    # rather than the unanswered one, and the case would prove nothing.
+    ("nogit-push-dirty-ledger-allows", ALLOW, True,
+     "git -C {DIRTYRUN} push origin main"),
+    ("nogit-push-bare-allows",     ALLOW, True,  "git push origin main"),
     # The control: with git present the same delete is allowed, so the block
     # above is the missing ANSWER and not the command.
     ("git-present-rm-r-allows",   ALLOW, False, "rm -rf node_modules"),
+    # ...and the control for the pair above: the identical string, same cwd,
+    # with git on PATH. Exit 2. So the ALLOW is the missing ANSWER, not the
+    # command being harmless.
+    ("git-present-push-dirty-blocks", BLOCK, False,
+     "git -C {DIRTYRUN} push origin main"),
 ]
 
 MALFORMED_PAYLOADS = [
@@ -1747,9 +2015,18 @@ def fill_paths(obj, repo, root):
     {FOREIGN}   a git repository that is not this run's.
     {SCRATCH}   a scratch directory holding a repository AND a worktree of it,
                 still not this run's. This suite's own temp dir is this shape.
+    {DIRTYRUN}  a run repo on `main` whose `.swarm-loop` is TRACKED and holds
+                uncommitted changes — the state Phase 7 actually pushes from.
+    {DIRTYWT}   a worker worktree of {DIRTYRUN}, on `task/T-010`. The ledger it
+                can see is the primary tree's; its own branch is not the run's.
+    {NOLEDGER}  the same repo, on `main`, with no `.swarm-loop` at all. The
+                control that says the block comes from the ledger.
     """
     if isinstance(obj, str):
-        return (obj.replace("{REPO}", repo)
+        return (obj.replace("{DIRTYRUN}", os.path.join(root, "dirty-run"))
+                   .replace("{DIRTYWT}", os.path.join(root, "dirty-wt"))
+                   .replace("{NOLEDGER}", os.path.join(root, "no-ledger"))
+                   .replace("{REPO}", repo)
                    .replace("{WT}", os.path.join(root, "worktrees", "T-010"))
                    .replace("{OUTSIDE}", os.path.join(root, "worktrees"))
                    .replace("{ELSEWHERE}", os.path.join(root, "elsewhere"))

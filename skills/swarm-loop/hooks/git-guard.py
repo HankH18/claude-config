@@ -91,6 +91,19 @@ Blocked:
     fetch INTO a local branch; `+…:refs/remotes/…` and `+…:refs/tags/…` are the
     ordinary refspecs and stay allowed)
 
+Blocked on repo STATE rather than on the command string — one rule, and the only
+one in this file that reads the working tree to decide:
+  git push of the run's `main` while `<tree>/.swarm-loop` holds anything
+    uncommitted (modified OR untracked). Phase 7's last push condition —
+    "everything `.swarm-loop/` currently holds is committed" — was prose with no
+    mechanism, so a `main` carrying none of the epoch's evidence went to the
+    remote silently, and that push is the run's only offsite copy of the thing
+    `resume` reads. Narrow by construction: it fires only on the branch checked
+    out in the tree that CARRIES `.swarm-loop`, so a worker's `task/<id>` push
+    and a repo with no `.swarm-loop` are untouched, and `--dry-run` (the
+    pre-flight probe run-permissions.md prescribes) is exempt. Unanswerable —
+    no git, no repository, a `status` that errors or times out — allows.
+
 Blocked WITHOUT a git verb (rules keyed on the PATH, added after a live audit
 found the guard had no path awareness at all):
   rm -r of the repo root, a worktree root, a directory CONTAINING worktree
@@ -229,7 +242,9 @@ completely unguarded. Guarded status depends on workers being Agent-tool
 subagents of the parent session; that is a property of how the run is launched,
 not something this file can enforce.
 
-Allowed (verified): git add, git commit, git push, git reset (soft/mixed),
+Allowed (verified): git add, git commit, git push (with the one STATE-keyed
+  exception above: not the run's `main` while `.swarm-loop` is dirty),
+  git push --dry-run, git reset (soft/mixed),
   git checkout <branch>, git checkout -b, git switch <branch>, git diff,
   git show, git show HEAD:<path> > <path>, git log, git status, git ls-tree,
   git ls-remote, git stash list, git stash show, git stash create,
@@ -1160,7 +1175,121 @@ def check_push(rest: list[str]) -> str | None:
             return ("`git push <remote> +" + s.lstrip("+") + ":" + d + "` is a "
                     "forced refspec — the `+` is `--force` for that ref, which is "
                     "blocked above under its other spelling.")
-    return None
+    return check_push_ledger(rest)
+
+
+# The options above are keyed on the COMMAND STRING. The one below is keyed on
+# repo STATE, and it is the first push rule in this file that is — see
+# `swarm_ledger_dirty`.
+#
+# Only these push options take a separate value, so only these can make the
+# token after them something other than a remote or a refspec. `-o` can also
+# carry its value attached (`-oci.skip`), which the dash-prefix test already
+# skips.
+_PUSH_VALUE_OPTS = frozenset({
+    "--repo", "--exec", "--receive-pack", "--push-option", "-o",
+})
+
+
+def push_local_refs(rest: list[str]) -> list[str] | None:
+    """The LOCAL ref names a `git push` publishes, or None for "no refspec".
+
+    Operand 0 is the remote; every operand after it is a refspec whose SOURCE
+    (before the `:`, minus a leading `+`) names the local thing being pushed.
+    None means the line carries no refspec at all — what git pushes then depends
+    on the OPTIONS, which is the caller's business (`--all` = every branch,
+    `--tags` = no branch, otherwise the current branch)."""
+    ops: list[str] = []
+    skip = False
+    for a in rest:
+        if skip:
+            skip = False
+            continue
+        if a.startswith("-") and a != "-":
+            if a in _PUSH_VALUE_OPTS:
+                skip = True
+            continue
+        ops.append(a)
+    if len(ops) <= 1:
+        return None
+    return [a.partition(":")[0].lstrip("+") for a in ops[1:]]
+
+
+def check_push_ledger(rest: list[str]) -> str | None:
+    """Phase 7's push gate, which was prose with no mechanism behind it.
+
+    SKILL.md's push conditions end with "everything `.swarm-loop/` currently
+    holds is committed … a push of a `main` carrying none of the epoch's
+    evidence is what makes `resume` on a fresh clone useless, and the push is
+    the run's only offsite copy of that evidence." Nothing enforced it, so it
+    failed silently and only in the unattended runs that most need it. Measured
+    in a fresh fixture after Phase 7's own four commands, all three tracked and
+    all three uncommitted at the moment the push runs:
+
+        M .swarm-loop/history.csv   (`measure` appends)
+        M .swarm-loop/state.json    (`checkpoint` rewrites)
+       ?? .swarm-loop/analysis/     (`analyze` writes cycle-N.json)
+
+    NARROW ON PURPOSE, because a false block on the loop's one push step is the
+    failure mode that matters here. It fires only on a push that publishes the
+    branch checked out in the tree that CARRIES `.swarm-loop` — the run's
+    `main`. A worker pushing its own `task/<id>` branch, a push in a repo with
+    no `.swarm-loop` at all, and `--dry-run` (which `run-permissions.md`
+    prescribes as the pre-flight probe, and which contacts the remote without
+    publishing anything) are all left alone and pinned as ALLOW cases.
+
+    THE NO-REFSPEC FORMS ARE NOT ALL THE SAME, and reading them as one was a
+    measured false block, not a hypothetical: `git push --all origin` and
+    `git push --tags origin` both carry zero refspecs, and the first draft's
+    "no refspec means the current branch" fallback blocked BOTH. `--all` really
+    does publish every local branch including the run's `main` (so it blocks,
+    and it blocks whatever branch the caller happens to be standing on);
+    `--tags` publishes refs/tags and NO branch at all, so it has no evidence to
+    be missing and is allowed. Both directions are pinned as cases.
+
+    Fails OPEN on every uncertainty — see `swarm_ledger_dirty`."""
+    # `--dry-run`/`-n` publishes nothing, so there is no evidence to be missing.
+    if long_opt_abbrev(rest, "--dry-run") or short_flag_has(rest, "n", "o"):
+        return None
+    dirty = swarm_ledger_dirty()
+    if dirty is None:
+        return None
+    tree, status = dirty
+    run_main = _current_branch(tree)
+    if not run_main:
+        return None            # detached HEAD, or git declined to say -> allow
+    here = _current_branch(_CWD)
+    refs = push_local_refs(rest)
+    if refs is None:
+        if long_opt_abbrev(rest, "--all", "--branches"):
+            refs = [run_main]      # every local branch, so the run's `main` too
+        elif long_opt_abbrev(rest, "--tags"):
+            refs = []              # refs/tags only — no branch is published
+        else:
+            refs = [here] if here else []
+    names = set()
+    for r in refs:
+        r = (r or "").strip()
+        if r in ("HEAD", "@"):
+            r = here or ""
+        if r.startswith("refs/heads/"):
+            r = r[len("refs/heads/"):]
+        if r:
+            names.add(r)
+    if run_main not in names:
+        return None
+    return ("`git push` of `" + run_main + "` while this run's ledger is DIRTY — "
+            "uncommitted under `" + os.path.join(tree, SWARM_DIR) + "`:\n"
+            + status + "\n"
+            "That is Phase 7's last push condition, and it is not a style rule: "
+            "`history.csv`, `state.json` and `analysis/` are what `resume` reads, "
+            "and this push is the run's only offsite copy of them. Pushing now "
+            "ships a `" + run_main + "` carrying none of this epoch's evidence.\n"
+            "FIX — commit the ledger first (Phase 8's epoch-boundary commit), "
+            "then push:\n"
+            "  git -C " + tree + " add " + SWARM_DIR + "\n"
+            "  git -C " + tree + " commit -m 'chore(swarm-loop): epoch evidence'\n"
+            "  <re-run your push>")
 
 
 def check_branch(rest: list[str]) -> str | None:
@@ -1671,6 +1800,70 @@ def swarm_dirs(ap: str | None) -> list[str]:
             seen.add(sd)
             out.append(sd)
     return out
+
+
+def _current_branch(d: str | None) -> str | None:
+    """The branch checked out in `d`, or None on a detached HEAD / no answer.
+
+    `symbolic-ref` rather than `rev-parse --abbrev-ref`, because the latter
+    prints the literal string `HEAD` on a detached head and exits 0 — a
+    non-answer wearing an answer's clothes, and this rule compares the result to
+    a branch name."""
+    p = _git_at(d, ["symbolic-ref", "--quiet", "--short", "HEAD"])
+    if p is None or p.returncode != 0:
+        return None
+    return p.stdout.strip() or None
+
+
+MAX_LEDGER_STATUS_LINES = 10
+
+
+def swarm_ledger_dirty() -> tuple:
+    """(tree, indented `git status --porcelain` lines) for a tree of THIS RUN
+    whose `.swarm-loop` holds uncommitted changes — otherwise None.
+
+    Asked of the SESSION FAMILY (the tree the command runs in, plus every
+    worktree of it), not of an operand: a push names no path, and the run's
+    `.swarm-loop` lives in the PRIMARY tree, which from inside a worker's
+    worktree only ever appears in the worktree list.
+
+    None means every outcome that is not "definitely dirty", and they are
+    deliberately indistinguishable to the caller: clean, no `.swarm-loop`
+    anywhere in the family, not a repository, git missing, `status` erroring or
+    timing out past the retry. This rule FAILS OPEN like every rule in this file
+    but one — the fail-CLOSED exception is and stays the recursive `rm` whose
+    target could not be classified. A push blocked because the guard could not
+    answer wedges the unattended run it exists to protect.
+
+    Untracked content counts as dirty, and that is the point rather than an
+    accident: `analyze` writes `.swarm-loop/analysis/cycle-N.json` into a
+    directory that does not exist yet, so the epoch's analysis shows up as
+    `?? .swarm-loop/analysis/` and nothing else. A rule that only noticed
+    MODIFIED tracked files would miss it."""
+    try:
+        fam = sorted(_session_family())
+    except Exception:
+        return None
+    for t in fam:
+        try:
+            if not os.path.isdir(os.path.join(t, SWARM_DIR)):
+                continue
+        except Exception:
+            continue
+        # Scoped to the one pathspec so this stays cheap on a big working tree;
+        # an unanswerable `status` is skipped, never guessed at.
+        p = _git_at(t, ["status", "--porcelain", "--", SWARM_DIR])
+        if p is None or p.returncode != 0:
+            continue
+        lines = [ln.rstrip() for ln in p.stdout.splitlines() if ln.strip()]
+        if lines:
+            shown = lines[:MAX_LEDGER_STATUS_LINES]
+            more = len(lines) - len(shown)
+            body = "\n".join("  " + ln for ln in shown)
+            if more > 0:
+                body += "\n  ... and %d more" % more
+            return t, body
+    return None
 
 
 def in_swarm_tree(op: str) -> bool:
