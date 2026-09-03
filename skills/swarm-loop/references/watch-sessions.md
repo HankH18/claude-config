@@ -6,8 +6,10 @@ open more, each in its own detached tmux session, each with a permission profile
 
     claude-build <dir> watch        build + watchdog
     claude-build <dir> watch-fix    build + watchdog + fixer
+    claude-build <dir> all          watch-fix, with the WATCHER also wearing
+                                    the CTO hat  (REFUSES today)
     claude-build <dir> full-auto    watch-fix + a CTO authorization gate
-                                    (REFUSES today — the gate does not exist)
+                                    (REFUSES today, and see below)
 
 Both spellings are accepted (`watch` and `--watch`). The bare word costs you one
 thing: a project directory literally named `watch` must be written `./watch`.
@@ -94,6 +96,7 @@ so the launcher mints unique names itself, timestamped per run.
       *-settings.json       their permission profiles
       *-launch.sh           the scripts tmux actually runs for them
       runinfo.py + peers.sh, wait-build.sh, wait-harness.sh
+      authority/approvals.log  append-only, `all` only; see below
       teardown.sh           kills the watchers, then reads the registry back
       skill/ skill-baseline/   the fixer's copy and its pristine twin
 
@@ -293,20 +296,72 @@ Attacked directly, with the shipped fixer profile:
 
 ---
 
-## The seam for `full-auto`
+## `all`, and the seam for the authorization gate
 
-`full-auto` parses and validates like the others and then **exits 3** with a
-message naming what is missing. It does not start a CTO session, because a
-`full-auto` that started one without a working gate would be a review step the
-operator believes is happening and which is not — strictly worse than the
-feature not existing.
+`all` is `watch-fix`'s three sessions with the **watcher also holding the CTO
+role**. There is no fourth session: the requester is the build and the grantor
+is the watcher, so the separation that matters — nothing approves its own
+request — survives without another agent.
+
+Both `all` and `full-auto` parse and validate like the others and then
+**refuse**, because both contain an authorization gate that does not exist yet
+and a watcher holding an authority it does not have is a review step the
+operator believes is happening. Two distinct refusals, both red paths:
+
+* **gate absent** (today, for both): exit 3, naming the sentinel, the file, and
+  what a CTO will and will not be able to do once it lands.
+* **gate present, `full-auto`**: still refuses. `all` is the only topology that
+  NAMES who holds the authority; `full-auto`'s CTO is a session claude-build
+  does not know how to start, so arming `AUTHORITY` for it would put an
+  authority in nobody's hands. The message points at `all`.
+* **gate present, `all`**: launches, with the CTO role on the watchdog and an
+  approvals store created.
+
+### The approvals store, and the shape that makes it work
+
+    ~/claude-build/runs/<run-id>/authority/approvals.log
+
+It sits **outside every directory the build session was granted**. That is the
+whole isolation property: a path outside the granted working directories is
+unreachable to the builder for read, write, and even `ls`, so the build can
+*ask* but can never grant and never forge a grant. It is also what makes
+"read-only watcher" and "can issue approvals" compatible rather than
+contradictory — the watcher's writes land in its own store, never in the
+apparatus or the specimen.
+
+It is **append-only**, one record per line, each carrying the requesting
+session, the exact operation, the CTO's stated reason, and a timestamp.
+
+### The risk `all` creates that the other three do not
+
+Merging observer and authorizer into one agent leaves the requester/grantor
+split intact but opens a loop:
+
+> the watcher tells the build "you should do X" → the build asks the CTO to
+> authorize X → the CTO, being the same agent, approves its own suggestion.
+
+That is the observer acting through the builder to launder its own read-only
+status. Two mitigations, both required, because neither alone is enough:
+
+* **Mechanical** — the append-only log above. Cheap, cannot be forgotten, and
+  it is what makes the loop findable after the fact.
+* **Stated** — the CTO's prompt names this as the one case it must ESCALATE to
+  the human rather than grant: an operation that traces back to its own earlier
+  suggestion. It cannot be fully mechanised, because an agent cannot reliably
+  introspect its own influence. So it is a rule plus a record: the rule catches
+  what the agent notices, the record catches the rest.
+
+The store's shape is a property of `claude-build`, not of the hook, which is
+why it is built now even though the gate is not.
 
 **Seam 1 — the flip is one grep.** `claude-build` looks for the literal
 `CLAUDE_BUILD_AUTHORIZATION_GATE` in `hooks/git-guard.py`. When the guard
-declares it, the refusal becomes a launch: the topology becomes `watch-fix` with
-`AUTHORITY=1`, and the run reports the gate as armed. Both directions are pinned
-in `tests/test_harness.sh` — sentinel absent → exit 3, sentinel present → exit 0
-and the fixer is planned — so the transition is recorded rather than discovered.
+declares it, `all`'s refusal becomes a launch: the topology stays `watch-fix`
+underneath, `AUTHORITY=1`, `CTO_ROLE=watchdog`, and the approvals store is
+created. All three outcomes are pinned in `tests/test_harness.sh` — sentinel
+absent → exit 3 for both modifiers; sentinel present → `all` exits 0 naming the
+CTO holder and the log, `full-auto` still refuses — so the transition is
+recorded rather than discovered.
 
 **Seam 2 — how the guard finds the CTO.** When a modifier is active,
 `claude-build` exports `CLAUDE_BUILD_STATE_DIR` before the build's `exec`. A
@@ -317,7 +372,9 @@ carries every identity in the topology:
      "build_session_name":…, "build_session_id":…, "build_pid":…,
      "watch_session_name":…, "watch_session_id":…,
      "fix_session_name":…,   "fix_session_id":…,
-     "harness_doc":…, "build_doc":…, "state_dir":…}
+     "harness_doc":…, "build_doc":…, "state_dir":…,
+     "build_launched":"yes"|"no",
+     "cto_role":"watchdog"|"", "cto_dir":…, "cto_log":…}
 
 So the guard never has to discover anyone. `--no-launch` prints the env var in
 the command it hands back, so a hand-started build is wired identically.

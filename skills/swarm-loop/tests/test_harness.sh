@@ -2726,6 +2726,16 @@ done
 cb "$CBP" watch --dry-run
 ck_hasnt "the watch topology does NOT plan a fixer" "would copy"
 
+# `all` parses in both spellings. With no gate it refuses (pinned below), so
+# what is asserted here is that it PARSED rather than being eaten as a
+# directory or rejected as an unknown option.
+for m in all --all; do
+  cb "$CBP" "$m" --dry-run
+  ck_exit "'$m' parses (and then refuses, having no gate)" 3 "$RC"
+  ck_has  "'$m' is recognised as the all topology" "all is not available"
+  ck_hasnt "'$m' is not taken as a directory" "would create directory"
+done
+
 # A typo must still land on the unknown-option error rather than being taken as
 # a directory name — which is why both spellings are accepted.
 cb "$CBP" --wtch
@@ -2735,6 +2745,11 @@ ck_has  "...and says so" "unknown option: --wtch"
 cb "$CBP" watch watch-fix
 ck_exit "two different modifiers are refused" 1 "$RC"
 ck_has  "...naming both" "two topology modifiers given: watch and watch-fix"
+cb "$CBP" all watch
+ck_exit "all with watch is a contradiction and is refused" 1 "$RC"
+ck_has  "...naming both" "two topology modifiers given: all and watch"
+cb "$CBP" all full-auto
+ck_exit "all with full-auto is refused too" 1 "$RC"
 cb "$CBP" watch watch --dry-run
 ck_exit "the same modifier twice is harmless" 0 "$RC"
 
@@ -2743,7 +2758,7 @@ section "claude-build: a modifier outside install mode  [fake skill tree]"
 
 # MODE is install|uninstall|uninstall-self and a modifier is orthogonal to it,
 # so it gets its own cross-flag check — the same shape as the --purge one.
-for m in watch watch-fix full-auto; do
+for m in watch watch-fix full-auto all; do
   cb "$CBP" --uninstall "$m"
   ck_exit "$m with --uninstall is refused" 1 "$RC"
   ck_has  "...naming the flag and the mode ($m)" "$m only means anything on a build run (you asked for: uninstall)"
@@ -2774,14 +2789,32 @@ ck_hasnt "...and it starts NOTHING" "6. Watchers"
 # When the guard declares the sentinel, the refusal becomes a launch. That is
 # the whole seam: one grep.
 printf '# stub guard\n# CLAUDE_BUILD_AUTHORIZATION_GATE\n' > "$CBS/hooks/git-guard.py"
-cb "$CBP" full-auto --dry-run
-ck_exit "full-auto proceeds once the guard declares the sentinel" 0 "$RC"
-ck_has  "...as the watch-fix topology plus authority" "6. Watchers (full-auto)"
+
+# `all` is the topology that NAMES who holds the authority, so it is the one
+# that launches. full-auto's CTO is a session claude-build does not know how to
+# start, so with the gate present it STILL refuses rather than arming an
+# authority nobody wears — the same defect the missing-gate refusal prevents.
+cb "$CBP" all --dry-run
+ck_exit "all proceeds once the guard declares the sentinel" 0 "$RC"
+ck_has  "...as its own topology label" "6. Watchers (all)"
 ck_has  "...announcing the gate is armed" "the CTO authorization gate"
+ck_has  "...naming who wears the CTO hat" "would give     the CTO role to the watchdog"
+ck_has  "...and where approvals are recorded" "authority/approvals.log"
 ck_has  "...and it does plan the fixer" "would copy"
+
+cb "$CBP" full-auto --dry-run
+ck_exit "full-auto still refuses even WITH the gate: nobody would hold it" 1 "$RC"
+ck_has  "...saying exactly that" "nobody would hold the authority it arms"
+ck_has  "...and pointing at the topology that does name a holder" "all  instead"
+ck_hasnt "...and starting nothing" "6. Watchers"
+
 printf '# stub guard\n' > "$CBS/hooks/git-guard.py"
 cb "$CBP" full-auto --dry-run
-ck_exit "removing the sentinel restores the refusal" 3 "$RC"
+ck_exit "removing the sentinel restores the missing-gate refusal" 3 "$RC"
+cb "$CBP" all --dry-run
+ck_exit "...for all as well" 3 "$RC"
+ck_has  "...naming the modifier that was asked for" "all is not available"
+ck_has  "...and saying both contain the gate" "Both full-auto and all"
 
 # ===========================================================================
 section "claude-build: --dry-run writes nothing and starts nothing"
@@ -2914,6 +2947,24 @@ ck "NEITHER observer may edit the live skill" "True" \
    "$(python3 -c "
 import json,sys
 print(all('Edit(//p/skill/**)' in json.load(open(p))['permissions']['deny'] for p in sys.argv[1:]))" "$CBGEN/watchdog.json" "$CBGEN/fixer.json")"
+# W09030034-05, found by the watchdog reading its own profile on the first live
+# watch-fix run: its notebook grant on the run directory also covered the
+# fixer's working copy AND the pristine baseline the fixer's deliverable is
+# diffed against, so it could have changed what a human reviews with nothing
+# able to see it. Both sides of that diff, pinned from both directions.
+ck "the watchdog is DENIED the fixer's working copy" "True" \
+   "$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print('Edit(//p/runs/r1/skill/**)' in d['permissions']['deny'])" "$CBGEN/watchdog.json")"
+ck "...and the pristine baseline it is diffed against" "True" \
+   "$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print('Edit(//p/runs/r1/skill-baseline/**)' in d['permissions']['deny'])" "$CBGEN/watchdog.json")"
+ck "...while the FIXER keeps write access to that same copy" "True" \
+   "$(python3 -c "
+import json,sys
+d=json.load(open(sys.argv[1]))
+print('Edit(//p/runs/r1/skill/**)' in d['permissions']['allow']
+      and 'Edit(//p/runs/r1/skill/**)' not in d['permissions']['deny'])" "$CBGEN/fixer.json")"
+ck "...and the watchdog keeps its notebook" "True" \
+   "$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print('Edit(//p/runs/r1/**)' in d['permissions']['allow'])" "$CBGEN/watchdog.json")"
+
 ck "the provisioned hook points at the launcher's OWN guard" "True" \
    "$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d['hooks']['PreToolUse'][0]['hooks'][0]['command'].endswith('/p/skill/hooks/git-guard.py\"'))" "$CBGEN/watchdog.json")"
 
@@ -2944,7 +2995,7 @@ ck "the build's exec is the LAST line of the script" "1" \
    "$(tail -1 "$CB_SRC" | grep -c '^exec claude "\${LAUNCH_ARGS\[@\]}" "\$PROMPT"$')"
 ck "every watcher is started before it" "0" \
    "$(awk '/^exec claude "\$\{LAUNCH_ARGS/{f=1} f && /tmux new-session/{n++} END{print n+0}' "$CB_SRC")"
-ck "...and the printed instructions are built from the same array" "1" \
+ck "...and BOTH written forms are built from the same array" "2" \
    "$(grep -c 'for a in "\${LAUNCH_ARGS\[@\]}"' "$CB_SRC")"
 ck "no second hand-written 'claude --add-dir' launch literal survives" "0" \
    "$(grep -c 'claude --add-dir "\$WT"' "$CB_SRC")"
@@ -2954,6 +3005,65 @@ ck "no second hand-written 'claude --add-dir' launch literal survives" "0" \
 # settings files, so every occurrence must carry the same string.
 ck "every matcher literal in the launcher is the frozen one" "0" \
    "$(grep -o '"matcher": "[^"]*"' "$CB_SRC" | grep -vc '"matcher": "Bash|Edit|Write|NotebookEdit|MultiEdit"')"
+
+# ===========================================================================
+section "claude-build: the run ledger says whether the build was started"
+
+# W09030034-01, found by the live watchdog on the first watch-fix run. Under
+# --no-launch the ledger's build_pid and build_transcript are a PREDICTION about
+# a session a human has yet to start, and nothing said so — so the watchdog
+# filed a CRITICAL "the build never existed" against a run where not starting
+# the build was the entire point. It reasoned correctly from what it was given.
+CBLED="$TMP/cbledger"; mkdir -p "$CBLED"
+python3 - "$CB_SRC" "$CBLED" <<'PYLED' > /dev/null
+import os, subprocess, sys
+src, out = sys.argv[1], sys.argv[2]
+body, grab = [], False
+for line in open(src):
+    if line.startswith("read -r -d '' PY_RUNJSON "):
+        grab = True; continue
+    if grab and line.startswith("PY_RUNJSON_EOF"):
+        break
+    if grab:
+        body.append(line)
+open(os.path.join(out, "ledger.py"), "w").write("".join(body))
+env = dict(os.environ, OUT_PATH=os.path.join(out, "run.json"),
+           R_RUN_ID="r1", R_BUILD_LAUNCHED="no", R_BUILD_PID="4242")
+subprocess.run([sys.executable, os.path.join(out, "ledger.py")], env=env, check=True)
+PYLED
+ck "the ledger generator writes run.json" "True" \
+   "$([ -f "$CBLED/run.json" ] && echo True || echo False)"
+ck "...and it carries build_launched" "no" \
+   "$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['build_launched'])" "$CBLED/run.json")"
+ck "...alongside the identities that are only a prediction without it" "r1|4242" \
+   "$(python3 -c "
+import json,sys
+d=json.load(open(sys.argv[1]))
+print(d['run_id'] + '|' + d['build_pid'])" "$CBLED/run.json")"
+ck "an unset ledger key is an empty string, never a KeyError" "" \
+   "$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['build_transcript'])" "$CBLED/run.json")"
+
+# And the watchdog is told the same thing in words, because it reads a prompt,
+# not run.json.
+ck "the launcher has a --no-launch branch for the build's status" "1" \
+   "$(grep -c 'BUILD_LAUNCHED=no' "$CB_SRC")"
+ck "...which says the absence is expected rather than a finding" "1" \
+   "$(grep -c 'That absence is EXPECTED and is not a finding' "$CB_SRC")"
+ck "...and a launched branch too" "1" \
+   "$(grep -c 'BUILD_LAUNCHED=yes' "$CB_SRC")"
+ck "the watchdog prompt actually carries it" "1" \
+   "$(grep -c '@@BUILD_STATUS@@' "$SCRIPT_DIR/../templates/watchdog-prompt.md")"
+
+# W09030034-02: the build role left no record of what was executed, so a build
+# that died at startup could not be told apart from one never started.
+ck "the build's command is recorded before the exec" "1" \
+   "$(grep -c 'build command recorded' "$CB_SRC")"
+ck "...from the SAME array the exec uses, so it cannot drift" "2" \
+   "$(grep -c 'for a in "\${LAUNCH_ARGS\[@\]}"' "$CB_SRC")"
+ck "...and never under --dry-run" "1" \
+   "$(grep -B1 -- '> "\$STATE_DIR/build-prompt.txt"' "$CB_SRC" | grep -c '\[ "\$DRY" != 1 \]')"
+ck "...and it says it is a record, not the launch path" "1" \
+   "$(grep -c 'claude-build does NOT run this file' "$CB_SRC")"
 
 # ===========================================================================
 section "claude-build: the prompt templates render or fail loudly"

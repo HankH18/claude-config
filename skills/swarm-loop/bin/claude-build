@@ -40,7 +40,7 @@ LAUNCH=1 ; IN_TREE=0 ; DRY=0 ; QUIET=0 ; MODE=install ; PURGE=0
 # Session topology. MODE says what claude-build DOES to a project (install /
 # uninstall); WATCH says how many SESSIONS the run gets. They are orthogonal,
 # so they get separate variables — "" | watch | watch-fix | full-auto.
-WATCH="" ; AUTHORITY=0
+WATCH="" ; AUTHORITY=0 ; CTO_ROLE=""
 
 # The one-line sentinel that says hooks/git-guard.py has grown the authorization
 # gate full-auto is built on. Until that string appears in the guard, full-auto
@@ -401,6 +401,33 @@ allow += ["Edit(" + g(obs) + ")", "Edit(" + g(state) + ")"]
 if role == "fixer":
     allow += ["Edit(" + g(work) + ")", "Read(" + g(work) + ")"]
 
+cto = os.environ.get("CTO_DIR", "")
+if role == "watchdog" and os.environ.get("CTO_ROLE") == "watchdog":
+    # The CTO hat, under `all`. The store sits outside every directory the
+    # BUILD session was granted, so the requester can ask but never grant and
+    # never forge a grant. It is inside the watchdog's own state dir, so the
+    # notebook grant already covers it; this is here to say so out loud.
+    allow += ["Edit(" + g(cto) + ")"]
+elif cto:
+    # Nobody else writes approvals, including the fixer.
+    deny += ["Edit(" + g(cto) + ")"]
+
+if role == "watchdog":
+    # Carve the fixer's two directories back out of the notebook grant above.
+    # The watchdog's notebook IS the run directory, so it must be able to write
+    # there — but the run directory also holds the fixer's working copy and the
+    # pristine baseline it is diffed against, and the fixer's whole deliverable
+    # is `diff -ruN skill-baseline skill`. An observer that can edit either side
+    # of that diff can silently change what a human reviews, and the fixer has
+    # no way to see it happen. Deny beats allow, so this narrows the grant
+    # rather than revoking it. Derived from `state` and not WORK_DIR, because
+    # the watchdog is generated with WORK_DIR="" — under plain `watch` neither
+    # path exists and the denies are inert.
+    #
+    # Found by the watchdog, reading its own profile, on the first live
+    # watch-fix run. Filed as W09030034-05.
+    deny += ["Edit(" + g(state + "/" + d) + ")" for d in ("skill", "skill-baseline")]
+
 data = {
     "disableAllHooks": False,
     "hooks": {"PreToolUse": [
@@ -427,7 +454,8 @@ import json, os
 
 KEYS = ["run_id", "run_tag", "topology", "authority", "shift", "project",
         "dir", "worktree_root", "skill", "state_dir", "obs_dir",
-        "harness_doc", "build_doc",
+        "harness_doc", "build_doc", "build_launched",
+        "cto_role", "cto_dir", "cto_log",
         "build_session_name", "build_session_id", "build_pid", "build_transcript",
         "watch_session_name", "watch_session_id",
         "fix_session_name", "fix_session_id", "work_dir", "created_at"]
@@ -584,7 +612,7 @@ claude-build — open a Claude Code session preconfigured for a swarm-loop run.
 
 USAGE
   claude-build [DIR] [options]
-  claude-build [DIR] watch|watch-fix|full-auto [options]
+  claude-build [DIR] watch|watch-fix|full-auto|all [options]
   claude-build [DIR] --uninstall
   claude-build --uninstall-self
 
@@ -596,20 +624,30 @@ SESSION TOPOLOGY (modifiers — bare word or --flag, both accepted)
   watch                Also start a WATCHDOG in a second terminal session. It
                        watches the build and the harness and writes what it
                        finds to two global observation documents under
-                       ~/.claude/observations/ — one for the harness, one for
-                       the build. It is read-only with respect to the build repo
+                       ~/claude-build/observations/ — one for the harness, one
+                       for the build. It is read-only with respect to the build repo
                        and the skill, enforced by its permission profile, and
                        can message the other sessions.
   watch-fix            Everything `watch` does, plus a third session: a FIXER
                        that watches the harness document and fixes what is
                        obviously fixable — in a COPY of the skill, never in the
                        live one, and never as a commit.
-  full-auto            watch-fix plus a CTO authorization gate. NOT AVAILABLE
-                       YET: it refuses until hooks/git-guard.py grows the gate.
+  full-auto            watch-fix plus a CTO authorization gate.
+  all                  watch-fix's three sessions, with the WATCHER also
+                       wearing the CTO hat. The build still asks and someone
+                       else still grants, so the requester cannot approve
+                       itself; every approval is appended to a log outside
+                       every directory the build can reach.
+
+                       full-auto and all BOTH REFUSE TO LAUNCH TODAY. The
+                       gate they contain lives in hooks/git-guard.py and does
+                       not exist yet, and a watcher holding an authority it
+                       does not have is a review step you would believe was
+                       happening. They exit 3 naming what is missing.
                        See references/watch-sessions.md.
 
   NOTE  A modifier is a bare word, so a project directory literally named
-        `watch`, `watch-fix` or `full-auto` must be written `./watch`.
+        `watch`, `watch-fix`, `full-auto` or `all` must be written `./watch`.
 
   NOTE  `watch-fix` and `--audit-loops N` are different mechanisms that happen
         to share a word. `--audit-loops` is the skill's ACT TWO: whole-codebase
@@ -663,7 +701,12 @@ WATCHERS
   Each watcher runs in its own detached tmux session; `tmux attach -t <name>`
   drops you into it and `tmux kill-session -t <name>` ends it. Both names, and
   a teardown script, are printed at launch and written to the run's state
-  directory under ~/.claude/observations/.claude-build/.
+  directory under ~/claude-build/runs/<run-id>/. Nothing a watcher writes ever
+  lands inside the project repository.
+
+  A watcher is read-only with respect to the build repo, its worktrees, the
+  transcript directory and the live skill — enforced by its permission profile,
+  measured by attacking it. See references/watch-sessions.md.
 HELP_TEXT
   exit 0
 }
@@ -698,6 +741,9 @@ while [ $# -gt 0 ]; do
     full-auto|--full-auto)  [ -n "$WATCH" ] && [ "$WATCH" != full-auto ] \
                               && die "two topology modifiers given: $WATCH and $1"
                             WATCH=full-auto; shift ;;
+    all|--all)              [ -n "$WATCH" ] && [ "$WATCH" != all ] \
+                              && die "two topology modifiers given: $WATCH and $1"
+                            WATCH=all; shift ;;
     -*)               die "unknown option: $1  (claude-build --help)" ;;
     *)                [ -n "$DIR" ] && die "more than one directory given: $DIR and $1"
                       DIR="$1"; shift ;;
@@ -724,20 +770,35 @@ fi
 #
 # The seam is one grep. When the guard grows the gate it declares the sentinel
 # below, and this refusal becomes a launch. See references/watch-sessions.md.
-if [ "$WATCH" = full-auto ]; then
+if [ "$WATCH" = full-auto ] || [ "$WATCH" = all ]; then
   if grep -q "$GATE_SENTINEL" "$GUARD" 2>/dev/null; then
     AUTHORITY=1
-    WATCH=watch-fix          # the topology is watch-fix; the gate adds authority
+    # `all` puts the CTO hat on the WATCHER rather than adding a fourth session:
+    # the requester is still the build and the grantor is still someone else, so
+    # the separation that matters survives. Both spellings are watch-fix
+    # underneath; AUTHORITY is what differs, and CTO_ROLE says who wears it.
+    [ "$WATCH" = all ] && CTO_ROLE=watchdog
+    if [ -z "$CTO_ROLE" ]; then
+      # The gate exists, but full-auto's CTO is a session claude-build does not
+      # know how to start: `all` is the only topology that names who holds the
+      # authority. Arming AUTHORITY with nobody wearing the hat would be the
+      # same defect the refusal above exists to prevent — an operator believing
+      # a review step is happening — so this is a red path, not a downgrade.
+      die "$WATCH: the authorization gate is installed, but claude-build has no CTO session for full-auto — nobody would hold the authority it arms. Use  claude-build ${DIR:-.} all  instead: same three sessions, with the watcher wearing the CTO hat and every approval appended to a log the build cannot reach."
+    fi
+    WATCH=watch-fix
   else
-    printf '\033[31merror:\033[0m full-auto is not available — its authorization gate is not installed.\n' >&2
+    printf '\033[31merror:\033[0m %s is not available — its authorization gate is not installed.\n' "$WATCH" >&2
     cat >&2 <<GATE_EOF
 
   What is missing
     $GUARD does not declare $GATE_SENTINEL.
-    Without it no session can grant anything, so a CTO session would be a
-    review step you believe is happening and which is not.
+    Without it no session can grant anything, so a CTO would be a review
+    step you believe is happening and which is not. Both full-auto and all
+    contain that gate, so both refuse until it exists — rather than
+    starting the watchers and quietly skipping the half you asked for.
 
-  What full-auto will and will not be able to do, once the gate lands
+  What a CTO will and will not be able to do, once the gate lands
     MAY authorize   a NON-DESTRUCTIVE operation the guard blocked pending
                     review — creating a new remote directory, say. Bounded by
                     reversibility, not by how good the reasoning is.
@@ -748,8 +809,9 @@ if [ "$WATCH" = full-auto ]; then
 
   What to do now
     Use  claude-build ${DIR:-.} watch-fix  for the watchdog + fixer topology
-    without the authorization gate, and rerun with full-auto once the guard
-    declares the sentinel.
+    without the authorization gate, and rerun with $WATCH once the guard
+    declares the sentinel. The sessions are the same three either way; what
+    is missing is only the authority.
 
 GATE_EOF
     exit 3
@@ -984,7 +1046,9 @@ fi
 # All of this happens BEFORE the exec on the last line, because `exec` replaces
 # this process and nothing after it ever runs. It is also what was asked for:
 # the build keeps the terminal you are standing in, the observers get their own.
-TOPOLOGY="$WATCH" ; [ "$AUTHORITY" = 1 ] && TOPOLOGY=full-auto
+TOPOLOGY="$WATCH"
+[ "$AUTHORITY" = 1 ] && TOPOLOGY=full-auto
+[ "$AUTHORITY" = 1 ] && [ "$CTO_ROLE" = watchdog ] && TOPOLOGY=all
 # NOT under ~/.claude. Two independent reasons, and the first is a hard block:
 #  1. Claude Code classifies everything under ~/.claude as a SENSITIVE path and
 #     refuses a --restricted session's write there — measured, with an explicit
@@ -1065,8 +1129,33 @@ if [ -n "$WATCH" ]; then
   BUILD_DOC="$OBS/swarm-loop-BUILD-$SLUG-OPEN.md"
   WORK_DIR=""
   [ "$WATCH" = watch-fix ] && WORK_DIR="$STATE_DIR/skill"
+  # The approvals store. It must sit OUTSIDE every directory the build session
+  # is granted — that is what makes "read-only watcher" and "can issue
+  # approvals" compatible instead of contradictory: the builder cannot read,
+  # write or even list a path outside its working directories, so it can ask
+  # but never grant, and never forge a grant. approvals.log is append-only and
+  # is the record that makes the observer-authorizing-its-own-suggestion loop
+  # auditable after the fact, since no agent can reliably introspect its own
+  # influence. See references/watch-sessions.md.
+  CTO_DIR="$STATE_DIR/authority"
+  CTO_LOG="$CTO_DIR/approvals.log"
   FIX_LABEL="(none — watch topology)"
   [ "$WATCH" = watch-fix ] && FIX_LABEL="$FIX_SESSION_NAME"
+  CTO_LABEL="(none — no authorization gate in this topology)"
+  [ "$CTO_ROLE" = watchdog ] && CTO_LABEL="you, in addition to watching"
+  # Whether claude-build itself starts the build. Under --no-launch it does not,
+  # and BUILD_PID/BUILD_TRANSCRIPT in the ledger are then a PREDICTION about a
+  # session a human has yet to start. Without this the watchdog cannot tell
+  # "not started yet" from "started and died" — and on the first live run one
+  # filed exactly that CRITICAL against a --no-launch run, reasoning correctly
+  # from what it had been given. (W09030034-01.)
+  if [ "$LAUNCH" = 1 ]; then
+    BUILD_LAUNCHED=yes
+    BUILD_STATUS="claude-build starts the build itself, immediately after this. Expect its registry entry within about 5-8 seconds."
+  else
+    BUILD_LAUNCHED=no
+    BUILD_STATUS="claude-build was run with --no-launch and did NOT start the build. A human must run the printed command. Until they do, the build is absent from the registry, its transcript does not exist, and the pid above is a PREDICTION, not an observation. That absence is EXPECTED and is not a finding — wait for it rather than reporting it."
+  fi
 
   if [ "$DRY" = 1 ]; then
     echo "  would create   $STATE_DIR"
@@ -1077,9 +1166,15 @@ if [ -n "$WATCH" ]; then
     [ "$WATCH" = watch-fix ] && echo "  would start    tmux session $FIX_SESSION_NAME  (fixer, writes only its copy)"
     echo "  would bind     the build session to -n $BUILD_SESSION_NAME"
     [ "$AUTHORITY" = 1 ] && echo "  would arm      the CTO authorization gate ($GATE_SENTINEL is declared in the guard)"
+    [ "$CTO_ROLE" = watchdog ] && echo "  would give     the CTO role to the watchdog, with an append-only approvals log at $CTO_LOG"
     echo "  nothing was written and no session was started (--dry-run)"
   else
     mkdir -p "$STATE_DIR" "$OBS" "$RUNS" "$PROJ_ROOT"
+    if [ -n "$CTO_ROLE" ]; then
+      mkdir -p "$CTO_DIR"
+      [ -f "$CTO_LOG" ] || printf '# claude-build approvals — append only, one record per line.\n# Each record carries the REQUESTING session, the exact operation, the\n# CTO reason, and a timestamp. It exists so an approval that traces back\n# to the CTO own earlier suggestion can be found after the fact.\n' > "$CTO_LOG"
+      ok "approvals store: $CTO_LOG (outside every directory the build can reach)"
+    fi
 
     export T_RUN_ID="$RUN_ID"          T_RUN_TAG="$RUN_TAG"
     export T_MODE="$TOPOLOGY"          T_PROJECT="$NAME"
@@ -1091,7 +1186,8 @@ if [ -n "$WATCH" ]; then
     export T_WATCH_NAME="$WATCH_SESSION_NAME"   T_WATCH_SID="$WATCH_SID"
     export T_FIX_NAME="$FIX_LABEL"     T_FIX_SID="$FIX_SID"
     export T_HARNESS_DOC="$HARNESS_DOC" T_BUILD_DOC="$BUILD_DOC"
-    export T_WORK_DIR="$WORK_DIR"
+    export T_WORK_DIR="$WORK_DIR"  T_BUILD_STATUS="$BUILD_STATUS"
+    export T_CTO_ROLE="$CTO_LABEL" T_CTO_DIR="$CTO_DIR" T_CTO_LOG="$CTO_LOG"
 
     # Seed each document only if it is not already there. The harness doc is
     # machine-global and long-lived; the build doc is per project. Neither lives
@@ -1110,7 +1206,9 @@ if [ -n "$WATCH" ]; then
           R_BUILD_PID="$BUILD_PID" R_BUILD_TRANSCRIPT="$BUILD_TRANSCRIPT" \
           R_WATCH_SESSION_NAME="$WATCH_SESSION_NAME" R_WATCH_SESSION_ID="$WATCH_SID" \
           R_FIX_SESSION_NAME="$FIX_LABEL" R_FIX_SESSION_ID="$FIX_SID" \
-          R_WORK_DIR="$WORK_DIR" R_CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          R_WORK_DIR="$WORK_DIR" R_BUILD_LAUNCHED="$BUILD_LAUNCHED" \
+          R_CTO_ROLE="$CTO_ROLE" R_CTO_DIR="$CTO_DIR" R_CTO_LOG="$CTO_LOG" \
+          R_CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
           python3 -c "$PY_RUNJSON")" || true
     case "$RJ" in OK:*) ok "ledger $STATE_DIR/run.json" ;; *) die "could not write the run ledger: ${RJ:-no output}" ;; esac
 
@@ -1128,6 +1226,7 @@ if [ -n "$WATCH" ]; then
     SET_OUT="$(ROLE=watchdog OUT_PATH="$STATE_DIR/watchdog-settings.json" \
                DIR="$DIR" WT="$WT" OBS="$OBS" STATE_DIR="$STATE_DIR" \
                PROJECTS_DIR="$PROJ_ROOT" SKILL="$SKILL" GUARD="$GUARD" WORK_DIR="" \
+               CTO_ROLE="$CTO_ROLE" CTO_DIR="$CTO_DIR" \
                python3 -c "$PY_WATCH_SETTINGS")" || true
     case "$SET_OUT" in OK:*) ok "watchdog profile — ${SET_OUT#OK:}" ;; *) die "watchdog profile failed: ${SET_OUT:-no output}" ;; esac
 
@@ -1191,6 +1290,7 @@ LAUNCH_EOF
       SET_OUT="$(ROLE=fixer OUT_PATH="$STATE_DIR/fixer-settings.json" \
                  DIR="$DIR" WT="$WT" OBS="$OBS" STATE_DIR="$STATE_DIR" \
                  PROJECTS_DIR="$PROJ_ROOT" SKILL="$SKILL" GUARD="$GUARD" WORK_DIR="$WORK_DIR" \
+                 CTO_ROLE="$CTO_ROLE" CTO_DIR="$CTO_DIR" \
                  python3 -c "$PY_WATCH_SETTINGS")" || true
       case "$SET_OUT" in OK:*) ok "fixer profile — ${SET_OUT#OK:}" ;; *) die "fixer profile failed: ${SET_OUT:-no output}" ;; esac
 
@@ -1254,6 +1354,30 @@ fi
 LAUNCH_ARGS=(--add-dir "$WT")
 if [ -n "$WATCH" ]; then
   LAUNCH_ARGS+=(-n "$BUILD_SESSION_NAME" --session-id "$BUILD_SID")
+fi
+
+# The watchers get launch scripts because they are started INTO tmux. The build
+# is not: it is exec'd into the terminal this script was run from, which is why
+# BUILD_PID is $$. Write the command down anyway. Without it a run directory
+# holds a pid, a session id and a transcript path with no record of what was
+# actually run, and "the build never started" cannot be told apart from "the
+# build started and exited" — which is exactly the ambiguity the first live run
+# hit. This file is a RECORD; claude-build never executes it. (W09030034-02.)
+if [ -n "$WATCH" ] && [ "$DRY" != 1 ]; then
+  printf '%s\n' "$PROMPT" > "$STATE_DIR/build-prompt.txt"
+  {
+    printf '#!/bin/bash\n'
+    printf '# claude-build %s — a RECORD of how the build session was started.\n' "$RUN_ID"
+    printf '# claude-build does NOT run this file. Running it by hand starts a\n'
+    printf '# SECOND build against the same run directory.\n'
+    printf 'export CLAUDE_BUILD_STATE_DIR=%q\n' "$STATE_DIR"
+    printf 'cd %q\n' "$DIR"
+    printf 'exec claude'
+    for a in "${LAUNCH_ARGS[@]}"; do printf ' %q' "$a"; done
+    printf ' "$(cat %q)"\n' "$STATE_DIR/build-prompt.txt"
+  } > "$STATE_DIR/build-launch.sh"
+  chmod +x "$STATE_DIR/build-launch.sh"
+  ok "build command recorded: $STATE_DIR/build-launch.sh"
 fi
 
 if [ "$LAUNCH" = 0 ]; then
