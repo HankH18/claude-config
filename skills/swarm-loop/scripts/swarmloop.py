@@ -5353,6 +5353,53 @@ def cmd_red_check(args):
         sys.exit(1)
 
 
+# The skill's cross-run memory lives NEXT TO THIS FILE, never in the run's repo:
+# one LEARNED.md is shared by every run on this machine. The reporter below and
+# the writer in `distil --to-skill` both resolve it here, so the count an
+# operator reads and the file an append lands in can never be two files.
+LEARNED_ENTRIES_MARKER = "## Entries"
+LEARNED_CAP = 40          # the ceiling LEARNED.md states for itself
+LEARNINGS_SOFT_CAP = 30   # the ceiling SKILL.md Phase 8 states for the run file
+
+
+def _learned_path():
+    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                         os.pardir, LEARNED_MD))
+
+
+def _learned_entries(text):
+    """-> (entry_blocks, marked). One block per entry, continuations folded in.
+
+    An entry OPENS with a bullet or a heading and runs to the next blank line;
+    entries in this file wrap at ~94 columns with two-space continuations, so a
+    reader that kept only opening lines would see a third of each entry — which
+    is how a duplicate check over the first line alone passes a lesson whose text
+    simply wrapped differently. Counting is unaffected: one block per entry.
+
+    `marked` is False when the '## Entries' header is gone, in which case the
+    WHOLE file is read — preamble rule bullets included, which is why the count
+    is only ever advisory in that state and why the writer refuses outright
+    rather than appending into a document whose shape it cannot find.
+    """
+    marked = LEARNED_ENTRIES_MARKER in text
+    body = text.split(LEARNED_ENTRIES_MARKER, 1)[-1] if marked else text
+    blocks, cur = [], None
+    for ln in body.splitlines():
+        if ln.startswith("- ") or ln.startswith("### "):
+            if cur is not None:
+                blocks.append(cur)
+            cur = ln
+        elif cur is not None:
+            if not ln.strip():
+                blocks.append(cur)
+                cur = None
+            else:
+                cur += "\n" + ln
+    if cur is not None:
+        blocks.append(cur)
+    return blocks, marked
+
+
 def _learning_lines(d):
     """Two lines on the self-improvement loop: the per-run file, and the skill's.
 
@@ -5365,11 +5412,10 @@ def _learning_lines(d):
     block the orchestrator already reads every cycle, which is the difference
     between a rule nobody kept and a rule nobody kept IN FRONT OF THEM.
 
-    Deliberately NOT enforcement, and deliberately read-only: the harness writes
-    nothing outside the run's own repo. LEARNED.md lives in the skill directory,
-    shared by every run on the machine and by any concurrent run — a counter that
-    edits it is a different decision with a much larger blast radius, and it is
-    not this one.
+    This function stays read-only. The append is `distil`, a separate command an
+    operator or Termination invokes deliberately, because LEARNED.md is shared by
+    every run on the machine and by any concurrent run — a status line that
+    silently edited it would put a machine-wide write inside `resume`.
 
     Never raises: a missing skill directory (the script invoked from a copy, a
     relocated skill) degrades to 'cannot see it', never to a crash in `resume`,
@@ -5384,13 +5430,12 @@ def _learning_lines(d):
     if n is None:
         out.append(f"{STATE_DIR}/{LEARNINGS_MD}: ABSENT — Phase 8 appends the process-loop lesson "
                    "for every epoch to it; a run with none has recorded nothing about its own "
-                   "orchestration")
+                   "orchestration (`distil --lesson ... --because ...` writes one)")
     else:
         out.append(f"{STATE_DIR}/{LEARNINGS_MD}: {n} non-empty line(s)")
 
     # The skill's own memory, located from THIS file rather than from the repo.
-    learned = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                            os.pardir, LEARNED_MD))
+    learned = _learned_path()
     try:
         if not os.path.exists(learned):
             out.append(f"{LEARNED_MD}: not found at {learned} — cannot report the skill's memory")
@@ -5400,17 +5445,24 @@ def _learning_lines(d):
     except OSError as e:
         out.append(f"{LEARNED_MD}: unreadable ({e})")
         return out
-    body = text.split("## Entries", 1)[-1] if "## Entries" in text else text
-    entries = sum(1 for ln in body.splitlines()
-                  if ln.startswith("- ") or ln.startswith("### "))
-    if entries == 0:
+    ents, marked = _learned_entries(text)
+    entries = len(ents)
+    if not marked:
+        # The writer refuses in this state; the reporter says why the number
+        # below is not to be trusted rather than quietly counting rule bullets.
+        out.append(f"{LEARNED_MD}: no '{LEARNED_ENTRIES_MARKER}' marker at {learned} — the whole "
+                   f"file is being counted ({entries} bullet(s)) and `distil --to-skill` REFUSES "
+                   "until the marker is restored")
+    elif entries == 0:
         out.append(f"{LEARNED_MD}: EMPTY (0 entries) — Termination is supposed to distil "
-                   f"{STATE_DIR}/{LEARNINGS_MD} into it. Every run so far has ended without "
-                   "doing so, which is why it is empty; do not let this one be another")
+                   f"{STATE_DIR}/{LEARNINGS_MD} into it with `distil --to-skill`. Every run so "
+                   "far has ended without doing so, which is why it is empty; do not let this "
+                   "one be another")
     else:
         out.append(f"{LEARNED_MD}: {entries} entr(ies)"
-                   + ("  ·  AT CAPACITY (>=40) — SKILL.md's capacity gate applies: stop and tell "
-                      "the user before further runs" if entries >= 40 else ""))
+                   + (f"  ·  AT CAPACITY (>={LEARNED_CAP}) — SKILL.md's capacity gate applies: "
+                      "stop and tell the user before further runs" if entries >= LEARNED_CAP
+                      else ""))
     return out
 
 
@@ -6656,6 +6708,393 @@ def cmd_status(args):
     }, indent=2))
 
 
+# ------------------------------------------------------------------ distil
+#
+# The self-improvement loop's write half. SKILL.md has declared this loop since
+# the first version and NOTHING has ever closed it: LEARNED.md carried zero
+# entries across every run to date, because the append was a paragraph and
+# paragraphs in this skill have a measured 100% failure rate at being followed.
+# `_learning_lines` made the omission visible in `resume`/`checkpoint`; this
+# makes it mechanical.
+#
+# TWO TIERS, and the difference between them is blast radius, not ceremony:
+#
+#   default          -> .swarm-loop/learnings.md   ONE repo, this run. Routine.
+#   --to-skill       -> <skill>/LEARNED.md         EVERY future run on this
+#                                                  machine. Validated, capped,
+#                                                  compare-and-swapped, locked.
+#
+# The safe tier is the DEFAULT on purpose: a mistyped or forgotten flag writes
+# the entry into the run's own file, which is recoverable, instead of into
+# machine-wide memory, which is not. Each invocation writes exactly ONE file —
+# there is no both-tiers mode, so there is no partial-success state to reason
+# about when the validator refuses.
+#
+# The validation IS the feature. A writer that accepts any string is the defect
+# class this whole skill is a catalogue of: a mechanism that emits a confident
+# result and has no red path. LEARNED.md's own header says an overgrown,
+# project-specific memory file "degrades every future run more than it helps" —
+# so every rule that header states is enforced below, with a refusal, and the
+# refusal names the offending token rather than editorializing.
+
+# Project-specificity, by the signals that are unambiguous rather than by taste.
+# Every one of these is a thing that cannot be true of a durable orchestration
+# lesson: a lesson about wave sizing does not need a home directory in it.
+_DL_PATHY = re.compile(r"(?:/Users/|/home/|/opt/|/etc/|/var/|~/|\b[A-Za-z]:\\)")
+_DL_URLY = re.compile(r"(?:https?://|git@[\w.-]+:"
+                      r"|\b[\w-]+\.(?:com|net|org|io|ai|dev|app|co|sh|cloud|local)\b)", re.I)
+# An interior capital is what product and service names look like: ClearView,
+# ProxyShop, DynamoDB, GitHub. Deliberately strict and deliberately without an
+# escape hatch — the fix is always to name the ROLE ("the shared database", "the
+# remote") instead of the brand, and that rewrite makes the entry MORE durable,
+# which is the whole point of the file.
+_DL_PROPER = re.compile(r"\b[A-Za-z][a-z0-9]+[A-Z][A-Za-z0-9]*\b")
+# Ticket / defect / cycle identifiers: the canonical project trivia.
+_DL_TICKET = re.compile(r"\b[A-Z]{1,4}-\d{1,5}\b")
+
+# "Imperative" enforced the only way a regex can: reject the openings that are
+# provably NOT imperative. A lesson opening "the merge queue was slow" is a
+# report; "cap wave width at 3" is an instruction a future run can execute.
+_DL_NOT_IMPERATIVE = ("the", "a", "an", "this", "that", "it", "we", "i", "they",
+                      "there", "our", "its", "his", "her", "when", "if", "because",
+                      "after", "before", "during", "most", "every", "some", "one",
+                      "two", "three", "always", "never")
+# Imperative verbs whose spelling collides with the -ed/-ing participle test.
+_DL_IMPERATIVE_OK = ("read", "feed", "seed", "need", "embed", "shed", "shred",
+                     "spread", "proceed", "exceed", "succeed", "speed", "breed",
+                     "bleed", "bring", "ring", "sing", "string", "cling", "fling",
+                     "swing", "wring")
+
+_DL_LESSON_MIN, _DL_LESSON_MAX = 20, 400
+_DL_BECAUSE_MIN, _DL_BECAUSE_MAX = 30, 900
+
+
+def _dl_norm(s):
+    """One line, no control characters, no leading bullet. Entries are counted by
+    a line prefix, so an entry containing a newline would be counted twice and
+    would break every future count including its own capacity gate."""
+    s = "".join(" " if ch in "\t\r\n\x0b\x0c" else ch
+                for ch in (s or "") if ch >= " " or ch in "\t\r\n")
+    s = " ".join(s.split())
+    while s[:2] in ("- ", "* ") or s[:1] == "#":
+        s = s.lstrip("-*# ").strip()
+    return s
+
+
+def _dl_wrap(text, width=94, indent="  "):
+    """Wrap to the shape the archived LEARNED.md used: one leading '- ' line,
+    continuations indented two spaces so only the first line is ever counted."""
+    words, lines, cur = text.split(), [], ""
+    for w in words:
+        cand = w if not cur else cur + " " + w
+        if len(cand) > width and cur:
+            lines.append(cur)
+            cur = indent + w
+        else:
+            cur = cand
+    if cur:
+        lines.append(cur)
+    return "\n".join(lines)
+
+
+def _dl_project_hits(field, value):
+    """[(rule, offending token)] — every project-specific signal in one field."""
+    hits = []
+    for rule, rx in (("a machine or repo path", _DL_PATHY),
+                     ("a URL, host or remote", _DL_URLY),
+                     ("a product / service / API name (interior capital)", _DL_PROPER),
+                     ("a ticket or defect identifier", _DL_TICKET)):
+        m = rx.search(value)
+        if m:
+            hits.append((field, rule, m.group(0)))
+    return hits
+
+
+def _dl_validate(lesson, because, existing):
+    """[] when the entry may enter machine-wide memory, else the reasons it may not.
+
+    Enforces exactly the rules LEARNED.md's own header states, in its own order:
+    durable and project-agnostic; imperative and specific; carrying the failure
+    that motivated it; not a duplicate of something already there.
+    """
+    bad = []
+    for field, value, lo, hi in (("--lesson", lesson, _DL_LESSON_MIN, _DL_LESSON_MAX),
+                                 ("--because", because, _DL_BECAUSE_MIN, _DL_BECAUSE_MAX)):
+        if len(value) < lo:
+            bad.append("%s is %d characters — under %d it is a stub, not a lesson a future "
+                       "run could judge the applicability of" % (field, len(value), lo))
+        elif len(value) > hi:
+            bad.append("%s is %d characters — over %d belongs in the final report, not in a "
+                       "file every future run reads in full" % (field, len(value), hi))
+        bad.extend("%s contains %s: %r — LEARNED.md holds orchestration lessons, not project "
+                   "facts. Name the ROLE it played, not the name it had"
+                   % (f, rule, tok) for f, rule, tok in _dl_project_hits(field, value))
+
+    first = (lesson.split(" ", 1)[0] if lesson else "").strip("*_`\"'(),.:;").lower()
+    if first and first.isalpha():
+        if first in _DL_NOT_IMPERATIVE:
+            bad.append("--lesson opens with %r — that is a report about what happened. Open "
+                       "with the verb a future run should obey" % first)
+        elif first not in _DL_IMPERATIVE_OK and (first.endswith("ing") or first.endswith("ed")):
+            bad.append("--lesson opens with %r — a participle, not an imperative. Open with "
+                       "the verb a future run should obey" % first)
+
+    key = re.sub(r"[^a-z0-9]+", "", lesson.lower())
+    if key:
+        for ln in existing:
+            if key in re.sub(r"[^a-z0-9]+", "", ln.lower()):
+                bad.append("this lesson is ALREADY in the file — LEARNED.md's curation rule is "
+                           "to merge duplicates, not to add one: %s" % _oneline(ln, 120))
+                break
+    return bad
+
+
+class _learned_lock(object):
+    """O_EXCL lockfile beside LEARNED.md, held across read-verify-append.
+
+    Deliberately NOT `_state_lock`'s policy. That lock proceeds with a warning
+    after its timeout, which is right for state.json — refusing to checkpoint
+    because a SIGKILLed holder left a lockfile would be worse than the race. Here
+    the opposite holds: the loser of a race is at Termination, the cost of a
+    refusal is one re-run of one command, and the cost of proceeding is a lost
+    update to memory shared by every future run on the machine. So it REFUSES.
+
+    A stale lock is still broken after `stale` seconds, or a killed run would
+    wedge the file permanently.
+    """
+
+    # 5s is ~500x the time a real append holds this (read 2 KB, validate, write,
+    # fsync); a wait longer than that is a holder that is not coming back.
+    def __init__(self, path, timeout=5.0, stale=120.0):
+        self.path, self.timeout, self.stale, self.held = path + ".lock", timeout, stale, False
+
+    def __enter__(self):
+        deadline = time.time() + self.timeout
+        while True:
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+                os.write(fd, ("%d\n" % os.getpid()).encode())
+                os.close(fd)
+                self.held = True
+                return self
+            except FileExistsError:
+                try:
+                    age = time.time() - os.path.getmtime(self.path)
+                except OSError:
+                    continue
+                if age > self.stale:
+                    try:
+                        os.unlink(self.path)
+                    except OSError:
+                        pass
+                    continue
+                if time.time() >= deadline:
+                    die("another process has held %s for %ds — it is mid-write on the skill's "
+                        "shared memory and NOTHING was written here. Re-run distil once it is "
+                        "done; if that lockfile is an orphan it self-clears after %ds"
+                        % (self.path, int(age), int(self.stale)))
+                time.sleep(0.2)
+            except OSError as e:
+                die("cannot lock %s (%s) — refusing to append to machine-wide memory unlocked"
+                    % (self.path, e))
+
+    def __exit__(self, *exc):
+        if self.held:
+            try:
+                os.unlink(self.path)
+            except OSError:
+                pass
+        return False
+
+
+def _dl_append(path, seen, payload):
+    """Append `payload` iff the file is still byte-for-byte `seen`. -> None or dies.
+
+    Compare-and-swap, not a rewrite. `seen` is what the capacity count and the
+    duplicate check were computed against; if the file moved under us — a second
+    run's distil, an operator editing it in a buffer, an editor's truncate-then-
+    write caught mid-flight — those two answers are stale and the append would
+    write past a capacity gate that no longer holds. O_APPEND is what makes the
+    write itself atomic against another appender, and never truncating is what
+    makes 'never rewrite or reorder existing entries' a property of the code
+    rather than a promise in a docstring.
+    """
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+    except OSError as e:
+        die("cannot open %s for append (%s) — nothing was written" % (path, e))
+    try:
+        now = open(path, "rb").read()
+        if now != seen:
+            die("%s changed while this command was validating (%d -> %d bytes). NOTHING was "
+                "written: the entry count and duplicate check this append relied on are stale. "
+                "Re-run distil." % (path, len(seen), len(now)))
+        if now and not now.endswith(b"\n"):
+            payload = b"\n" + payload
+        os.write(fd, payload)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def cmd_distil(args):
+    """Close the self-improvement loop: record a lesson in the run, or promote one.
+
+    Exit 0 wrote something (or --dry-run validated it), 1 refused, 3 is usage.
+    Never 2: an orchestrator reads 2 as a terminal signal, and a full or picky
+    memory file is not a reason to end a run.
+    """
+    root = repo_root()
+    d = sd(root)
+    lpath = os.path.join(d, LEARNINGS_MD)
+    learned = _learned_path()
+
+    if args.do_list:
+        for line in _learning_lines(d):
+            print("self-improvement: " + line)
+        print("run file : %s" % lpath)
+        print("skill mem: %s" % learned)
+        return
+
+    missing = [n for n, v in (("--lesson", args.lesson), ("--because", args.because))
+               if not str(v or "").strip()]
+    if missing:
+        # --because is required, not optional prose: "with the failure that
+        # motivated them" is a rule LEARNED.md states, and a required argument is
+        # the only spelling of that rule this repo has ever seen kept.
+        die("distil needs " + " ".join(missing) + " — a lesson without the failure that "
+            "motivated it cannot be judged for applicability by the run that reads it next. "
+            "Say what to do, and what went wrong that makes it worth doing. (Or --list.)", 3)
+    lesson, because = _dl_norm(args.lesson), _dl_norm(args.because)
+    if not lesson or not because:
+        # Non-empty as ARGUMENTS but empty as CONTENT — "- - -", "###". Caught
+        # here rather than written as an entry with an empty bold span, because
+        # tier 1 does no other validation and this is the one shape that would
+        # corrupt the file's own line-prefix accounting.
+        die("--lesson and --because are empty once markdown punctuation is stripped — there is "
+            "no lesson here to record", 3)
+
+    # ---------------------------------------------------------------- tier 1
+    if not args.to_skill:
+        state = {}
+        spath = os.path.join(d, STATE_FILE)
+        if os.path.exists(spath):
+            try:
+                with open(spath) as f:
+                    state = json.load(f)
+            except (ValueError, OSError):
+                state = {}
+        cycle = args.cycle if args.cycle is not None else int(state.get("current_cycle", 0) or 0)
+        entry = _dl_wrap("- (cycle %d) **%s** — %s" % (cycle, lesson, because))
+        if args.dry_run:
+            print("distil --dry-run: would append to %s/%s\n%s" % (STATE_DIR, LEARNINGS_MD, entry))
+            return
+        os.makedirs(d, exist_ok=True)
+        try:
+            prior = open(lpath, "rb").read() if os.path.exists(lpath) else b""
+        except OSError as e:
+            die("cannot read %s/%s (%s) — nothing was written" % (STATE_DIR, LEARNINGS_MD, e))
+        lead = "" if not prior else ("\n" if prior.endswith(b"\n") else "\n\n")
+        with open(lpath, "a") as f:
+            f.write(lead + entry + "\n")
+        n = sum(1 for ln in open(lpath) if ln.startswith("- "))
+        print("distil: appended to %s/%s (%d entr(ies))" % (STATE_DIR, LEARNINGS_MD, n))
+        print(entry)
+        if n > LEARNINGS_SOFT_CAP:
+            # A warning, never a refusal, and the asymmetry with --to-skill is
+            # deliberate: this file is one repo's, it is curated by hand every
+            # epoch, and refusing to record a lesson mid-run loses the lesson.
+            print("distil: %s/%s now holds %d entries, over SKILL.md Phase 8's ~%d — curate it "
+                  "at this epoch boundary (merge duplicates, drop the least useful)."
+                  % (STATE_DIR, LEARNINGS_MD, n, LEARNINGS_SOFT_CAP))
+        return
+
+    # ---------------------------------------------------------------- tier 2
+    # Provenance first: distillation compresses something the run recorded. With
+    # an empty run file there is nothing to compress and the "lesson" is being
+    # invented at Termination, which is how a memory file fills with plausible
+    # sentences nobody learned. One tier-1 call satisfies this.
+    try:
+        run_lines = sum(1 for ln in open(lpath) if ln.strip()) if os.path.exists(lpath) else 0
+    except OSError:
+        run_lines = 0
+    if run_lines == 0:
+        die("%s/%s is empty or absent — there is nothing to distil FROM, so this entry "
+            "would be invented rather than learned. Record it in the run first:\n"
+            "    swarmloop.py distil --lesson \"%s\" --because \"...\""
+            % (STATE_DIR, LEARNINGS_MD, _oneline(lesson, 60)))
+
+    if not os.path.exists(learned):
+        die("%s not found at %s — this script is running from a copy outside the skill, so "
+            "there is no cross-run memory to append to. Put the distilled lessons in the final "
+            "report under 'proposed skill updates' instead." % (LEARNED_MD, learned))
+
+    with _learned_lock(learned):
+        try:
+            seen = open(learned, "rb").read()
+        except OSError as e:
+            die("%s is unreadable (%s) — nothing was written" % (learned, e))
+        text = seen.decode("utf-8", "replace")
+        entries, marked = _learned_entries(text)
+        if not marked:
+            die("%s has no '%s' section — refusing to append into a file whose entry "
+                "region cannot be located. Restore the marker; every count this command makes "
+                "(capacity, duplicates) is measured below it."
+                % (learned, LEARNED_ENTRIES_MARKER))
+
+        # The capacity gate LEARNED.md writes for itself, enforced verbatim: at
+        # the cap this REFUSES, and it does not trim to make room. A full
+        # learnings file means the skill has a backlog, and silently deleting the
+        # oldest entry would hide exactly the signal that says so.
+        if len(entries) >= LEARNED_CAP:
+            bar = "!" * 74
+            print(bar)
+            print("!!! %s IS FULL — %d entries (cap %d). NOTHING WAS WRITTEN."
+                  % (LEARNED_MD, len(entries), LEARNED_CAP))
+            print(bar)
+            print("  This is not a trim-and-continue. A full learnings file means the SKILL has")
+            print("  a backlog: run an improvement pass that promotes every encodable entry into")
+            print("  SKILL.md, the references, or swarmloop.py itself, then curate what remains,")
+            print("  before further runs. Tell the user that, in your next message to them.")
+            print("  The lesson this command refused is NOT lost — put it in the final report")
+            print("  under 'proposed skill updates':")
+            print(_dl_wrap("- **%s** — %s" % (lesson, because)))
+            sys.exit(1)
+
+        bad = _dl_validate(lesson, because, entries)
+        if bad:
+            print("distil: REFUSED — this entry may not enter %s. Nothing was written."
+                  % LEARNED_MD, file=sys.stderr)
+            for b in bad:
+                print("  - " + b, file=sys.stderr)
+            print("  LEARNED.md is read in full by every future run on this machine; an entry "
+                  "that is project-specific, vague or duplicated costs every one of them.",
+                  file=sys.stderr)
+            sys.exit(1)
+
+        entry = _dl_wrap("- **%s** — %s · distilled %s"
+                         % (lesson, because, time.strftime("%Y-%m-%d")))
+        if args.dry_run:
+            print("distil --dry-run: %s VALIDATED, %d/%d entries in %s, nothing written\n%s"
+                  % (LEARNED_MD, len(entries), LEARNED_CAP, learned, entry))
+            return
+        _dl_append(learned, seen, ("\n" + entry + "\n").encode("utf-8"))
+        total = len(entries) + 1
+        print("distil: appended to %s (%d/%d entries)" % (learned, total, LEARNED_CAP))
+        print(entry)
+        if total >= LEARNED_CAP:
+            # LEARNED.md aims this at "the agent whose append makes this file 40
+            # entries" — this one. The append stands; the next is refused above.
+            bar = "!" * 74
+            print(bar)
+            print("!!! THAT APPEND FILLED %s — %d/%d. The next one will be REFUSED."
+                  % (LEARNED_MD, total, LEARNED_CAP))
+            print(bar)
+            print("  STOP AND TELL THE USER in your next message: the skill needs an improvement")
+            print("  pass that promotes every encodable entry into SKILL.md, the references or")
+            print("  swarmloop.py, and curates what remains, before further runs.")
+
+
 # -------------------------------------------------------------------- main
 
 def main():
@@ -6952,6 +7391,25 @@ def main():
     s.add_argument("--keep-branches", action="store_true",
                    help="retire the worktrees but delete no branches")
     s.set_defaults(func=cmd_retire)
+
+    s = sub.add_parser("distil", help="record a process lesson in the run — or, with "
+                                      "--to-skill, promote one into the skill's cross-run memory")
+    s.add_argument("--lesson", default=None, metavar="TEXT",
+                   help="the imperative instruction a future run should obey")
+    s.add_argument("--because", default=None, metavar="TEXT",
+                   help="the failure that motivated it — required, because a lesson whose "
+                        "motivating failure is missing cannot be judged for applicability")
+    s.add_argument("--to-skill", action="store_true", dest="to_skill",
+                   help=f"append to the skill's {LEARNED_MD} instead of the run's file. This is "
+                        "machine-wide memory read by EVERY future run: the entry is validated "
+                        f"project-agnostic, capped at {LEARNED_CAP}, and appended under a lock")
+    s.add_argument("--cycle", type=int, default=None, metavar="N",
+                   help="cycle to tag a run-file entry with (default: state's current_cycle)")
+    s.add_argument("--dry-run", action="store_true", dest="dry_run",
+                   help="validate and render the entry, write nothing")
+    s.add_argument("--list", action="store_true", dest="do_list",
+                   help="report both tiers and where they live; write nothing")
+    s.set_defaults(func=cmd_distil)
 
     s = sub.add_parser("resume", help="reconstruct run state after an interrupted session")
     s.set_defaults(func=cmd_resume)

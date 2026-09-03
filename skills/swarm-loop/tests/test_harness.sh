@@ -3824,6 +3824,354 @@ ck_has "W48c-7 --help says being --merged proves nothing by itself" \
        "Being --merged proves nothing on its own"
 ck_has "W48c-7 --help names last-verdict-wins for the ledger" \
        "LAST verdict per ticket wins"
+# (y) DISTIL — the self-improvement loop's write half
+#
+# The loop was declared in SKILL.md from version one and nothing ever closed it:
+# LEARNED.md carried ZERO entries across every run, because the append was a
+# paragraph. `distil` makes it mechanical, and the whole risk of that is a writer
+# that cannot refuse — this skill's signature defect class. So the cases below
+# are mostly refusals, each paired with a control that must still pass.
+#
+# EVERY distil call here runs an ISOLATED COPY of the skill (`sli`), never the
+# installed one. LEARNED.md is machine-wide memory shared by every run on this
+# machine; a suite that wrote to it would be the exact blast radius the two-tier
+# split exists to avoid. The last case re-hashes the real file to prove it.
+# ===========================================================================
+ISO="$TMP/iso-skill"
+LM="$ISO/LEARNED.md"
+REAL_LEARNED="$SCRIPT_DIR/../LEARNED.md"
+REAL_LEARNED_SHA="$(sha_of "$REAL_LEARNED")"
+
+mk_iso() {   # a pristine isolated skill: the real script, the real LEARNED.md
+  rm -rf "$ISO"
+  mkdir -p "$ISO/scripts"
+  cp "$SL" "$ISO/scripts/swarmloop.py" || return 1
+  cp "$REAL_LEARNED" "$LM" || return 1
+  return 0
+}
+
+sli() {   # swarmloop, run from the isolated skill copy
+  python3 "$ISO/scripts/swarmloop.py" "$@" > "$OUT" 2>&1
+  RC=$?
+  return 0
+}
+
+fill_learned() {   # fill_learned <n> — append n well-formed entries to the copy
+  python3 - "$LM" "$1" <<'PY'
+import sys
+p, n = sys.argv[1], int(sys.argv[2])
+with open(p, "a") as f:
+    for i in range(n):
+        f.write("\n- **Bound metric command %d to a timeout a hung runner cannot outlive** - a "
+                "runner that hangs forever reads as a metric that never improves\n" % i)
+PY
+}
+
+n_entries() {   # entries counted exactly the way the harness counts them
+  python3 - "$LM" <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["SL_DIR"])
+import swarmloop
+ents, marked = swarmloop._learned_entries(open(sys.argv[1]).read())
+print(len(ents) if marked else "UNMARKED")
+PY
+}
+
+has_in() {   # has_in <file> <substring> -> yes/no, whitespace-collapsed
+  # Entries wrap at ~94 columns, so a line-oriented grep misses any phrase the
+  # wrapper split. Collapsing whitespace compares the entry as it was written.
+  python3 - "$1" "$2" <<'PY'
+import sys
+print("yes" if sys.argv[2] in " ".join(open(sys.argv[1]).read().split()) else "no")
+PY
+}
+
+# A lesson that must SURVIVE every rule: imperative, specific, motivated, and
+# carrying the harness's own vocabulary, which a lazier matcher would reject.
+GOOD_L="Commit the run state directory at every epoch boundary, never only at freeze"
+GOOD_B="a resumed run found no state at all and re-dispatched every in-flight ticket into a second set of worktrees"
+
+section "(y) distil tier 1 — the run's own file  [repo: distil1]"
+mk_repo distil1
+mk_iso
+ck_file "(y) the isolated skill copy has a LEARNED.md" "$LM"
+ck "(y) and it starts with zero entries" "0" "$(n_entries)"
+
+sli distil --lesson "$GOOD_L" --because "$GOOD_B"
+ck_exit "(y) tier 1 appends without a flag — the safe tier is the default" 0 "$RC"
+ck_has "(y) and says which file it landed in" ".swarm-loop/learnings.md"
+ck_file "(y) the run file now exists" ".swarm-loop/learnings.md"
+ck "(y) the lesson is IN the run file" "yes" "$(has_in .swarm-loop/learnings.md "$GOOD_L")"
+ck "(y) the motivating failure went in with it" "yes" "$(has_in .swarm-loop/learnings.md "$GOOD_B")"
+ck "(y) tier 1 wrote NOTHING to the skill's memory" "0" "$(n_entries)"
+
+sli distil --lesson "$GOOD_L"
+ck_exit "(y) --because is REQUIRED, not optional prose" 3 "$RC"
+ck_has "(y) and the refusal says why a lesson needs its failure" "cannot be judged for applicability"
+ck "(y) the run file did not grow on the refusal" "1" \
+   "$(grep -c -F -- "(cycle 0)" .swarm-loop/learnings.md)"
+
+# The run file's ~30 cap is a WARNING, never a refusal: it is one repo's file,
+# curated by hand every epoch, and refusing mid-run loses the lesson itself.
+ck_hasnt "(y) CONTROL: under the soft cap it says nothing about curating" "over SKILL.md Phase 8's"
+python3 - <<'PY'
+with open(".swarm-loop/learnings.md", "a") as f:
+    for i in range(31):
+        f.write("- (cycle 0) **Filler entry %d** - filler\n" % i)
+PY
+sli distil --lesson "Split any ticket whose verify command names more than one module" \
+  --because "a two-module ticket came back half done and neither half could be verified alone"
+ck_exit "(y) over the soft cap it still APPENDS" 0 "$RC"
+ck_has "(y) ...and warns to curate at this epoch boundary" "over SKILL.md Phase 8's"
+
+section "(y2) distil --to-skill — provenance and the happy path  [repo: distil2]"
+mk_repo distil2
+mk_iso
+LM_SHA0="$(sha_of "$LM")"
+
+# Distillation compresses what the run recorded. With an empty run file there is
+# nothing to compress and the "lesson" is being invented at Termination, which is
+# how a memory file fills with plausible sentences nobody learned.
+sli distil --to-skill --lesson "$GOOD_L" --because "$GOOD_B"
+ck_exit "(y2) --to-skill REFUSES when the run recorded nothing" 1 "$RC"
+ck_has "(y2) ...naming what there is nothing to distil from" "nothing to distil FROM"
+ck "(y2) and LEARNED.md is byte-identical" "$LM_SHA0" "$(sha_of "$LM")"
+
+sli distil --lesson "$GOOD_L" --because "$GOOD_B"
+ck_exit "(y2) tier 1 satisfies the provenance gate in one command" 0 "$RC"
+cp "$LM" "$TMP/distil-learned.before"
+sli distil --to-skill --lesson "$GOOD_L" --because "$GOOD_B"
+ck_exit "(y2) CONTROL: a durable, imperative, motivated lesson IS accepted" 0 "$RC"
+ck_has "(y2) ...reported against the cap" "1/40 entries"
+ck "(y2) the entry is really in LEARNED.md" "1" "$(n_entries)"
+ck "(y2) the lesson landed verbatim" "yes" "$(has_in "$LM" "$GOOD_L")"
+ck "(y2) and so did the failure that motivated it" "yes" "$(has_in "$LM" "$GOOD_B")"
+
+# Append-only IN EFFECT, not by promise: everything that was in the file is
+# still there, in order, as a byte prefix. A rewrite-the-whole-file
+# implementation could pass every other case here and fail this one.
+ck "(y2) the previous bytes are a strict PREFIX of the new file" "yes" \
+   "$(python3 -c "
+a=open('$TMP/distil-learned.before','rb').read(); b=open('$LM','rb').read()
+print('yes' if b.startswith(a) and len(b)>len(a) else 'NO')")"
+
+# The reporter and the writer must agree — the whole point of resolving
+# LEARNED.md in one place. checkpoint is where the orchestrator reads it.
+sl freeze
+gq add -A; gq commit -qm harness
+sli checkpoint --cycle 0
+ck_has "(y2) checkpoint now reports the entry distil just wrote" "LEARNED.md: 1 entr(ies)"
+ck_hasnt "(y2) ...and no longer calls the file EMPTY" "EMPTY (0 entries)"
+
+sli distil --list
+ck_exit "(y2) --list reports both tiers and writes nothing" 0 "$RC"
+ck_has "(y2) --list names the run file" ".swarm-loop/learnings.md"
+ck_has "(y2) --list names the skill memory" "iso-skill/LEARNED.md"   # normpath'd
+
+LM_SHA1="$(sha_of "$LM")"
+sli distil --to-skill --dry-run \
+  --lesson "Rebase an integration branch onto the base immediately before merging it" \
+  --because "two integration branches landed the same file twice because neither had been rebased"
+ck_exit "(y2) --dry-run validates and exits 0" 0 "$RC"
+ck_has "(y2) --dry-run says it wrote nothing" "nothing written"
+ck "(y2) --dry-run really wrote nothing" "$LM_SHA1" "$(sha_of "$LM")"
+
+section "(y3) distil --to-skill REFUSES a project-specific entry  [repo: distil3]"
+mk_repo distil3
+mk_iso
+sli distil --lesson "$GOOD_L" --because "$GOOD_B"     # satisfy provenance
+LM_SHA="$(sha_of "$LM")"
+
+# Each of these is a signal that cannot be true of a durable orchestration
+# lesson. The refusal names the token, because "rejected" without the word is
+# not something the agent that wrote it can act on.
+sli distil --to-skill --lesson "Pin the ProxyShop renderer before dispatching a wave that touches it" \
+  --because "the renderer moved under three agents at once and each rebased onto a different tree"
+ck_exit "(y3) a product / service name is refused" 1 "$RC"
+ck_has "(y3) ...naming the offending token" "'ProxyShop'"
+ck_has "(y3) ...and saying how to fix it" "Name the ROLE it played"
+
+sli distil --to-skill --lesson "Reuse the venv at /Users/dev/app/.venv instead of building one per worktree" \
+  --because "each worktree rebuilt a two-minute environment and the wave took longer to provision than to run"
+ck_exit "(y3) a machine path is refused" 1 "$RC"
+ck_has "(y3) ...named as a path" "a machine or repo path"
+
+sli distil --to-skill --lesson "Push the run branch to the mirror at labs.example.com before the final report" \
+  --because "the only offsite copy of a nine-hour run lived on one laptop until the last push"
+ck_exit "(y3) a host or URL is refused" 1 "$RC"
+ck_has "(y3) ...named as a host" "a URL, host or remote"
+
+sli distil --to-skill --lesson "Schedule T-036 ahead of anything that imports the registry it creates" \
+  --because "the dependent tickets all failed red-check because the enabler had not landed yet"
+ck_exit "(y3) a ticket identifier is refused" 1 "$RC"
+ck_has "(y3) ...named as an identifier" "a ticket or defect identifier"
+
+ck "(y3) not one refusal wrote a byte" "$LM_SHA" "$(sha_of "$LM")"
+
+section "(y4) distil --to-skill REFUSES a malformed entry  [repo: distil4]"
+mk_repo distil4
+mk_iso
+sli distil --lesson "$GOOD_L" --because "$GOOD_B"     # satisfy provenance
+LM_SHA="$(sha_of "$LM")"
+
+sli distil --to-skill --lesson "the merge queue was slower than expected all cycle" \
+  --because "waves four and five each waited on a review that nobody had been assigned to do"
+ck_exit "(y4) a report-shaped opening is refused" 1 "$RC"
+ck_has "(y4) ...named as non-imperative" "that is a report about what happened"
+
+sli distil --to-skill --lesson "Capping wave width at three keeps merge review survivable" \
+  --because "wave five collided on shared build outputs and two merges had to be redone by hand"
+ck_exit "(y4) a participle opening is refused" 1 "$RC"
+ck_has "(y4) ...named as a participle" "a participle, not an imperative"
+
+sli distil --to-skill --lesson "Cap wave width at three or fewer tickets when the batch shares build outputs" \
+  --because "it was slow"
+ck_exit "(y4) a stub motivation is refused" 1 "$RC"
+ck_has "(y4) ...named as too short to judge" "it is a stub"
+
+sli distil --to-skill --lesson "Cap it" --because "$GOOD_B"
+ck_exit "(y4) a stub lesson is refused" 1 "$RC"
+
+ck "(y4) not one malformed entry wrote a byte" "$LM_SHA" "$(sha_of "$LM")"
+
+# CONTROL: the near-miss. Each of the four refusals above must be a property of
+# the entry, not of a validator that refuses everything it is shown.
+sli distil --to-skill --lesson "Cap wave width at three or fewer tickets when the batch shares build outputs" \
+  --because "wave five collided on shared build outputs and two merges had to be redone by hand"
+ck_exit "(y4) CONTROL: the corrected entry is accepted" 0 "$RC"
+ck "(y4) CONTROL: and it landed" "1" "$(n_entries)"
+
+# Curation is a rule LEARNED.md states about itself: merge duplicates, do not
+# add one. The check reads whole entry BLOCKS, so a lesson that only wrapped
+# differently is still recognised as the same lesson.
+sli distil --to-skill --lesson "Cap wave width at three or fewer tickets when the batch shares build outputs" \
+  --because "an entirely different failure text, so only the lesson itself collides with what is there"
+ck_exit "(y4) a duplicate lesson is refused" 1 "$RC"
+ck_has "(y4) ...naming the curation rule it would break" "merge duplicates, not to add one"
+ck "(y4) and the file still holds exactly one" "1" "$(n_entries)"
+
+# The same rule against a lesson LONG enough that the writer wraps it across
+# lines. A duplicate check that kept only each entry's OPENING line sees a third
+# of this one and lets the second copy in — which is what the block folding in
+# _learned_entries is for, and the only case that can tell.
+LONG_L="Rebase every integration branch onto the base branch immediately before merging it and never after"
+sli distil --to-skill --lesson "$LONG_L" \
+  --because "two integration branches landed the same file twice because neither had been rebased first"
+ck_exit "(y4) a lesson long enough to WRAP is accepted once" 0 "$RC"
+ck "(y4) ...and is stored across more than one line" "yes" \
+   "$(python3 -c "
+import sys
+t = open('$LM').read()
+i = t.index('Rebase every integration branch')
+print('yes' if '\n' in t[i:i+len('$LONG_L')] else 'NO')")"
+sli distil --to-skill --lesson "$LONG_L" \
+  --because "a different failure text entirely, so only the wrapped lesson itself collides"
+ck_exit "(y4) the wrapped duplicate is refused too" 1 "$RC"
+ck "(y4) ...and did not land" "2" "$(n_entries)"
+
+section "(y5) distil --to-skill enforces the ~40 cap LEARNED.md states  [repo: distil5]"
+mk_repo distil5
+mk_iso
+sli distil --lesson "$GOOD_L" --because "$GOOD_B"     # satisfy provenance
+fill_learned 39
+ck "(y5) the copy now holds 39 entries" "39" "$(n_entries)"
+
+sli distil --to-skill --lesson "Kill a wave that has produced no commit by its second checkpoint" \
+  --because "a hung worker and a working one look identical from the orchestrator and the run spent an epoch on nothing"
+ck_exit "(y5) the append that FILLS the file still succeeds" 0 "$RC"
+ck_has "(y5) ...and shouts at the agent whose append filled it" "The next one will be REFUSED"
+ck_has "(y5) ...telling it to stop and tell the user" "STOP AND TELL THE USER"
+ck "(y5) 40 entries now" "40" "$(n_entries)"
+
+LM_SHA="$(sha_of "$LM")"
+sli distil --to-skill --lesson "Run the frozen metric commands from the primary checkout only" \
+  --because "a worktree copy of the harness measured a tree that had never been merged and the verdict was fiction"
+ck_exit "(y5) the 41st entry is REFUSED" 1 "$RC"
+ck_has "(y5) ...with the capacity message, not a trim" "IS FULL"
+ck_has "(y5) ...saying the skill has a backlog" "means the SKILL has"
+ck_has "(y5) ...and handing the refused lesson back for the report" "proposed skill updates"
+ck "(y5) NOTHING was trimmed to make room" "40" "$(n_entries)"
+ck "(y5) the file is byte-identical after the refusal" "$LM_SHA" "$(sha_of "$LM")"
+
+section "(y6) distil --to-skill will not write a file it cannot read  [repo: distil6]"
+mk_repo distil6
+mk_iso
+sli distil --lesson "$GOOD_L" --because "$GOOD_B"     # satisfy provenance
+
+# The '## Entries' marker is where every count this command makes is measured.
+# Without it the whole file counts, preamble rule bullets included, so the
+# capacity gate would be answering about the wrong thing.
+python3 - "$LM" <<'PY'
+import sys
+p = sys.argv[1]
+open(p, "w").write(open(p).read().replace("## Entries", "## Notes"))
+PY
+LM_SHA="$(sha_of "$LM")"
+sli distil --to-skill --lesson "$GOOD_L" --because "$GOOD_B"
+ck_exit "(y6) a LEARNED.md with no entries marker is refused" 1 "$RC"
+ck_has "(y6) ...naming the missing section" "has no '## Entries' section"
+ck "(y6) and it is left untouched" "$LM_SHA" "$(sha_of "$LM")"
+sli distil --list
+ck_has "(y6) the reporter says its own count cannot be trusted either" \
+       "REFUSES until the marker is restored"
+
+# A held lock means a process is mid-write on memory shared by every run on this
+# machine. `_state_lock` proceeds after its timeout because refusing to
+# checkpoint is worse than the race it prevents; here the opposite holds — the
+# loser of the race is at Termination and one re-run costs nothing.
+mk_iso
+sli distil --lesson "$GOOD_L" --because "$GOOD_B"
+: > "$LM.lock"
+LM_SHA="$(sha_of "$LM")"
+sli distil --to-skill --lesson "$GOOD_L" --because "$GOOD_B"
+ck_exit "(y6) a held lock REFUSES rather than racing" 1 "$RC"
+ck_has "(y6) ...saying nothing was written" "NOTHING was written here"
+ck "(y6) and nothing was" "$LM_SHA" "$(sha_of "$LM")"
+rm -f "$LM.lock"
+sli distil --to-skill --lesson "$GOOD_L" --because "$GOOD_B"
+ck_exit "(y6) CONTROL: with the lock released the same entry lands" 0 "$RC"
+
+# The compare-and-swap. The capacity count and the duplicate check are computed
+# against bytes read a moment earlier; if the file moved under them — a second
+# run's distil, an operator's editor saving mid-flight — both answers are stale
+# and the append would write past a gate that no longer holds. Driven through
+# the module because no black-box ordering interleaves a foreign writer
+# deterministically.
+mk_iso
+LM_SHA="$(sha_of "$LM")"
+CAS_OUT=$(python3 - "$LM" 2>/dev/null <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["SL_DIR"])
+import swarmloop
+p = sys.argv[1]
+stale = open(p, "rb").read() + b"\n- **an entry this caller never saw** - x\n"
+try:
+    swarmloop._dl_append(p, stale, b"\n- **should never land** - y\n")
+    print("APPENDED")
+except SystemExit:
+    print("REFUSED")
+PY
+)
+ck "(y6) an append whose read is stale is REFUSED" "REFUSED" "$CAS_OUT"
+ck "(y6) ...and the file is untouched" "$LM_SHA" "$(sha_of "$LM")"
+
+# CONTROL for the CAS: handed the bytes it actually read, the same call appends.
+python3 - "$LM" >/dev/null 2>&1 <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["SL_DIR"])
+import swarmloop
+p = sys.argv[1]
+swarmloop._dl_append(p, open(p, "rb").read(),
+                     b"\n- **Retire a worktree only once its branch is an ancestor of the "
+                     b"base** - merged into an integration branch is not landed\n")
+PY
+ck "(y6) CONTROL: with the bytes it read, the append lands" "1" "$(n_entries)"
+
+# The suite's own blast radius. Every case above ran an isolated copy; if any one
+# of them ever reaches the INSTALLED skill's memory instead, this goes red.
+ck "(y) THE SUITE NEVER TOUCHED THE INSTALLED LEARNED.md" \
+   "$REAL_LEARNED_SHA" "$(sha_of "$REAL_LEARNED")"
+
 
 
 # ===========================================================================
