@@ -49,16 +49,46 @@ if os.path.exists(path):
 else:
     note.append("created settings.local.json")
 
-man = {"worktree_dir": wt, "permissions_added": [],
-       "additional_directories_added": [], "gitignore_added": [],
-       "set_disable_all_hooks": False}
+# The manifest is the ONLY record of what uninstall has to undo. It used to be
+# rebuilt from scratch and written unconditionally, so a SECOND install erased
+# the first one's record: uninstall then no longer knew it had added
+# Read(.env)/Edit(.env) or the worktree grant, and left them behind forever.
+# Load the previous manifest and MERGE into it instead of overwriting.
+prev = {}
+if os.path.exists(manifest_p):
+    try:
+        with open(manifest_p) as f:
+            prev = json.load(f) or {}
+        note.append("merged into existing install manifest")
+    except Exception:
+        note.append("existing manifest unreadable — starting a fresh one")
+        prev = {}
+
+man = dict(prev)
+man["permissions_added"] = list(prev.get("permissions_added") or [])
+man["additional_directories_added"] = list(prev.get("additional_directories_added") or [])
+man["gitignore_added"] = list(prev.get("gitignore_added") or [])
+man.setdefault("set_disable_all_hooks", False)
+if prev.get("worktree_dir") and prev["worktree_dir"] != wt:
+    note.append("worktree dir changed (%s -> %s); --purge only removes the new one"
+                % (prev["worktree_dir"], wt))
+man["worktree_dir"] = wt
 
 # Hook entries MERGE across settings levels, so this never removes a user-level
 # hook. disableAllHooks is the one switch that turns the guard off; pin it false.
-if "disableAllHooks" not in data:
-    man["set_disable_all_hooks"] = True
-elif data.get("disableAllHooks") is True:
-    note.append("flipped disableAllHooks true -> false")
+#
+# A user's own "disableAllHooks": true used to be flipped to false and only
+# NOTED — set_disable_all_hooks stayed False, so the restore in --uninstall
+# never fired and our flip was permanent. Record the prior state so uninstall
+# can put it back. Record it ONCE: only the FIRST install sees the user's real
+# value; every later one sees nothing but our own pin.
+had_dah = "disableAllHooks" in data
+if "disable_all_hooks_was_present" not in prev:
+    man["disable_all_hooks_was_present"] = had_dah
+    man["disable_all_hooks_prev"] = data.get("disableAllHooks")
+    man["set_disable_all_hooks"] = not had_dah  # legacy field; older uninstallers read it
+if had_dah and data.get("disableAllHooks") is True:
+    note.append("flipped disableAllHooks true -> false (uninstall restores it)")
 data["disableAllHooks"] = False
 
 hooks = data.setdefault("hooks", {})
@@ -86,7 +116,9 @@ adds = perms.get("additionalDirectories")
 if not isinstance(adds, list):
     adds = []
 if wt not in adds and not wt.startswith(os.path.dirname(os.path.dirname(path))+os.sep+".claude"):
-    adds.append(wt); man["additional_directories_added"].append(wt)
+    adds.append(wt)
+    if wt not in man["additional_directories_added"]:  # union — see manifest note above
+        man["additional_directories_added"].append(wt)
     note.append("granted worktree directory")
 perms["additionalDirectories"] = adds
 
@@ -102,7 +134,13 @@ allow = perms.get("allow")
 if not isinstance(allow, list):
     allow = []
 added = [p for p in baseline if p not in allow]
-allow.extend(added); man["permissions_added"] = added
+allow.extend(added)
+# Union, never replace: on a second install `added` is empty because the first
+# install already put these in allow[], and assigning it would blank the record
+# that uninstall uses to take them back out.
+for p in added:
+    if p not in man["permissions_added"]:
+        man["permissions_added"].append(p)
 perms["allow"] = allow
 if added:
     note.append(f"added {len(added)} baseline permission(s)")
@@ -176,10 +214,24 @@ if os.path.exists(settings):
         else:
             data.pop("hooks", None)
 
-    # disableAllHooks: we set it False. Remove only if still exactly False.
-    if data.get("disableAllHooks") is False and man.get("set_disable_all_hooks"):
-        data.pop("disableAllHooks", None)
-        notes.append("removed disableAllHooks pin")
+    # disableAllHooks: we set it False. Touch it only if it is STILL exactly
+    # False — if the user turned it back on since install, that is their call.
+    # Restore whatever was there before install: absent -> remove the key,
+    # true -> put the true back. The old code only ever removed the key, so a
+    # user who had hooks disabled had that setting silently flipped for good.
+    if data.get("disableAllHooks") is False:
+        if "disable_all_hooks_was_present" in man:
+            if man.get("disable_all_hooks_was_present"):
+                prior = man.get("disable_all_hooks_prev")
+                if prior is not False:
+                    data["disableAllHooks"] = prior
+                    notes.append("restored disableAllHooks = " + json.dumps(prior))
+            else:
+                data.pop("disableAllHooks", None)
+                notes.append("removed disableAllHooks pin")
+        elif man.get("set_disable_all_hooks"):  # manifest from an older install
+            data.pop("disableAllHooks", None)
+            notes.append("removed disableAllHooks pin")
 
     perms = data.get("permissions") or {}
     ad = perms.get("additionalDirectories")
@@ -272,9 +324,11 @@ UNINSTALL
                        added yourself is left alone. Reads the manifest at
                        .claude/.claude-build.json; falls back to signature
                        matching if that file is gone.
-  --purge              With --uninstall: also delete the worktree directory
-                       and prune stale worktree registrations. Refuses if any
-                       worktree still holds uncommitted work.
+  --purge              With --uninstall only: also delete the worktree
+                       directory and prune stale worktree registrations. Takes
+                       the directory from the manifest and refuses to guess if
+                       the manifest is gone. Refuses if any worktree still holds
+                       uncommitted work, or if git cannot say whether it does.
   --uninstall-self     Delete the claude-build script itself. Does not touch
                        any project; run --uninstall in each project first.
 
@@ -310,6 +364,13 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# --purge is only ever READ under --uninstall. Accepting it silently anywhere
+# else means `claude-build ~/proj --purge` reads as "remove the worktrees" and
+# does the opposite — a full INSTALL — with no hint that the flag did nothing.
+if [ "$PURGE" = 1 ] && [ "$MODE" != uninstall ]; then
+  die "--purge only means anything with --uninstall (you asked for: $MODE)"
+fi
+
 # ------------------------------------------------------------ uninstall-self
 if [ "$MODE" = uninstall-self ]; then
   TARGET="$(cd "$(dirname "$SELF")" && pwd -P)/$(basename "$SELF")"
@@ -331,11 +392,25 @@ command -v git     >/dev/null || die "git not on PATH"
 [ "$MODE" = install ] && { command -v claude >/dev/null || die "claude not on PATH"; }
 
 DIR="${DIR:-$PWD}"
-if [ ! -d "$DIR" ] && [ "$MODE" = install ]; then
-  [ "$DRY" = 1 ] && echo "would create directory: $DIR" || mkdir -p "$DIR"
+if [ ! -d "$DIR" ]; then
+  # Only install mode creates the directory. A missing DIR used to silently
+  # fall back to $PWD, so one typo in `claude-build ~/prject --uninstall --purge`
+  # pointed the rm -rf and the settings surgery at whatever repo you happened to
+  # be standing in. Outside install mode a path that does not exist is an ABORT.
+  if [ "$MODE" != install ]; then
+    die "no such directory: $DIR  (refusing to fall back to $PWD in $MODE mode)"
+  fi
+  # if/else, not `A && B || C`: with the && form a failed echo (closed stdout)
+  # falls through and creates the directory during a --dry-run.
+  if [ "$DRY" = 1 ]; then echo "would create directory: $DIR"; else mkdir -p "$DIR"; fi
 fi
-[ -d "$DIR" ] || DIR="$PWD"
-DIR="$(cd "$DIR" && pwd -P)"
+if [ -d "$DIR" ]; then
+  DIR="$(cd "$DIR" && pwd -P)"
+else
+  # --dry-run install of a directory that does not exist yet: nothing was
+  # created, so make the path absolute without cd-ing into it.
+  case "$DIR" in /*) ;; *) DIR="$PWD/${DIR#./}" ;; esac
+fi
 if git -C "$DIR" rev-parse --show-toplevel >/dev/null 2>&1; then
   ROOT="$(git -C "$DIR" rev-parse --show-toplevel)"
   [ "$ROOT" != "$DIR" ] && { warn "$DIR is inside the repo at $ROOT — using the repo root"; DIR="$ROOT"; }
@@ -344,55 +419,102 @@ NAME="$(basename "$DIR")"
 SETTINGS="$DIR/.claude/settings.local.json"
 MANIFEST="$DIR/.claude/.claude-build.json"
 
+# Is every registered worktree at or under $1 clean enough to delete? Returns 0
+# only when the answer is a proven yes.
+#
+# The old one-liner was
+#   git worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}' | grep -F "$BASE"
+# which is wrong three ways, each of which ends in rm -rf'ing live work:
+#   * awk '{print $2}' truncates a worktree path at its first space, so a
+#     checkout under "/Users/me/My Proj-worktrees/t1" was never status-checked;
+#   * grep -F substring-matches, so "…-worktrees.bak/t1" counted as ours while
+#     the truncated paths above matched nothing at all;
+#   * 2>/dev/null on both git calls made the check fail OPEN — a git that could
+#     not answer read as "all clean, go ahead".
+# So: split on the `worktree ` sentinel (paths keep their spaces), match the base
+# exactly, and fail CLOSED when git cannot answer.
+wt_clean() {
+  local base="$1" listing line w st rc=0
+  if ! listing="$(git -C "$DIR" worktree list --porcelain 2>&1)"; then
+    warn "cannot list worktrees in $DIR — git said: ${listing%%$'\n'*}"
+    return 1
+  fi
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*) w="${line#worktree }" ;;
+      *)            continue ;;
+    esac
+    case "$w" in
+      "$base"|"$base"/*) ;;
+      *)                 continue ;;
+    esac
+    # A registration whose directory is already gone holds no work to lose —
+    # that is precisely what `git worktree prune` below cleans up.
+    [ -d "$w" ] || continue
+    if ! st="$(git -C "$w" status --porcelain 2>&1)"; then
+      warn "cannot read git status in $w — git said: ${st%%$'\n'*}"
+      rc=1; continue
+    fi
+    if [ -n "$st" ]; then
+      warn "uncommitted work in $w"; rc=1
+    fi
+  done <<< "$listing"
+  return "$rc"
+}
+
 # ================================================================ UNINSTALL
 if [ "$MODE" = uninstall ]; then
   step "claude-build — uninstall from $NAME"
   [ "$DRY" = 1 ] && warn "DRY RUN — nothing will be removed"
 
+  # The manifest is the ONLY thing allowed to name a directory we rm -rf. The old
+  # code invented "$(dirname "$DIR")/$NAME-worktrees" whenever the manifest was
+  # missing or unreadable and then deleted that guess — a directory claude-build
+  # may never have created, and may well be someone else's work. Read it here,
+  # before the uninstall step deletes the manifest.
+  WT_REC="$(MANIFEST="$MANIFEST" python3 -c 'import json,os;p=os.environ["MANIFEST"];print((json.load(open(p)).get("worktree_dir") or "") if os.path.exists(p) else "")' 2>/dev/null || true)"
+
   # Safety first: if --purge could refuse, it must refuse BEFORE anything is
   # removed. Otherwise a refusal leaves the project half-uninstalled.
   if [ "$PURGE" = 1 ]; then
-    WT_PRE="$(MANIFEST="$MANIFEST" python3 -c 'import json,os;p=os.environ["MANIFEST"];print((json.load(open(p)).get("worktree_dir") or "") if os.path.exists(p) else "")' 2>/dev/null || true)"
-    WT_PRE="${WT_PRE:-$(dirname "$DIR")/${NAME}-worktrees}"
-    BLOCKED=0
-    while IFS= read -r w; do
-      [ -z "$w" ] && continue
-      if [ -n "$(git -C "$w" status --porcelain 2>/dev/null)" ]; then
-        warn "uncommitted work in $w"; BLOCKED=1
-      fi
-    done < <(git -C "$DIR" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}' | grep -F "$WT_PRE" || true)
-    [ "$BLOCKED" = 1 ] && die "refusing to purge — worktrees hold uncommitted work. Nothing was removed; commit or discard, then rerun."
+    [ -n "$WT_REC" ] || die "--purge needs the install manifest at $MANIFEST to know which directory to delete, and it is missing or unreadable. Refusing to guess — rerun without --purge and remove the worktree directory by hand."
+    case "$WT_REC" in
+      /*) ;;
+      *)  die "manifest worktree_dir is not an absolute path ($WT_REC) — refusing to purge" ;;
+    esac
+    [ "$WT_REC" = "/" ] && die "manifest worktree_dir is / — refusing to purge"
+    case "$DIR/" in
+      "$WT_REC"/*) die "manifest worktree_dir $WT_REC contains the project $DIR — refusing to purge" ;;
+    esac
+    wt_clean "$WT_REC" || die "refusing to purge — worktrees under $WT_REC are not all clean, or git could not say. Nothing was removed; commit or discard, then rerun."
   fi
 
   OUT="$(SETTINGS="$SETTINGS" MANIFEST="$MANIFEST" DIR="$DIR" DRY="$DRY" python3 -c "$PY_UNINSTALL")" || true
 
   case "$OUT" in
     FATAL:*) die "${OUT#FATAL:}" ;;
-    OK:*)    BODY="${OUT#OK:}"; WT_REC="${BODY%%|*}"; NOTES="${BODY#*|}"
-             IFS=';' read -ra N <<< "$NOTES"; for n in "${N[@]}"; do ok "${n# }"; done ;;
+    # The wt field before the "|" is the same manifest value already read into
+    # WT_REC above; only the notes are consumed here. `for n in "${N[@]}"` is an
+    # unbound-variable error on bash 3.2 when NOTES is empty, so guard it.
+    OK:*)    BODY="${OUT#OK:}"; NOTES="${BODY#*|}"
+             IFS=';' read -ra N <<< "$NOTES"
+             for n in ${N[@]+"${N[@]}"}; do ok "${n# }"; done ;;
     *)       die "uninstall failed: ${OUT:-no output}" ;;
   esac
 
-  WT_REC="${WT_REC:-$(dirname "$DIR")/${NAME}-worktrees}"
   if [ "$PURGE" = 1 ]; then
     step "Purge — worktrees"
-    LIVE=0
-    while IFS= read -r w; do
-      [ -z "$w" ] && continue
-      if [ -n "$(git -C "$w" status --porcelain 2>/dev/null)" ]; then
-        warn "uncommitted work in $w"; LIVE=1
-      fi
-    done < <(git -C "$DIR" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}' | grep -F "$WT_REC" || true)
-    if [ "$LIVE" = 1 ]; then
-      die "refusing to purge — worktrees hold uncommitted work (commit or discard, then rerun)"
-    fi
+    # Re-checked immediately before the delete: this is the check that actually
+    # guards the rm -rf, and the settings surgery above took real time.
+    wt_clean "$WT_REC" || die "refusing to purge — worktrees under $WT_REC are not all clean, or git could not say (commit or discard, then rerun)"
     if [ "$DRY" = 1 ]; then echo "  would delete $WT_REC and run git worktree prune"
     else
-      rm -rf "$WT_REC"; git -C "$DIR" worktree prune 2>/dev/null || true
+      rm -rf -- "$WT_REC"
+      git -C "$DIR" worktree prune || warn "git worktree prune failed — run it by hand in $DIR"
       ok "deleted $WT_REC and pruned"
     fi
-  else
-    [ -d "$WT_REC" ] && warn "worktree dir left in place: $WT_REC  (--purge removes it)"
+  elif [ -n "$WT_REC" ] && [ -d "$WT_REC" ]; then
+    warn "worktree dir left in place: $WT_REC  (--purge removes it)"
   fi
 
   step "Done"
@@ -428,7 +550,11 @@ PARENT="$(dirname "$DIR")"
 WT="$PARENT/${NAME}-worktrees"; WT_MODE="sibling"
 if [ "$IN_TREE" = 1 ]; then
   WT="$DIR/.swarm-loop/worktrees"; WT_MODE="in-tree (forced)"
-elif ! ( [ -w "$PARENT" ] && ( [ -d "$WT" ] || mkdir -p "$WT" 2>/dev/null ) ); then
+# The `mkdir -p` below is how this probe learns the parent is really writable,
+# but it also CREATES the directory — under --dry-run, which advertises "Writes
+# nothing", that left a <name>-worktrees/ behind in the user's parent directory.
+# In dry-run mode settle for what can be learned without writing.
+elif ! ( [ -w "$PARENT" ] && ( [ -d "$WT" ] || [ "$DRY" = 1 ] || mkdir -p "$WT" 2>/dev/null ) ); then
   WT="$DIR/.swarm-loop/worktrees"; WT_MODE="in-tree (parent not writable)"
   warn "cannot write to $PARENT — falling back in-tree"
   warn "metric commands MUST then exclude .swarm-loop/ (see goal-setting.md)"
@@ -444,6 +570,34 @@ case "$MERGE_OUT" in
   OK:*)    ok "${MERGE_OUT#OK:}" ;;
   *)       die "settings merge failed: ${MERGE_OUT:-no output}" ;;
 esac
+
+# settings.local.json is not the only file that can turn the guard off, and it
+# was the only one this script ever looked at. A project .claude/settings.json —
+# or the user-level ~/.claude/settings.json — carrying "disableAllHooks": true
+# leaves the session with NO hooks at all, and every probe in step 5 still comes
+# back green, because those probes pipe JSON straight into git-guard.py and never
+# go through the settings harness that reads these files. Four green checks over
+# a dead guard is the worst failure this script can produce, so look, say so
+# loudly, and let step 5 refuse the launch.
+HOOKS_OFF_AT=""
+for OTHER in "$DIR/.claude/settings.json" "$HOME/.claude/settings.json"; do
+  [ -f "$OTHER" ] || continue
+  OTHER_STATE="$(OTHER="$OTHER" python3 -c '
+import json, os
+try:
+    d = json.load(open(os.environ["OTHER"])) or {}
+except Exception:
+    print("unreadable"); raise SystemExit
+print("off" if d.get("disableAllHooks") is True else "ok")' 2>/dev/null || echo unreadable)"
+  case "$OTHER_STATE" in
+    off) HOOKS_OFF_AT="$OTHER"
+         warn "$OTHER sets \"disableAllHooks\": true"
+         warn "  that switch kills EVERY hook for the session — including the git-guard"
+         warn "  just written to settings.local.json — and it outlives this script."
+         warn "  Remove that key from $OTHER, then rerun." ;;
+    unreadable) warn "could not parse $OTHER — check it by hand for disableAllHooks" ;;
+  esac
+done
 
 step "4. .gitignore"
 GI="$DIR/.gitignore"
@@ -465,11 +619,21 @@ else
     grep -qxF "$line" "$GI" 2>/dev/null || { printf '%s\n' "$line" >> "$GI"; ADDED_LINES+=("$line"); }
   done <<< "$NEEDED"
   if [ ${#ADDED_LINES[@]} -gt 0 ]; then
+    # Append to the recorded list, do not replace it: a later install that adds
+    # one new line used to wipe the first install's record, stranding the rest of
+    # the .gitignore entries in the project forever.
     printf '%s\n' "${ADDED_LINES[@]}" | MANIFEST="$MANIFEST" python3 -c '
 import json,os,sys
 p=os.environ["MANIFEST"]
-m=json.load(open(p)) if os.path.exists(p) else {}
-m["gitignore_added"]=[l.rstrip("\n") for l in sys.stdin if l.strip()]
+try:
+    m=json.load(open(p)) if os.path.exists(p) else {}
+except Exception:
+    m={}
+seen=m.get("gitignore_added") or []
+for l in (x.rstrip("\n") for x in sys.stdin):
+    if l.strip() and l not in seen:
+        seen.append(l)
+m["gitignore_added"]=seen
 json.dump(m,open(p,"w"),indent=2)'
   fi
   ok "${#ADDED_LINES[@]} entr$([ ${#ADDED_LINES[@]} = 1 ] && echo y || echo ies) added"
@@ -496,15 +660,43 @@ else
 
   # A grant covering reads but not writes passes the first half of this and
   # hangs the wave on the second, so probe all four operations.
+  #
+  # The name is per-process: a fixed "_cb_probe" collides with a second
+  # claude-build running against the same repo, and with the leftover branch of
+  # any earlier run whose cleanup did not complete — which showed up as a
+  # worktree probe FAILURE on a perfectly good repo.
+  PROBE_ID="_cb_probe_$$_${RANDOM}"
+  PROBE_WT="$WT/$PROBE_ID"
   if ( cd "$DIR" \
-       && git worktree add -q "$WT/_probe" -b _cb_probe >/dev/null 2>&1 \
-       && echo probe > "$WT/_probe/_cb_probe.txt" \
-       && [ "$(cat "$WT/_probe/_cb_probe.txt")" = probe ] ); then
+       && git worktree add -q "$PROBE_WT" -b "$PROBE_ID" >/dev/null 2>&1 \
+       && echo probe > "$PROBE_WT/probe.txt" \
+       && [ "$(cat "$PROBE_WT/probe.txt")" = probe ] ); then
     ok "worktree add + write + read at $WT"
   else
     warn "worktree probe FAILED at $WT"; FAIL=1
   fi
-  ( cd "$DIR" && rm -rf "$WT/_probe" && git worktree prune && git branch -qD _cb_probe ) >/dev/null 2>&1 || true
+
+  # Teardown used to end in `|| true`, so a probe worktree left registered in the
+  # repo — which pollutes every later `git worktree list` and any root-walking
+  # metric command — was completely silent. Say what is left behind.
+  CLEAN=0
+  [ -e "$PROBE_WT" ] && { rm -rf -- "$PROBE_WT" || CLEAN=1; }
+  git -C "$DIR" worktree prune >/dev/null 2>&1 || CLEAN=1
+  if git -C "$DIR" rev-parse --verify -q "refs/heads/$PROBE_ID" >/dev/null 2>&1; then
+    git -C "$DIR" branch -qD "$PROBE_ID" >/dev/null 2>&1 || CLEAN=1
+  fi
+  if [ "$CLEAN" = 1 ] || [ -e "$PROBE_WT" ]; then
+    warn "probe cleanup incomplete — remove $PROBE_WT and branch $PROBE_ID by hand"
+  else
+    ok "probe worktree + branch torn down"
+  fi
+
+  # Green probes prove git-guard.py works; they cannot prove the session will
+  # ever call it. See the disableAllHooks scan in step 3.
+  if [ -n "$HOOKS_OFF_AT" ]; then
+    warn "disableAllHooks: true in $HOOKS_OFF_AT — the probes above cannot see this, and the guard will not run"
+    FAIL=1
+  fi
 
   [ "$FAIL" = 1 ] && die "probes failed — refusing to launch. An unproven guard is no guard."
 fi

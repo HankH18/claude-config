@@ -120,10 +120,17 @@ permission to change its own route has misread this packet.
   need a clean tree, that is the orchestrator's job in fresh isolation: STOP and
   report it, do not stash. (A `PreToolUse` git-guard blocks these ops; if you hit
   a block, the guard is working — switch to the read-only form, do not route
-  around it.) What the guard blocks is every git verb that WRITES the working
-  tree from a commit or the index, and it blocks them no matter how narrow the
-  pathspec looks: `git restore <one file>` and `git checkout HEAD -- <one file>`
-  are refused exactly like `git checkout .`. It does NOT block READING from git.
+  around it.) What the guard blocks is the ops that DISCARD uncommitted work —
+  overwriting the tree from a commit or the index with no merge and no conflict
+  markers, forcing it clean, or destroying refs — and it blocks them no matter
+  how narrow the pathspec looks: `git restore <one file>` and
+  `git checkout HEAD -- <one file>` are refused exactly like `git checkout .`.
+  It is NOT "every verb that writes the working tree", and do not reason from
+  that wider rule: `git checkout <branch>`, `git switch <branch>`, `git merge`,
+  `git rebase`, `git cherry-pick` and `git revert` all rewrite the tree from a
+  commit and are ALLOWED BY DESIGN — the loop needs them, and git itself aborts
+  each one rather than clobbering a file you have modified. Reading from git is
+  never blocked.
   **The guard's surface is WIDER than the list above, so do not read that list as
   the complete set of things that will be refused.** Also blocked, and blocked for
   the same reason: bare `git stash` and `git stash branch`; `git worktree remove --force`
@@ -221,6 +228,16 @@ NEEDS: <outside-ownership changes or dependencies you need, if any. Also the
   place to say it if a frozen test you have objected to in CONCERNS is what is
   actually blocking you — name it here so the orchestrator knows the objection
   has a ticket riding on it.>
+CONFIG-TOUCHED: <every build- or test-config file this ticket expects to change,
+  and WHY — pyproject.toml, pytest.ini, setup.cfg, tox.ini, conftest.py,
+  package.json, tsconfig.json, a Makefile/justfile, a jest/vitest/eslint/coverage
+  config. Name them here even when the change is obviously innocent, and name
+  them for the plan as well as the diff: `check-branch` tags exactly these files
+  with an advisory `?` because they are the one class of edit that can move a
+  frozen metric without touching a frozen byte, and it computes that tag AFTER
+  your report exists. A `?` your report already explains is a five-second
+  confirm; a `?` with nothing beside it stalls the merge on a question only you
+  could have answered, and by then you are gone. Write "none" if none.>
 BUGS-OBSERVED: <every defect you noticed ANYWHERE while working — in your
   files, in files you only read, in behavior you observed — whether or not it
   relates to this task. Prefix each item [open], or [fixed] if you repaired it
@@ -260,7 +277,7 @@ CONCERNS: <anything smelling wrong, including tests you believe are incorrect.
 
   The file is append-only (`.swarm-loop/dispatch.jsonl` — verified against `DISPATCH_FILE` in the shipped script); nothing else in the run is changed by writing to it. `--agent`, `--kind` and `--subject` are all required unless you passed `--list` or `--close`. **`--files` is the load-bearing one:** `check-wave` intersects a candidate wave's ownership not only against in-flight *worktrees* but against these records, which is the only protection a ticket worker has against colliding with an orchestrator-owned agent. A dispatch recorded without `--files` still shows up in `--list` but contributes nothing to the wave check. Closing an agent-ref that is not open is recorded anyway with a warning rather than refused. `resume` reads the same open records, so a recorded agent survives a compaction. Run `dispatch --list` at every `resume` and at the top of every wave; a stale open record is a five-second close, and a missing one is two agents on one file.
 - **Model/effort scaling.** Straightforward, well-bounded tasks can go to a faster model if the environment supports per-subagent model selection; keep the default model for anything with design judgment in it. Matching effort to task difficulty is the main cost lever in a swarm.
-- **The report is a claim.** Phase 5 checks it against the diff and Phase 7 checks it against the metrics. Treat `DECISIONS`, `NEEDS`, and `BUGS-OBSERVED` as the valuable part — they feed the codebase map, the ticket backlog, and the scheduler's next dispatch decisions.
+- **The report is a claim.** Phase 5 checks it against the diff and Phase 7 checks it against the metrics. Treat `DECISIONS`, `NEEDS`, `CONFIG-TOUCHED`, and `BUGS-OBSERVED` as the valuable part — they feed the codebase map, the ticket backlog, and the scheduler's next dispatch decisions.
 - **A worker's frozen-test objection is yours to carry, not to file away.** The worker's wall has exactly one door in it and you are it. When a report's CONCERNS names a frozen acceptance test as *wrong* with the four-part evidence — not merely hard — you neither edit it nor bury it: `swarmloop.py escalate --kind frozen-test --subject <test path> --reason "<the worker's evidence>" --proposed "<the change being asked for>" --cycle <N>`, then keep dispatching everything the disputed test does not judge. Judge the evidence before forwarding it: "this test is hard" is the job, and passing that up as an escalation trains the one human in the loop to stop reading escalations. Until the user amends it, the test stands — the retry packet carries it as an unchanged constraint, and the worker's branch still may not touch it. Reply to the worker's objection in the retry packet either way, so the same objection is not re-litigated from scratch by the next agent.
 - **Every SHARED-DOC-OBSERVATION gets a `main`-side check before it becomes an action.** A long-running worker's copy of every orchestrator-owned document is pinned at its branch point while you keep correcting those documents mid-wave, so its findings are *time-shifted*, not wrong. Observed: both `T-010` and `T-011` reported that `public-surface.md` still said "the five trust dimensions" **after** an amendment had made it six and `main` already read six. Cheap per item, but it is a per-finding tax and a false alarm is one careless step from a re-fix of something already fixed — or from telling the next wave something false. Read the line on `main` first; then either answer the worker in its retry packet or fix `main` once. The separate report field exists so the whole class triages in one pass instead of one finding at a time.
 - **Inject learnings selectively.** Only entries relevant to the task's area; a packet stuffed with every lesson ever learned buries the two that matter.

@@ -19,6 +19,8 @@ Subcommands:
   escalate    Ask the USER to change something frozen/blocked (records ONLY)
   frontier    Ready set from the ticket graph (readiness + blast radius)
   check-wave  Refuse a wave whose members could own the same file
+  reads       Read edges the graph does not declare (gates freeze)
+  findings    Record checker findings durably, then mint tickets from them
   red-check   Prove each ticket's verify command FAILS before it is built
   dispatch    Record a dispatched agent / close one (append-only)
   retire      Reclaim worktrees whose work LANDED on main (plain remove, never --force)
@@ -87,6 +89,11 @@ ANALYSIS_DIR = "analysis"
 HISTORY_HEADER = ["cycle", "metric_id", "value", "error", "timestamp", "source"]
 
 SLOPE_EPS = 1e-9  # below this magnitude, treat the error trend as flat
+# A metric command that sends its own output to /dev/null. Matches the shapes a
+# shell actually uses: `>/dev/null`, `> /dev/null`, `2>/dev/null`, `&>/dev/null`,
+# and `>/dev/null 2>&1`. Deliberately NOT matching `2>/dev/null` alone would be
+# wrong — stderr is exactly where a failing runner says why.
+DEVNULL_RE = re.compile(r"(?:\d*|&)\s*>+\s*/dev/null")
 # Relative floor under which a change in a metric's error is float noise rather
 # than progress. Scaled by the previous error so a metric measured in millions
 # and one measured in percent get the same treatment.
@@ -1671,6 +1678,20 @@ def cmd_freeze(args):
                     raise ValueError
             except (TypeError, ValueError):
                 die(f"metric {m['id']}: timeout must be a positive integer number of seconds")
+        # goal-setting.md's rule, enforced instead of merely written. A metric
+        # that throws its own failure output away leaves a zero with no artifact
+        # anywhere: measured cost on one run, four false zeros in six cycles,
+        # four manual re-runs, four different causes, every one of them
+        # rediscovered by hand because the measurement destroyed the evidence.
+        # A freeze is the last cheap moment to say so — after it, changing the
+        # command needs a user-approved amendment.
+        cmd = str(m.get("command") or "")
+        if DEVNULL_RE.search(cmd):
+            die(f"metric {m['id']}: the command discards its own failure output "
+                f"({DEVNULL_RE.search(cmd).group(0)!r}). A zero from this metric will leave no "
+                f"artifact to explain it, and this is the last moment it is cheap to fix — "
+                f"after the freeze the command is frozen bytes and needs an amendment. "
+                f"Redirect to a file instead:  > {STATE_DIR}/reports/<id>-last.log 2>&1")
 
     # B5/H-10: the read-closure check runs HERE — before the goalpost gate, before
     # a single byte is written — because its whole value is that it fires at
@@ -2547,7 +2568,6 @@ def cmd_measure(args):
     # not produce one against a harness it has not checked.
     _integrity_gate(root, d, state, goals, "measure")
     _dupe_metric_ids(goals, warn_only=True)
-    ts = time.strftime("%Y-%m-%dT%H:%M:%S")
     rows, failures = [], []
     print(f"measuring cycle {args.cycle}:")
     for m in goals["metrics"]:
@@ -2575,7 +2595,13 @@ def cmd_measure(args):
                 print("      stderr: " + proc.stderr.strip().splitlines()[-1][:200])
             continue
         err = _error(value, _target(m), m["direction"])
-        rows.append([args.cycle, m["id"], value, err, ts, "measure"])
+        # Stamped HERE, per metric, not once above the loop. Every row of a
+        # cycle used to carry the sweep's START time, so history.csv could not
+        # show per-metric duration — and the timestamp is not decoration: it is
+        # what analyze compares against `last_amended_at` to decide a row is
+        # pre-amendment and therefore stale.
+        rows.append([args.cycle, m["id"], value, err,
+                     time.strftime("%Y-%m-%dT%H:%M:%S"), "measure"])
         mark = "OK " if err == 0 else "   "
         print(f"  {m['id']:<28} value={value:<12g} target={_target(m):<10g} error={err:<12g} {mark}")
     _append_history(root, rows)
@@ -3965,21 +3991,41 @@ def _graph_validate(idx, dupes):
 
 def _graph_depth(idx):
     """{id: longest dependency chain below it}. Cycle-safe (a cycle reports 0)."""
+    # Iterative for the same reason _graph_validate's cycle DFS is: a
+    # hand-edited graph is a PROJECT file, and a deep or pathological chain must
+    # report a number, not a RecursionError out of a harness internal. That
+    # rationale was written once and applied to only one of the three walks.
     depth, busy = {}, set()
-
-    def walk(tid):
-        if tid in depth:
-            return depth[tid]
-        if tid in busy:
-            return 0
-        busy.add(tid)
-        deps = [x for x in _graph_strs(idx.get(tid, {}), "depends_on") if x in idx]
-        depth[tid] = 1 + max([walk(x) for x in deps] or [-1])
-        busy.discard(tid)
-        return depth[tid]
-
-    for tid in idx:
-        walk(tid)
+    for root_tid in idx:
+        if root_tid in depth:
+            continue
+        stack = [(root_tid, None)]
+        while stack:
+            tid, deps_it = stack[-1]
+            if deps_it is None:
+                if tid in depth:
+                    stack.pop()
+                    continue
+                if tid in busy:            # a cycle: contributes 0, as before
+                    depth[tid] = 0
+                    stack.pop()
+                    continue
+                busy.add(tid)
+                deps_it = iter([x for x in _graph_strs(idx.get(tid, {}), "depends_on")
+                                if x in idx])
+                stack[-1] = (tid, deps_it)
+            advanced = False
+            for nxt in deps_it:
+                if nxt not in depth:
+                    stack.append((nxt, None))
+                    advanced = True
+                    break
+            if advanced:
+                continue
+            deps = [x for x in _graph_strs(idx.get(tid, {}), "depends_on") if x in idx]
+            depth[tid] = 1 + max([depth.get(x, 0) for x in deps] or [-1])
+            busy.discard(tid)
+            stack.pop()
     return depth
 
 
@@ -4166,15 +4212,45 @@ def cmd_dispatch(args):
                   if r.get("target_files") else ""))
         return
     if args.close:
-        open_refs = {r["agent_ref"] for r in _open_dispatches(d)}
+        open_recs = _open_dispatches(d)
+        open_refs = {r["agent_ref"] for r in open_recs}
         if args.close not in open_refs:
             print(f"dispatch: {args.close} is not open (open: "
                   + (", ".join(sorted(open_refs)) or "none") + ") — recording the close anyway")
+        # NO VERDICT IS BOUND TO THE SHA IT JUDGED. merge-protocol.md pins the tip
+        # at collection and then says "redo it against the new tip" for the
+        # fix->re-verify loop, and nothing re-pinned or recorded the second
+        # verdict's SHA — so a green from a verifier could be, and was, a green
+        # about a tree that no longer existed. Re-resolve the branch here and say
+        # so out loud when it moved under the agent.
+        prior = next((r for r in open_recs if r["agent_ref"] == args.close), None)
+        branch = args.branch or (prior or {}).get("branch")
+        tip = None
+        if branch:
+            out = _git(root, "rev-parse", "--verify", "--quiet", branch + "^{commit}")
+            tip = (out.stdout or "").strip() or None
+        rec = {"agent_ref": args.close, "action": "close",
+               "closed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+               "note": args.note}
+        if branch:
+            rec["branch"] = branch
+            rec["sha"] = tip
         with open(path, "a") as f:
-            f.write(json.dumps({"agent_ref": args.close, "action": "close",
-                                "closed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                                "note": args.note}, sort_keys=True) + "\n")
+            f.write(json.dumps(rec, sort_keys=True) + "\n")
         print(f"dispatch: {args.close} closed")
+        if branch:
+            was = (prior or {}).get("sha")
+            print(f"  verdict is bound to {branch}@{(tip or 'UNRESOLVABLE')[:12]}")
+            if was and tip and was != tip:
+                print(f"  !! {branch} MOVED since dispatch ({was[:12]} -> {tip[:12]}). Whatever "
+                      "this agent reported was measured against the OLD tip. Re-verify against "
+                      "the tip above before merging, and record THAT verdict — a green about a "
+                      "tree that no longer exists is not a green.")
+            elif was and tip and was == tip:
+                print("  branch is unmoved since dispatch — the verdict is about this tip")
+            elif branch and not tip:
+                print(f"  !! {branch} does not resolve — it was deleted or never created, so "
+                      "there is no tree this verdict can be about")
         return
     missing = [n for n, v in (("--agent", args.agent), ("--kind", args.kind),
                               ("--subject", args.subject)) if not str(v or "").strip()]
@@ -4182,14 +4258,30 @@ def cmd_dispatch(args):
         die("dispatch needs " + " ".join(missing)
             + " (or use --list / --close <agent-ref>)", 3)
     files = [x.strip() for x in (args.files or "").split(",") if x.strip()]
+    # `head` is the ORCHESTRATOR's HEAD and always was; it says nothing about the
+    # branch being judged. --branch pins the tip this dispatch is actually about.
+    tip = None
+    if args.branch:
+        out = _git(root, "rev-parse", "--verify", "--quiet", args.branch + "^{commit}")
+        tip = (out.stdout or "").strip() or None
+    rec = {
+        "agent_ref": args.agent, "action": "open", "kind": args.kind,
+        "subject": args.subject, "target_files": files,
+        "dispatched_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "closed_at": None,
+        "head": _git(root, "rev-parse", "HEAD").stdout.strip() or None,
+    }
+    if args.branch:
+        rec["branch"] = args.branch
+        rec["sha"] = tip
     with open(path, "a") as f:
-        f.write(json.dumps({
-            "agent_ref": args.agent, "action": "open", "kind": args.kind,
-            "subject": args.subject, "target_files": files,
-            "dispatched_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "closed_at": None,
-            "head": _git(root, "rev-parse", "HEAD").stdout.strip() or None,
-        }, sort_keys=True) + "\n")
+        f.write(json.dumps(rec, sort_keys=True) + "\n")
     print(f"dispatch: recorded {args.agent} ({args.kind}) on {args.subject}")
+    if args.branch:
+        print(f"  judging {args.branch}@{(tip or 'UNRESOLVABLE')[:12]}"
+              + ("" if tip else "  !! that branch does not resolve"))
+    else:
+        print("  no --branch given: this dispatch's verdict is bound to no tree, so a "
+              "re-verify after a fix cannot be told apart from the original")
     print(f"  close it at collection:  swarmloop.py dispatch --close {args.agent}")
 
 
@@ -5121,17 +5213,17 @@ def _module_owners(mod, scopes):
 def _dep_closure(idx):
     """{id: every ticket transitively below it}. Cycle-safe; _graph_validate
     reports the cycle separately, this must not hang on one."""
+    # Iterative, same rationale as _graph_depth and _graph_validate.
     out = {}
-
-    def walk(tid, seen):
-        for dep in _graph_strs(idx.get(tid, {}), "depends_on"):
-            if dep in idx and dep not in seen:
-                seen.add(dep)
-                walk(dep, seen)
-        return seen
-
     for tid in idx:
-        out[tid] = walk(tid, set())
+        seen, stack = set(), [tid]
+        while stack:
+            cur = stack.pop()
+            for dep in _graph_strs(idx.get(cur, {}), "depends_on"):
+                if dep in idx and dep not in seen:
+                    seen.add(dep)
+                    stack.append(dep)
+        out[tid] = seen
     return out
 
 
@@ -6403,6 +6495,11 @@ def main():
     s.add_argument("--files", default=None, metavar="A,B",
                    help="files this agent owns — what check-wave intersects against for work "
                         "that has no worktree")
+    s.add_argument("--branch", default=None, metavar="REF",
+                   help="the branch this dispatch JUDGES. Its tip is resolved and recorded at "
+                        "open and again at close, so a verdict is bound to the SHA it was "
+                        "measured against and a branch that moved under the agent is reported "
+                        "instead of silently accepted")
     s.add_argument("--close", default=None, metavar="REF", help="mark a dispatch collected")
     s.add_argument("--note", default=None, metavar="TEXT")
     s.add_argument("--list", action="store_true", dest="do_list",

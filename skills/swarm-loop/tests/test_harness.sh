@@ -3265,6 +3265,96 @@ ck_hasnt "(w) CONTROL: and says nothing about coverage" "CARRY NO FROZEN TEST"
 
 
 # ===========================================================================
+# (x) Verdicts bound to the SHA they judged, and freeze refusing a metric that
+#     destroys its own evidence. Both were rules the docs stated and nothing
+#     enforced.
+# ===========================================================================
+section "(x) dispatch --branch pins the tree a verdict is about  [repo: dsha]"
+mk_repo dsha
+# Commit the ledger on main FIRST. mk_repo leaves .swarm-loop/ untracked, and a
+# later `add -A` on the branch would commit it THERE — so checking main back out
+# deletes dispatch.jsonl from the working tree and the close finds no prior
+# record. That is a fixture trap, not a defect, and it cost three red cases.
+gq add -A; gq commit -qm ledger
+gq branch task/T-010
+sl dispatch --agent v1 --kind verifier --subject T-010 --branch task/T-010
+ck_exit "(x) dispatch records the branch it judges" 0 "$RC"
+ck_has "(x) and prints the tip it is bound to" "judging task/T-010@"
+SHA1="$(git rev-parse task/T-010)"
+# the branch moves under the agent — the fix->re-verify loop merge-protocol.md
+# describes and nothing re-pinned
+gq checkout -q task/T-010
+echo "# a fix landed while the verifier was out" >> src/app.py
+gq add src/app.py; gq commit -qm fix          # ONLY the product file
+gq checkout -q main
+sl dispatch --close v1 --branch task/T-010
+ck_exit "(x) closing it exits 0" 0 "$RC"
+ck_has "(x) a branch that MOVED under the agent is reported, not accepted" "MOVED since dispatch"
+ck_has "(x) and says why that verdict is void" "is not a green"
+ck "(x) the close record carries the NEW sha, not the dispatch-time one" "$(git rev-parse task/T-010)" \
+   "$(python3 -c "
+import json
+recs=[json.loads(l) for l in open('.swarm-loop/dispatch.jsonl') if l.strip()]
+print([r for r in recs if r.get('action')=='close'][-1].get('sha'))")"
+ck "(x) and the open record kept the ORIGINAL sha" "$SHA1" \
+   "$(python3 -c "
+import json
+recs=[json.loads(l) for l in open('.swarm-loop/dispatch.jsonl') if l.strip()]
+print([r for r in recs if r.get('action')=='open'][-1].get('sha'))")"
+
+# an UNMOVED branch must not cry wolf
+gq branch task/T-011
+sl dispatch --agent v2 --kind verifier --subject T-011 --branch task/T-011
+sl dispatch --close v2 --branch task/T-011
+ck_has "(x) CONTROL: an unmoved branch says so plainly" "unmoved since dispatch"
+ck_hasnt "(x) CONTROL: and does not warn" "MOVED since dispatch"
+
+section "(x2) freeze refuses a metric that discards its failure output  [repo: dnull]"
+mk_repo dnull
+python3 - <<'PY'
+import json
+p = ".swarm-loop/goals.json"
+g = json.load(open(p))
+g["metrics"][0]["command"] = "if cat score.txt >/dev/null 2>&1; then echo 100; else echo 0; fi"
+json.dump(g, open(p, "w"), indent=2)
+PY
+gq add -A; gq commit -qm dn
+sl freeze
+ck_exit "(x2) freeze REFUSES a metric redirecting to /dev/null" 1 "$RC"
+ck_has "(x2) naming what it destroys" "discards its own failure output"
+ck_has "(x2) and offering the fix" "reports/"
+ck "(x2) goals were NOT frozen" "False" "$(jget .swarm-loop/goals.json "d['frozen']")"
+
+# every spelling a shell actually uses
+for spell in '2>/dev/null' '&>/dev/null' '> /dev/null'; do
+  python3 - "$spell" <<'PY'
+import json, sys
+p = ".swarm-loop/goals.json"
+g = json.load(open(p))
+g["metrics"][0]["command"] = "cat score.txt %s; echo 100" % sys.argv[1]
+json.dump(g, open(p, "w"), indent=2)
+PY
+  sl freeze
+  ck_exit "(x2) refused for spelling $spell" 1 "$RC"
+done
+
+# CONTROL: redirecting to a FILE keeps the evidence and must freeze
+mk_repo dnull2
+mkdir -p .swarm-loop/reports
+python3 - <<'PY'
+import json
+p = ".swarm-loop/goals.json"
+g = json.load(open(p))
+g["metrics"][0]["command"] = "cat score.txt > .swarm-loop/reports/accept-last.log 2>&1; cat score.txt"
+json.dump(g, open(p, "w"), indent=2)
+PY
+gq add -A; gq commit -qm dn2
+sl freeze
+ck_exit "(x2) CONTROL: redirecting to a file still freezes" 0 "$RC"
+ck_hasnt "(x2) CONTROL: no complaint" "discards its own failure output"
+
+
+# ===========================================================================
 cd / 2>/dev/null || true
 ELAPSED=$(( $(date +%s) - START_TS ))
 echo
