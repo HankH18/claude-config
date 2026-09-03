@@ -1901,16 +1901,42 @@ def _linked_worktrees_under(d: str | None) -> list[str]:
     DIRECTORY, so a vendored checkout under `node_modules` is not probed and
     `rm -rf node_modules` stays allowed; that false block would be far worse
     than this miss. Bounded on every axis — entries scanned, probes issued,
-    depth — because this runs on `rm`."""
+    depth — because this runs on `rm`.
+
+    RETURNS `(found, starved)`. `starved` is the half that was missing, and its
+    absence was a defect: this search could stop early for a reason that has
+    NOTHING to do with the question being asked — how many unrelated directories
+    happen to sit beside the one being protected — and the caller could not tell
+    that from "there is nothing here". Reproduced: with four linked worktrees of
+    some OTHER repository at depth 1, `MAX_CHILD_PROBES` is spent on all four,
+    every one is then discarded by `_is_this_run`, and `worktrees/T-010` two
+    levels down is never reached — so `rm -rf ../*/T-010` went BLOCK -> ALLOW
+    with no guard change at all. Silent, in the ALLOW direction, and it gets
+    likelier as a run scales up, because this skill's whole model is one
+    worktree per ticket.
+
+    WHAT COUNTS AS STARVED, and what deliberately does not. The three DATA-
+    DEPENDENT budgets do: the probe cap, the per-directory entry cap, and the
+    global scan cap all stop the search because of what happens to be lying
+    around next to the target. `MAX_CHILD_DEPTH` does NOT: it is a fixed
+    boundary that applies identically to every layout, it does not vary with the
+    neighbours, and counting it would make `starved` true for essentially every
+    tree deeper than two levels — which would turn the fail-closed rule below
+    into a blanket refusal. That line is drawn on purpose and is stated here so
+    the next reader does not "fix" it by widening it."""
     if not d:
-        return []
+        return [], False
     found: list[str] = []
     frontier = [(d, 0)]
     scanned = 0
+    starved = False
     while frontier and len(found) < MAX_CHILD_PROBES:
         cur, depth = frontier.pop(0)
-        if depth > MAX_CHILD_DEPTH or scanned >= MAX_SCAN_ENTRIES * 4:
+        if scanned >= MAX_SCAN_ENTRIES * 4:
+            starved = True
             continue
+        if depth > MAX_CHILD_DEPTH:
+            continue          # a fixed boundary, not starvation — see above
         entries = []
         try:
             with os.scandir(cur) as it:
@@ -1922,6 +1948,7 @@ def _linked_worktrees_under(d: str | None) -> list[str]:
                     except Exception:
                         pass
                     if len(entries) >= MAX_SCAN_ENTRIES or scanned >= MAX_SCAN_ENTRIES * 4:
+                        starved = True
                         break
         except Exception:
             continue
@@ -1930,12 +1957,16 @@ def _linked_worktrees_under(d: str | None) -> list[str]:
                 if _is_linked_worktree(child):
                     found.append(child)
                     if len(found) >= MAX_CHILD_PROBES:
+                        # Stopped because the budget ran out, not because the
+                        # directory ran out. Whatever was not looked at is
+                        # unknown, and saying so is the entire point.
+                        starved = True
                         break
                     continue
             except Exception:
                 pass
             frontier.append((child, depth + 1))
-    return found
+    return found, starved
 
 
 def _session_family() -> set:
@@ -1977,6 +2008,50 @@ def _is_this_run(root: str | None, wts: list) -> bool:
     return False
 
 
+class Undetermined(str):
+    """A FALSY string: the third element of `_resolve`, carrying WHY the answer
+    is unknown instead of only that it is.
+
+    `determined` was a bare bool, and `check_rm_paths` printed one fixed
+    sentence for it — "the query did not run (no git binary, or it timed out
+    twice)". That sentence became a lie the moment a second way to fail to
+    answer existed. This file has just been through exactly that failure once
+    already, on the refusal FOOTER: text written for one family, stapled to a
+    rule it was false of, read by an autonomous orchestrator with no human to
+    notice. Adding a second undetermined reason under the first one's prose
+    would have reproduced it verbatim, so the reason travels with the verdict.
+
+    Falsy on purpose, so every existing `if not det` / `_resolve(...)[2]` site
+    keeps working unchanged and no caller has to learn a new contract."""
+
+    def __bool__(self) -> bool:
+        return False
+
+
+GIT_UNANSWERED = (
+    "the guard could not ask git whether that path is a repository root, a live "
+    "worktree, or a directory holding live worktrees: the query did not run (no "
+    "git binary, or it timed out twice)."
+)
+
+SEARCH_STARVED = (
+    "the guard could not FINISH looking. The bounded scan for linked worktrees "
+    "under that path hit its budget (at most %d probes, %d levels deep) before "
+    "it reached any tree belonging to this run, and no other probe — the "
+    "command's own directory, the operand's nearest existing ancestor, or the "
+    "directory this hook was launched in — found one either. An empty protected "
+    "set here therefore means `I could not find out`, not `nothing is "
+    "protected`, and a recursive delete is the one operation where guessing "
+    "that wrong is unrecoverable.\n"
+    "FIX — give the guard the authoritative answer instead of a search:\n"
+    "  - run the same command from inside the run's repository or any of its "
+    "worktrees. From there the guard asks `git worktree list` ONCE and gets the "
+    "complete set, with no guessing and nothing to starve.\n"
+    "  - retiring a worktree? `git worktree remove <path>` is allowed, needs no "
+    "search at all, and refuses a worktree with uncommitted changes."
+) % (MAX_CHILD_PROBES, MAX_CHILD_DEPTH)
+
+
 def _resolve(ap: str | None, scan_below: bool = False,
              also: str | None = None) -> tuple:
     """(repo roots, worktree roots, determined) relevant to operand `ap`.
@@ -1985,21 +2060,42 @@ def _resolve(ap: str | None, scan_below: bool = False,
       - `_CWD`, so no verdict that already worked can be lost;
       - the operand's own nearest existing directory — the fix;
       - for a recursive delete, the linked worktrees BELOW it;
+      - for a recursive delete, `_SESSION_ROOT` — the AUTHORITATIVE one, and
+        the fix for the starvation above. The scan below the operand is a
+        heuristic guessing at where a tree might be; `git worktree list
+        --porcelain`, asked from ANY tree of the repo, enumerates every worktree
+        of it exactly. The hook is registered in one place,
+        `<repo>/.claude/settings.local.json`, so the process was launched in the
+        run's repo and `_SESSION_ROOT` IS such a tree — which makes the complete
+        set reachable in one already-cached git call, from any cwd, no matter
+        how many unrelated directories sit beside the target. A starving
+        heuristic is the wrong MECHANISM for a question that has an authoritative
+        answer, not a mechanism with the wrong constant, so the constants are
+        untouched: raising them would buy coverage in rare layouts at the price
+        of latency on EVERY tool call of every agent, and buy it only until some
+        layout is one directory wider.
       - `also`, an extra anchor the CALLER supplies. Exactly one caller does
         (`var_tail_reason`, with `_SESSION_ROOT`), because that rule has an
-        operand there is nothing to resolve FROM. It is a parameter and not a
-        fourth unconditional probe on purpose: every other rule asks git about
-        the operand and is already directory-independent, and widening
-        resolution for all of them is how "every git repository on the machine
-        is undeletable" happened once.
+        operand there is nothing to resolve FROM. It stays a parameter rather
+        than becoming unconditional for ALL rules: widening resolution for every
+        rule is how "every git repository on the machine is undeletable"
+        happened once. The `_SESSION_ROOT` probe added above is confined to
+        `scan_below` — the recursive-delete rules — for that same reason, and it
+        cannot widen the set beyond the run's own trees anyway, because every
+        probe that is not `_CWD` is gated by `_is_this_run`.
+
+    The third element is `True`, or a falsy `Undetermined` carrying WHY.
     """
     roots: list[str] = []
     wts: list[str] = []
-    determined = True
+    undetermined: Undetermined | None = None
     base = _nearest_existing_dir(ap)
     probes = [_CWD, base]
+    starved = False
     if scan_below:
-        probes.extend(_linked_worktrees_under(base))
+        hits, starved = _linked_worktrees_under(base)
+        probes.extend(hits)
+        probes.append(_SESSION_ROOT)
     if also:
         probes.append(also)
     seen = set()
@@ -2008,8 +2104,8 @@ def _resolve(ap: str | None, scan_below: bool = False,
             continue
         seen.add(d)
         r, w, det = _ctx_at(d)
-        if not det:
-            determined = False
+        if not det and undetermined is None:
+            undetermined = Undetermined(GIT_UNANSWERED)
         if d != _CWD and not _is_this_run(r, w):
             continue          # some other repository, not this run's — not ours
         if r and r not in roots:
@@ -2017,7 +2113,18 @@ def _resolve(ap: str | None, scan_below: bool = False,
         for x in w:
             if x not in wts:
                 wts.append(x)
-    return roots, wts, determined
+    # A search that ran out of budget must not answer ALLOW by omission. It says
+    # so ONLY when it also came back with nothing: if any probe produced a tree
+    # of this run, the authoritative `git worktree list` behind it already
+    # returned that repo's COMPLETE worktree set, and what the scan did or did
+    # not reach can no longer change the answer. That pairing is what keeps this
+    # from being a blanket refusal — in a real run `_SESSION_ROOT` is the run's
+    # repo, so this cannot fire at all; it fires when the guard is somewhere it
+    # cannot recognise AND could not finish looking, which is precisely "I could
+    # not find out".
+    if starved and not roots and not wts and undetermined is None:
+        undetermined = Undetermined(SEARCH_STARVED)
+    return roots, wts, (True if undetermined is None else undetermined)
 
 
 def _under(path: str, root: str) -> bool:
@@ -2494,6 +2601,7 @@ def check_rm_paths(args: list[str]) -> str | None:
     """Non-git `rm`. This is the rule the guard was missing entirely."""
     recursive = long_opt_abbrev(args, "--recursive") or short_cluster_has(args, "rRd")
     unknown: str | None = None
+    unknown_why: str = ""
     for op in operands_after_options(args):
         if is_ledger(op) or in_swarm_tree(op):
             # LEDGER, alone among this checker's refusals — one directory, not a
@@ -2527,14 +2635,21 @@ def check_rm_paths(args: list[str]) -> str | None:
             if not collapsed:
                 continue  # `rm -rf "$V"` with V unset is `rm -rf ''` — rm refuses
         # Nothing matched. Was that an ANSWER, or a failure to ask? Only the
-        # second is a reason to refuse.
-        if unknown is None and not _resolve(abs_path(op), scan_below=True)[2]:
-            unknown = op
+        # second is a reason to refuse — and there is now more than one way to
+        # fail to ask, so the refusal quotes the one that actually happened
+        # rather than one fixed sentence about a missing git binary.
+        if unknown is None:
+            det = _resolve(abs_path(op), scan_below=True)[2]
+            if not det:
+                unknown = op
+                unknown_why = str(det)
     if recursive and unknown is not None:
-        return ("`rm -r " + unknown + "` — the guard could not ask git whether that "
-                "path is a repository root, a live worktree, or a directory holding "
-                "live worktrees: the query did not run (no git binary, or it timed "
-                "out twice).\n" + UNDETERMINED_HINT)
+        # Each reason brings its own closing advice. UNDETERMINED_HINT says "fix
+        # git", which is true of a missing binary and false of a search that ran
+        # out of budget — the same mismatched-footer defect this file has
+        # already been bitten by once, so the two are kept apart.
+        tail = ("\n" + UNDETERMINED_HINT) if unknown_why == GIT_UNANSWERED else ""
+        return "`rm -r " + unknown + "` — " + unknown_why + tail
     return None
 
 

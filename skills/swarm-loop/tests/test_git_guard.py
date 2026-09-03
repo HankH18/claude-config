@@ -465,6 +465,25 @@ MUST_BLOCK = [
     # ...and the glob is still seen through the wrappers everything else is.
     ("rm-rf-glob-bash-c",     'bash -c "rm -rf ../worktrees/*"'),
     ("rm-rf-glob-after-and",  "echo tearing down && rm -rf ../worktrees/*"),
+
+    # -- worktree discovery STARVED by sibling directories -------------------
+    #    See build_starvation_repos. Each of these was ALLOW on the committed
+    #    guard for a reason that has nothing to do with the command: four
+    #    unrelated worktrees happened to sit next to the target and spent the
+    #    scan's budget. They are absolute paths, so they mean the same thing
+    #    from every cwd and need no CWD_EXPECT entry — which is the point: the
+    #    verdict must not depend on where anyone is standing OR on what else is
+    #    lying around.
+    ("starve-glob-star-mid",   "rm -rf {STARVE}/*/T-777"),
+    ("starve-glob-parent",     "rm -rf {STARVE}/worktree*"),
+    ("starve-glob-bracket",    "rm -rf {STARVE}/*/[Tt]-777"),
+    ("starve-glob-catchall",   "rm -rf {STARVE}/worktrees/*"),
+    #    The parent itself CONTAINS a live worktree, two levels down.
+    ("starve-parent-itself",   "rm -rf {STARVE}"),
+    #    ...and the control that says the fixture really does hold a live
+    #    worktree: naming it outright was blocked even while starved, because
+    #    that operand resolves onto the worktree without any search at all.
+    ("starve-literal",         "rm -rf {STARVE}/worktrees/T-777"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -925,6 +944,25 @@ MUST_ALLOW = [
     ("ansic-harmless",        "printf $'%s\\n' ok"),
     ("blob-alone",            "echo " + BLOB),
     ("blob-in-commit-msg",    'git commit -m "' + BLOB + '"'),
+
+    # -- the closest LEGITIMATE neighbours of every starvation block above ---
+    #    Resolving the run's worktrees authoritatively must not turn into
+    #    "every directory near a worktree is undeletable". A false block here
+    #    is worse than the gap that was just closed.
+    #    A ticket that does not exist: the glob matches nothing live.
+    ("starve-glob-no-such-ticket", "rm -rf {STARVE}/*/T-999"),
+    #    A FOREIGN repo's worktree, sitting in the same directory as the run's.
+    #    The guard is session-scoped; deleting someone else's throwaway
+    #    worktree is not its business, and `_is_this_run` is what says so.
+    ("starve-foreign-worktree",    "rm -rf {STARVE}/sv-decoy-0"),
+    ("starve-foreign-repo",        "rm -rf {DECOYSRC}"),
+    #    A glob that matches only the decoys — near-miss on `worktrees`.
+    ("starve-glob-decoys-only",    "rm -rf {STARVE}/sv-decoy-*"),
+    #    Build junk INSIDE each worktree: a per-component glob must not read
+    #    `*/node_modules` as naming the worktrees themselves.
+    ("starve-glob-inner-junk",     "rm -rf {STARVE}/*/node_modules"),
+    #    Nothing of this run's is anywhere below these, starved scan or not.
+    ("starve-blind-non-recursive", "rm -f {BLIND}/build"),
 ]
 
 
@@ -1684,7 +1722,106 @@ def build_repo(root):
                          % (st.stdout, st.stderr))
 
     build_ledger_repos(root)
+    build_starvation_repos(root, repo)
     return repo
+
+
+def build_starvation_repos(root, repo):
+    """The layout that makes worktree DISCOVERY answer a question nobody asked:
+    how many unrelated directories happen to sit BESIDE the one being protected.
+
+    `_linked_worktrees_under` is a bounded breadth-first scan — at most
+    `MAX_CHILD_PROBES` linked worktrees, at most `MAX_CHILD_DEPTH` levels. Put
+    exactly `MAX_CHILD_PROBES` linked worktrees of some OTHER repository at
+    depth 1 and the budget is spent on all of them; every one is then discarded
+    by `_is_this_run` as not this run's, and the run's own worktree one level
+    below is never reached. The protected set comes back empty, and an empty
+    protected set read as "nothing is protected" is an ALLOW.
+
+    Measured on the committed guard, same command, only the decoy count varying
+    (the full transcript is in the commit message):
+
+        decoys=3   rm -rf <parent>/*/T-010     BLOCK
+        decoys=4   rm -rf <parent>/*/T-010     ALLOW      <- the defect
+        decoys=4   rm -rf <parent>/worktree*   ALLOW
+        decoys=4   rm -rf <parent>/worktrees/T-010  BLOCK (names the path outright)
+
+    The threshold is exactly `MAX_CHILD_PROBES` and it is ORDER-INDEPENDENT: all
+    four decoys sit at depth 1, so they are all found while scanning the parent
+    itself, and the loop exits before anything at depth 2 is ever popped — no
+    matter what order `os.scandir` returns. That is why the decoy count is
+    derived from the guard's own constant below rather than hard-coded: raise
+    the constant and this fixture keeps testing starvation instead of quietly
+    testing nothing.
+
+    WHY IT IS BURIED THIS DEEP (`starve-nest/x/...`). These fixtures are
+    themselves linked worktrees, so placed nearer the top they would starve the
+    scans that every OTHER case in this file depends on — which is not a
+    hypothetical: the previous agent hit exactly that and worked around it by
+    nesting. Sitting at depth 3, they are past `MAX_CHILD_DEPTH` from `root` and
+    cannot perturb anything. That a test fixture has to be hidden from the code
+    under test to avoid changing unrelated verdicts IS the defect, in miniature.
+    """
+    import re as _re
+    m = _re.search(r"^MAX_CHILD_PROBES = (\d+)", open(HOOK).read(), _re.M)
+    if not m:
+        raise SystemExit("test setup failed: MAX_CHILD_PROBES not found in the hook")
+    n_decoys = int(m.group(1))
+
+    nest = os.path.join(root, "starve-nest", "x")
+    src = os.path.join(nest, "decoy-src")
+    os.makedirs(src)
+
+    def g(cwd, *args):
+        p = subprocess.run(["git", "-C", cwd] + list(args), env=git_env(root),
+                           capture_output=True, text=True)
+        if p.returncode != 0:
+            raise SystemExit("test setup failed: git -C %s %s\n%s%s"
+                             % (cwd, " ".join(args), p.stdout, p.stderr))
+
+    for cmd in (["init", "-q"], ["config", "user.email", "t@example.invalid"],
+                ["config", "user.name", "t"], ["config", "commit.gpgsign", "false"]):
+        g(src, *cmd)
+    with open(os.path.join(src, "f.py"), "w") as f:
+        f.write("f = 1\n")
+    g(src, "add", "-A")
+    g(src, "commit", "-qm", "f")
+
+    starve = os.path.join(nest, "starve")
+    blind = os.path.join(nest, "blind")
+    blind2 = os.path.join(nest, "blind2")
+    # `starve` and `blind` get a full budget of decoys, so the scan is starved.
+    # `blind2` gets one short of it, so the scan FINISHES — the control that
+    # says the refusal comes from running out of budget and not merely from
+    # standing outside a repository.
+    for d, tag, count in ((starve, "sv", n_decoys), (blind, "bl", n_decoys),
+                          (blind2, "b2", max(1, n_decoys - 2))):
+        os.makedirs(d)
+        for i in range(count):
+            g(src, "worktree", "add", "-q", "-b", "%s-%d" % (tag, i),
+              os.path.join(d, "%s-decoy-%d" % (tag, i)), "HEAD")
+    # ...and THE thing the starved scan never reaches: a worktree of the RUN's
+    # repo, one level below the decoys. `blind`/`blind2` deliberately have no
+    # such worktree — they are the "could not find out" fixtures.
+    os.makedirs(os.path.join(starve, "worktrees"))
+    g(repo, "worktree", "add", "-q", "-b", "task/T-777",
+      os.path.join(starve, "worktrees", "T-777"), "HEAD")
+
+    # The fixture's discriminating properties, asserted rather than assumed: a
+    # miscounted decoy or a worktree that did not take would make every case
+    # below pass for the wrong reason.
+    decoys = [e for e in sorted(os.listdir(starve))
+              if os.path.isfile(os.path.join(starve, e, ".git"))]
+    if len(decoys) != n_decoys:
+        raise SystemExit("test setup failed: %d decoy worktrees at depth 1 of %s, "
+                         "need exactly MAX_CHILD_PROBES=%d"
+                         % (len(decoys), starve, n_decoys))
+    if not os.path.isfile(os.path.join(starve, "worktrees", "T-777", ".git")):
+        raise SystemExit("test setup failed: {STARVE}/worktrees/T-777 is not a "
+                         "linked worktree")
+    if os.path.isdir(os.path.join(src, SWARM_DIR)):
+        raise SystemExit("test setup failed: the decoy repo must NOT carry %s, "
+                         "or _is_this_run would accept its worktrees" % SWARM_DIR)
 
 
 def build_ledger_repos(root):
@@ -2078,10 +2215,19 @@ def with_git_c(cmd, target):
 # runner
 # ---------------------------------------------------------------------------
 
-def run_payload(repo, env, payload):
+def run_payload(repo, env, payload, proc_cwd=None):
     """The hook process ALWAYS starts in the primary checkout. For the cwd cases
-    that is the point: any verdict that changes must come from the payload."""
-    p = subprocess.run([sys.executable, HOOK], input=payload, cwd=repo, env=env,
+    that is the point: any verdict that changes must come from the payload.
+
+    `proc_cwd` overrides that, and it is the ONLY way to reach one rule. The
+    guard captures its own launch directory as `_SESSION_ROOT` — the run's repo,
+    because the hook is registered in exactly one place — and asks git there
+    when nothing nearer answers. Everything in this file that runs from `repo`
+    therefore has an authoritative answer available, which is correct and is
+    also why the fail-closed branch below is unreachable without this parameter.
+    See PROC_CWD_CASES."""
+    p = subprocess.run([sys.executable, HOOK], input=payload,
+                       cwd=proc_cwd or repo, env=env,
                        capture_output=True, text=True)
     return p.returncode, p.stderr
 
@@ -2365,6 +2511,64 @@ TEXT_CASES = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# PROCESS-CWD cases — the axis no command string and no payload can express
+# ---------------------------------------------------------------------------
+#
+# A bounded search that runs out of budget must not answer ALLOW by omission.
+# The guard's own precedent is that an unclassifiable recursive `rm` is the ONE
+# rule that fails CLOSED, on the reasoning that guessing wrong there is
+# unrecoverable; a scan that could not finish is the same kind of not-knowing,
+# so it joins that rule rather than quietly deciding.
+#
+# Reaching it needs the hook PROCESS to start somewhere that is not the run's
+# repository, because `_SESSION_ROOT` otherwise supplies the authoritative
+# worktree list and the search cannot decide anything. That is not a contrivance
+# to be apologised for — it is the measurement that says the fail-closed branch
+# CANNOT fire in a real run, and the third case below is what pins that claim.
+#
+# (name, want, process cwd, payload cwd, command, must-contain, must-NOT-contain)
+_MCP = int(re.search(r"^MAX_CHILD_PROBES = (\d+)",
+                     open(HOOK).read(), re.M).group(1))
+_MCD = int(re.search(r"^MAX_CHILD_DEPTH = (\d+)",
+                     open(HOOK).read(), re.M).group(1))
+
+PROC_CWD_CASES = [
+    # Starved AND blind: no probe found anything of this run's, and the scan
+    # stopped because it ran out of budget rather than because it ran out of
+    # directories. That is "I could not find out", and it refuses.
+    ("starved-blind-fails-closed", BLOCK, "{ELSEWHERE}", "{BLIND}",
+     "rm -rf {BLIND}/build",
+     ["could not FINISH looking",
+      "at most %d probes, %d levels deep" % (_MCP, _MCD),
+      "run the same command from inside the run's repository",
+      "`git worktree remove <path>` is allowed"],
+     # It must not borrow the OTHER undetermined reason's prose. That sentence
+     # is about a missing git binary and would be a lie here — the same
+     # mismatched-footer defect this file has already been bitten by once.
+     ["no git binary, or it timed out twice"] + _SAFE_HINT_ONLY),
+    # THE CONTROL, and the case that makes the one above mean something: the
+    # identical shape, identical cwds, one decoy fewer, so the scan FINISHES.
+    # Empty protected set, but this time it is an ANSWER. Without this, the
+    # block above is equally well explained by "outside a repository = refuse",
+    # which would be a false block on every teardown in a scratch directory.
+    ("unstarved-blind-allows", ALLOW, "{ELSEWHERE}", "{BLIND2}",
+     "rm -rf {BLIND2}/build", [], []),
+    # ...and the same starving layout with the hook launched where it actually
+    # IS launched. `_SESSION_ROOT` answers authoritatively, the starved scan
+    # stops being the deciding voice, and the verdict goes back to ALLOW. This
+    # is the case that says the fail-closed branch cannot fire in a live run.
+    ("starved-but-session-root-answers", ALLOW, None, "{BLIND}",
+     "rm -rf {BLIND}/build", [], []),
+    # The starvation defect itself, from OUTSIDE the repository — the directory
+    # the run grants with `--add-dir` and the natural place to stand for a
+    # teardown loop. `_SESSION_ROOT` is what makes this one blockable at all.
+    ("starved-real-worktree-still-blocks", BLOCK, None, "{STARVE}",
+     "rm -rf {STARVE}/*/T-777",
+     ["that is a live worktree root"], []),
+]
+
+
 def build_matrix(repo, root):
     """Every case, at every cwd, under every prefix. Returns (name, payload,
     want, kind) tuples. Three of the four axes derive their expectation instead
@@ -2444,6 +2648,15 @@ def fill_paths(obj, repo, root):
     {FOREIGN}   a git repository that is not this run's.
     {SCRATCH}   a scratch directory holding a repository AND a worktree of it,
                 still not this run's. This suite's own temp dir is this shape.
+    {STARVE}    a directory holding exactly MAX_CHILD_PROBES linked worktrees of
+                a FOREIGN repo at depth 1, and one worktree of THIS RUN at depth
+                2 under `worktrees/`. The bounded scan spends its whole budget
+                on the decoys and never reaches the real one.
+    {BLIND}     the same starving shape with nothing of this run's below it at
+                all — the layout where the guard genuinely cannot find out.
+    {BLIND2}    {BLIND} with one decoy fewer, so the scan FINISHES. The control
+                that says a refusal came from the budget, not from the cwd.
+    {DECOYSRC}  the foreign repository those decoy worktrees belong to.
     {DIRTYRUN}  a run repo on `main` whose `.swarm-loop` is TRACKED and holds
                 uncommitted changes — the state Phase 7 actually pushes from.
     {DIRTYWT}   a worker worktree of {DIRTYRUN}, on `task/T-010`. The ledger it
@@ -2473,7 +2686,12 @@ def fill_paths(obj, repo, root):
                    .replace("{SWARM}", os.path.join(repo, SWARM_DIR))
                    .replace("{SUB}", os.path.join(repo, "vendor", "sub"))
                    .replace("{FOREIGN}", os.path.join(root, "foreign-clone"))
-                   .replace("{SCRATCH}", os.path.join(root, "scratch")))
+                   .replace("{SCRATCH}", os.path.join(root, "scratch"))
+                   .replace("{STARVE}", os.path.join(root, "starve-nest", "x", "starve"))
+                   .replace("{BLIND2}", os.path.join(root, "starve-nest", "x", "blind2"))
+                   .replace("{BLIND}", os.path.join(root, "starve-nest", "x", "blind"))
+                   .replace("{DECOYSRC}", os.path.join(root, "starve-nest", "x",
+                                                       "decoy-src")))
     if isinstance(obj, dict):
         return dict((k, fill_paths(v, repo, root)) for k, v in obj.items())
     return obj
@@ -2502,7 +2720,8 @@ def main():
                     + [n for n, _, _ in PAYLOAD_CASES]
                     + [n for n, _, _, _ in ENV_CASES]
                     + [n for n, _, _ in MALFORMED_PAYLOADS]
-                    + [n for n, _, _, _ in TEXT_CASES])
+                    + [n for n, _, _, _ in TEXT_CASES]
+                    + [n for n, _, _, _, _, _, _ in PROC_CWD_CASES])
         dupes = sorted({n for n in declared if declared.count(n) > 1})
         if dupes:
             print("TEST_GIT_GUARD: duplicate case names: %s" % ", ".join(dupes))
@@ -2593,6 +2812,35 @@ def main():
                                               frag),
                         payload, BLOCK, got, text, "text"))
 
+        # Process-cwd cases: exit code AND text, since the whole point of the
+        # starved branch is that it says WHY it could not answer.
+        for (pname, pwant, pproc, pcwd, pcmd, pmust, pmust_not) in PROC_CWD_CASES:
+            payload = json.dumps({
+                "tool_name": "Bash", "cwd": fill_paths(pcwd, repo, root),
+                "tool_input": {"command": fill_paths(pcmd, repo, root)}})
+            got, stderr = run_payload(
+                repo, env, payload,
+                proc_cwd=fill_paths(pproc, repo, root) if pproc else None)
+            text = stderr or ""
+            by_kind["proccwd"] = by_kind.get("proccwd", 0) + 1
+            if got == pwant:
+                passed += 1
+                if verbose:
+                    print("  ok    %-40s exit %d" % (pname, got))
+            else:
+                failures.append((pname, payload, pwant, got, text, "proccwd"))
+            for frag, want_present in ([(f, True) for f in pmust]
+                                       + [(f, False) for f in pmust_not]):
+                by_kind["proccwd"] = by_kind.get("proccwd", 0) + 1
+                if (frag in text) == want_present:
+                    passed += 1
+                else:
+                    failures.append((
+                        "%s :: must %s %r" % (pname,
+                                              "CONTAIN" if want_present else "NOT contain",
+                                              frag),
+                        payload, pwant, got, text, "text"))
+
         label = {BLOCK: "BLOCK (exit 2)", ALLOW: "ALLOW (exit 0)"}
         for name, payload, want, got, stderr, kind in failures:
             kindlabel = "MISSED BLOCK" if want == BLOCK else "FALSE BLOCK"
@@ -2611,9 +2859,10 @@ def main():
 
         print("")
         print("  declared: %d block  %d allow  %d payload  %d env  %d malformed"
-              "  %d text"
+              "  %d text  %d proccwd"
               % (len(MUST_BLOCK), len(MUST_ALLOW), len(PAYLOAD_CASES),
-                 len(ENV_CASES), len(MALFORMED_PAYLOADS), len(TEXT_CASES)))
+                 len(ENV_CASES), len(MALFORMED_PAYLOADS), len(TEXT_CASES),
+                 len(PROC_CWD_CASES)))
         print("  cells run: " + "  ".join(
             "%s=%d" % (k, by_kind[k]) for k in sorted(by_kind)))
         print("TEST_GIT_GUARD: PASS=%d FAIL=%d" % (passed, len(failures)))
