@@ -6372,6 +6372,14 @@ print(swarmloop._ticket_test_nodes(os.getcwd(), state, "T-1")[1])
 PY
 )"
 
+# NOTE, because this pair was measured NON-DISCRIMINATING on its own and the
+# note is the only thing that stops it being re-read as proof: this fixture's
+# stand-in pytest prints the requested node ids back verbatim in "ok" mode,
+# which is byte-identical in SHAPE to real pytest's `ERROR: not found: <nodeid>`
+# echo. So these two lines passed identically over tests that were collected and
+# over tests that could not be collected at all. What discriminates them is
+# section V4, whose stand-in emits the real error shapes and whose assertions
+# are the ones that go red if the echo is counted again. Keep both.
 sl red-check --ticket T-1
 ck_exit "V2 CONTROL: a gate whose own tests DO get collected is still a real gate" 0 "$RC"
 ck_has "V2 CONTROL: ...and says so" "frozen test(s) survive collection here"
