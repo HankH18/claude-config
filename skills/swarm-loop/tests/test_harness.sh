@@ -6613,6 +6613,15 @@ if "--collect-only" in sys.argv:
             print("%s[2]" % a)
         print("%d tests collected in 0.01s" % (2 * len(args)))
         sys.exit(0)
+    if mode == "listed-rc4":
+        # Every requested node id listed as a real collected item, AND a
+        # non-zero exit. Real pytest's own error lines are filtered by
+        # _probe_noise, so this shape is what tests the OTHER guard -- the one
+        # that reads the collect-only return code -- independently of it.
+        for a in args:
+            print(a)
+        print("%d tests collected in 0.01s" % len(args))
+        sys.exit(4)
     if mode == "silent":
         sys.exit(5)
     if mode == "desel":
@@ -6691,6 +6700,27 @@ ck_has "V4 ...and is counted as surviving collection" \
 ck_hasnt "V4 ...with no rootdir story invented to explain it" \
          "rootdir/path-shape difference"
 
+# TWO INDEPENDENT GUARDS, and this case is what keeps them independent. Filtering
+# pytest's error lines and requiring exit 0 both close the echo defect on the
+# measured shape, so either one alone makes the other look redundant -- and a
+# guard that no case distinguishes is a guard the next edit deletes. Here every
+# node id is listed as a genuinely collected item and pytest still exits
+# non-zero: the line filter cannot see anything wrong, and only the return code
+# can. `ok` is an affirmative claim; a runner that refused the run has not
+# earned it.
+echo listed-rc4 > FAKE_MODE
+gq add -A; gq commit -qm listedrc4
+sl red-check --close --ticket T-1
+ck_hasnt "V4 every node id LISTED but pytest exited non-zero is not 'ok'" \
+         "frozen test(s) survive collection here"
+ck_has "V4 ...it says the collect run did not complete cleanly" \
+       "did not complete cleanly"
+ck_hasnt "V4 ...and it is NOT rendered as the nonsense 'only N of N'" \
+         "only 1 of 1"
+ck_exit "V4 ...and an unexplained non-zero collect is advisory, not a refusal" 0 "$RC"
+ck "V4 ...the stamp records it, so the merge gate can see it" "unconfirmed" \
+   "$(python3 -c 'import json;print(json.loads(open(".swarm-loop/redcheck.jsonl").read().splitlines()[-1]).get("selection"))')"
+
 # THE STAMP CARRIES THE PROBE'S ANSWER. Without it, a `red` stamped over a gate
 # whose grading tests could not be collected at all is byte-identical IN THE
 # LEDGER to a `red` whose grading tests were observed running — and the merge
@@ -6761,7 +6791,7 @@ section "V5 the /dev/null match is anchored to the test run  [repo: rdevnull]"
 mk_repo rdevnull
 
 ck "V5 the anchoring table, in one shot (1 = SWALLOWED)" \
-   "1 0 0 1 0 1 0 0 1 0" \
+   "1 0 0 1 0 1 0 0 1 0 1 0" \
    "$(python3 - <<'PY'
 import os, sys
 sys.path.insert(0, os.environ["SL_DIR"])
@@ -6785,6 +6815,12 @@ cases = [
     "pytest -q tests > .swarm-loop/reports/t1.log 2>&1; exit 1",
     "go test ./... > /dev/null 2>&1; echo '1 failed'; exit 1",
     "mkdir -p out 2>/dev/null; pytest -q tests",
+    # QUOTED SEPARATORS, both directions. A regex split on ; && || | cuts inside
+    # quotes, and the false NEGATIVE it produces hides the exact shape the check
+    # exists for: the redirect lands on a fragment with no runner while the
+    # runner lands on a fragment with no redirect.
+    'pytest -q -k "a;b" > /dev/null 2>&1; echo "1 failed"; exit 1',
+    "echo 'a|b' >/dev/null; pytest -q tests",
 ]
 print(" ".join("1" if s._swallowing_redirect(c) else "0" for c in cases))
 PY

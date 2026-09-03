@@ -133,7 +133,54 @@ DEVNULL_RE = re.compile(r"(?:\d*|&)\s*>+\s*/dev/null")
 # worse than the gap being closed.
 #
 # So: split the command into shell segments, and decide per segment.
-_SEGMENT_RE = re.compile(r"(?:\|\||&&|;|\||\n)")
+#
+# QUOTE-AWARE, hand-rolled, because `re.split(r"\|\||&&|;|\||\n")` splits inside
+# quotes and that cuts BOTH ways here: `pytest -q -k "a;b" >/dev/null 2>&1;
+# echo '1 failed'` splits into `pytest -q -k "a` and `b" >/dev/null 2>&1`, so the
+# redirect ends up on a fragment with no runner in it while the runner ends up on
+# a fragment with no redirect — and the false NEGATIVE hides exactly the shape
+# the check exists for. Not a shell parser and not trying to be: quotes and
+# backslash escapes only, which is all a `verify` string has ever needed.
+_SEGMENT_SEPS = (("||", 2), ("&&", 2), (";", 1), ("|", 1), ("\n", 1))
+
+
+def _shell_segments(cmd):
+    """`cmd` split on UNQUOTED ; && || | and newline. Empty pieces dropped."""
+    out, buf = [], []
+    quote = None
+    i, n = 0, len(cmd or "")
+    while i < n:
+        ch = cmd[i]
+        if quote:
+            buf.append(ch)
+            if ch == "\\" and quote == '"' and i + 1 < n:
+                buf.append(cmd[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in "'\"":
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            buf.append(ch)
+            buf.append(cmd[i + 1])
+            i += 2
+            continue
+        hit = next((ln for sep, ln in _SEGMENT_SEPS if cmd.startswith(sep, i)), None)
+        if hit:
+            out.append("".join(buf))
+            buf = []
+            i += hit
+            continue
+        buf.append(ch)
+        i += 1
+    out.append("".join(buf))
+    return [s for s in out if s.strip()]
 # A segment that RUNS TESTS. Positive evidence, deliberately: if the redirect is
 # on this, the count parsed downstream cannot have come from it.
 TEST_RUNNER_RE = re.compile(
@@ -171,7 +218,7 @@ def _swallowing_redirect(cmd):
     positive unreadable: `'>/dev/null'` says nothing about which command's output
     went there.
     """
-    segments = [s for s in _SEGMENT_RE.split(cmd or "") if s.strip()]
+    segments = _shell_segments(cmd or "")
     redirected = [s for s in segments if DEVNULL_RE.search(s)]
     if not redirected:
         return None
@@ -6136,6 +6183,18 @@ def _selection_probe(wt, nodes, timeout, unparsed=()):
 
     if rc == 0 and hits == len(nodes) and not desel:
         return "ok", ("all %d frozen test(s) survive collection here" % len(nodes)) + tail
+    if hits == len(nodes) and not collect_error and not desel:
+        # Every id listed AND a non-zero exit. Not `ok` (the runner refused the
+        # run it was asked to do) and emphatically not `partial`, which used to
+        # catch this and render it as the nonsense "only N of N frozen test(s)
+        # survive collection here". This is also the case that keeps the two
+        # echo guards independent: the line filter sees nothing wrong here, and
+        # only the return code can.
+        return "unconfirmed", (
+            "pytest LISTED all %d of this ticket's frozen test(s) and then exited %d — the "
+            "collect-only run it was asked to do did not complete cleanly, so this is not a "
+            "positive observation. ADVISORY: read the collect output by hand%s"
+            % (len(nodes), rc, tail))
     if hits and not collect_error:
         return "partial", ("only %d of %d frozen test(s) survive collection here%s"
                            % (hits, len(nodes),
@@ -6471,11 +6530,13 @@ def cmd_red_check(args):
                                     pdetail))
                 elif pv == "partial":
                     extra.append("partial selection — %s" % pdetail)
-                elif pv == "uncollectable":
+                elif pv in ("uncollectable", "unconfirmed"):
                     # NEVER a refusal, and the reason is measured: the throwaway
                     # worktree has no venv, so an ImportError on a third-party
                     # dependency is the DEFAULT for any project that has any.
                     # Refusing here would refuse every ticket in such a project.
+                    # `unconfirmed` rides along for the same reason — an exit
+                    # code nobody can explain is not evidence against a branch.
                     extra.append("UNVERIFIED — %s" % pdetail)
                 elif pv == "unknown" and _unparsed:
                     extra.append("UNVERIFIED — %s" % pdetail)
