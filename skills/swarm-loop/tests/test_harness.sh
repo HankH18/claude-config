@@ -4127,6 +4127,226 @@ ck_has "(z) and that is exit 1" "exit=1"
 
 
 # ===========================================================================
+# (y3) push-gate — an UNANSWERABLE rung is NOT a pass.
+#
+# The gate shipped printing, one line apart, "1 mechanical condition(s) this
+# command could NOT answer ... they are not passes." and "the mechanical
+# conditions are MET", at exit 0 — so `push-gate --cycle N && git push` spent an
+# unread rung as a passed one. That is the defect class the command was written
+# to remove, reappearing inside it. Both directions are pinned here, because a
+# refusal that fires on everything is not an improvement: the SAME fixture
+# clears at exit 0 before the rung is broken and refuses at exit 1 after.
+# ===========================================================================
+section "(y3) push-gate: an unanswered rung is not a pass  [repo: pgunans]"
+mk_repo pgunans
+sl freeze
+gq add -A; gq commit -qm freeze
+sl measure --cycle 1 --timeout 60
+sl analyze --cycle 1
+sl checkpoint --cycle 1
+echo "cycle 2 product change" >> src/app.py
+gq add -A; gq commit -qm c2
+sl measure --cycle 2 --timeout 60
+sl analyze --cycle 2
+sl checkpoint --cycle 2
+gq add .swarm-loop; gq commit -qm "epoch 2 ledger"
+
+# POSITIVE CONTROL, first and on the same fixture: a genuinely met gate clears.
+sl push-gate --cycle 2
+ck_exit "(y3) control: a genuinely met gate still exits 0" 0 "$RC"
+ck_has "(y3) control: and says so" "the mechanical conditions are MET"
+ck_has "(y3) control: with all five mechanical rungs answered here" \
+       "5 of the gate's conditions are mechanical and were scored here"
+sl push-gate --cycle 2 --json
+ck_exit "(y3) control: --json agrees on the exit code" 0 "$RC"
+ck_has "(y3) control: --json verdict is clear" '"verdict": "clear"'
+ck_has "(y3) control: --json counts five mechanical rungs" '"mechanical_conditions": 5'
+ck_has "(y3) control: all five of them answered" '"mechanical_answered": 5'
+ck_has "(y3) control: and nothing left unanswered" '"unanswered": []'
+
+# Now break exactly ONE rung's ability to answer, and nothing else: a state.json
+# that predates the tracked_files key — a run resumed across a skill upgrade.
+python3 - <<'PY'
+import json
+p = ".swarm-loop/state.json"
+s = json.load(open(p))
+for h in s.get("head_history", []):
+    h.pop("tracked_files", None)
+json.dump(s, open(p, "w"), indent=2)
+PY
+gq add .swarm-loop; gq commit -qm "state.json predating tracked_files"
+sl push-gate --cycle 2
+ck_exit "(y3) an UNANSWERABLE rung refuses the push, exactly like a FAIL" 1 "$RC"
+ck_has "(y3) the rung is marked UNANSWERABLE, not PASS" \
+       "UNANSWERABLE  this epoch's tracked-file count"
+ck_has "(y3) and the verdict line says DO NOT PUSH" "push-gate: DO NOT PUSH"
+ck_has "(y3) naming it as UNANSWERED rather than as a failure" "condition(s) UNANSWERED"
+ck_has "(y3) and naming WHICH rung went unanswered" "UNANSWERED: tracked-files"
+ck_has "(y3) in the gate's own words" "an unanswered rung is not a met one"
+# The whole defect in one assertion: these two sentences appeared together.
+ck_hasnt "(y3) and it must NOT also report the conditions met" \
+         "the mechanical conditions are MET"
+# The header count is a property of the GATE and must not shrink to the subset
+# it managed to read — "4 of the gate's conditions are mechanical" is how a
+# partial answer looks complete.
+ck_has "(y3) the mechanical rung COUNT does not degrade to the answered subset" \
+       "5 of the gate's conditions are mechanical"
+ck_has "(y3) the header states the split instead" "4 answered here, 1 UNANSWERABLE"
+# The operator checklist is still printed — an unanswerable rung must not also
+# swallow the two conditions no command can score.
+ck_has "(y3) the operator conditions are still printed on the refusal path" \
+       "OPERATOR      this epoch's integrations landed green"
+
+sl push-gate --cycle 2 --json
+ck_exit "(y3) --json refuses on the same rung" 1 "$RC"
+ck_has "(y3) --json verdict is 'unanswerable', never 'clear'" '"verdict": "unanswerable"'
+ck_hasnt "(y3) --json must not call it clear" '"verdict": "clear"'
+ck_has "(y3) --json still counts five mechanical rungs" '"mechanical_conditions": 5'
+ck_has "(y3) --json says only four were answered" '"mechanical_answered": 4'
+ck_has "(y3) --json names the unanswered rung for a machine reader" '"tracked-files"'
+
+# ===========================================================================
+# (y4) push-gate — the analysis rung's integrity check had no red path.
+#
+# It read `harness_integrity == "VIOLATED"`, and nothing can ever write that:
+# `analyze` is the only writer of analysis/cycle-N.json and it routes through
+# `_integrity_gate`, which die()s on VIOLATED before the file is saved. A new
+# refusal with no reachable red path, added by the change whose stated purpose
+# was removing gates with no red path. It now reads POSITIVELY — anything that
+# is not "intact" is not a pass — which is reachable, and a file predating the
+# key is UNANSWERABLE rather than a silent pass.
+# ===========================================================================
+section "(y4) push-gate: the analysis integrity rung, positively  [repo: pgunans]"
+cd "$TMP/pgunans" || exit 1
+python3 - <<'PY'
+import json
+p = ".swarm-loop/state.json"
+s = json.load(open(p))
+for i, h in enumerate(s.get("head_history", [])):
+    h["tracked_files"] = 40 + i     # restore the key the (y3) block stripped
+json.dump(s, open(p, "w"), indent=2)
+PY
+gq add .swarm-loop; gq commit -qm "state.json with tracked_files back"
+
+# CONTROL first: the untouched analysis passes, and says on what grounds.
+sl push-gate --cycle 2
+ck_exit "(y4) control: an intact analysis clears the gate" 0 "$RC"
+ck_has "(y4) control: and the rung says WHY it passed" "records harness_integrity=intact"
+
+# The reachable red path the old '== VIOLATED' comparison could not see.
+python3 - <<'PY'
+import json
+p = ".swarm-loop/analysis/cycle-2.json"
+a = json.load(open(p)); a["harness_integrity"] = "tampered"
+json.dump(a, open(p, "w"), indent=2)
+PY
+gq add .swarm-loop; gq commit -qm "analysis records a non-intact integrity"
+sl push-gate --cycle 2
+ck_exit "(y4) an analysis whose integrity is not 'intact' refuses the push" 1 "$RC"
+ck_has "(y4) the analysis rung is the one marked FAIL" \
+       'FAIL          `analyze` did not exit 1'
+ck_has "(y4) quoting the value it actually found" "harness_integrity='tampered'"
+ck_has "(y4) and saying what the rung requires" "not 'intact'"
+ck_hasnt "(y4) and the gate does not report the conditions met" \
+         "the mechanical conditions are MET"
+
+# The sibling hand-edit guard on this same rung, which had no case either.
+python3 - <<'PY2'
+import json
+p = ".swarm-loop/analysis/cycle-2.json"
+a = json.load(open(p)); a["cycle"] = 99
+json.dump(a, open(p, "w"), indent=2)
+PY2
+gq add .swarm-loop; gq commit -qm "analysis recording someone else's cycle"
+sl push-gate --cycle 2
+ck_exit "(y4) an analysis recording another cycle refuses" 1 "$RC"
+ck_has "(y4) naming both numbers" "records cycle 99, not 2"
+python3 - <<'PY2'
+import json
+p = ".swarm-loop/analysis/cycle-2.json"
+a = json.load(open(p)); a["cycle"] = 2
+json.dump(a, open(p, "w"), indent=2)
+PY2
+gq add .swarm-loop; gq commit -qm "analysis cycle restored"
+
+# The historical value still refuses — the old branch's intent is preserved.
+python3 - <<'PY'
+import json
+p = ".swarm-loop/analysis/cycle-2.json"
+a = json.load(open(p)); a["harness_integrity"] = "VIOLATED"
+json.dump(a, open(p, "w"), indent=2)
+PY
+gq add .swarm-loop; gq commit -qm "analysis records VIOLATED"
+sl push-gate --cycle 2
+ck_exit "(y4) a VIOLATED integrity still refuses" 1 "$RC"
+ck_has "(y4) named" "harness_integrity='VIOLATED'"
+
+# A file written before the key existed: not a pass and not a failure. It must
+# not read as a pass, which is what '== VIOLATED' did with an absent key.
+python3 - <<'PY'
+import json
+p = ".swarm-loop/analysis/cycle-2.json"
+a = json.load(open(p)); a.pop("harness_integrity", None)
+json.dump(a, open(p, "w"), indent=2)
+PY
+gq add .swarm-loop; gq commit -qm "analysis predating harness_integrity"
+sl push-gate --cycle 2
+ck_exit "(y4) an analysis predating the key is UNANSWERABLE, not a pass" 1 "$RC"
+ck_has "(y4) marked as such on the rung" 'UNANSWERABLE  `analyze` did not exit 1'
+ck_has "(y4) explaining what is missing" "carries no harness_integrity"
+ck_hasnt "(y4) and it is not laundered into a met gate" \
+         "the mechanical conditions are MET"
+
+# ===========================================================================
+# (y5) push-gate — the fail path the reorder left unsatisfiable.
+#
+# F7: the gate moved to the END of Phase 8, AFTER the epoch report is written
+# and committed, but its fail-path instruction still read "name the failing item
+# in the epoch report" with nothing said about committing that note. Obeying it
+# re-dirtied .swarm-loop/ and flipped the gate's LAST rung to FAIL on the re-run
+# — a refusal the operator created by following the instruction. This is that
+# sequence, mechanically: the middle step is the reproduction and the last step
+# is the fix SKILL.md and the command's own refusal text now both prescribe.
+# ===========================================================================
+section "(y5) push-gate: recording a refusal must not create one  [repo: pgnote]"
+mk_repo pgnote
+sl freeze
+gq add -A; gq commit -qm freeze
+sl measure --cycle 1 --timeout 60
+sl analyze --cycle 1
+sl checkpoint --cycle 1
+echo "# cycle 1" > .swarm-loop/reports/cycle-1.md
+sl dispatch --agent V-7 --kind verifier --subject "batch e1-b1"
+gq add .swarm-loop; gq commit -qm "epoch 1: report + ledger"
+
+sl push-gate --cycle 1
+ck_exit "(y5) the gate refuses on the outstanding verifier" 1 "$RC"
+ck_has "(y5) that is the rung that failed" "rung2-returned"
+ck_has "(y5) and the ledger rung is clean at this point" \
+       'PASS          everything `.swarm-loop/` holds is committed'
+ck_has "(y5) the refusal text tells you to commit the note it asks for" \
+       "COMMIT that amendment"
+
+# Obey the instruction as it USED to read — write the note, commit nothing.
+echo "- push declined: rung2-returned (V-7 outstanding)" >> .swarm-loop/reports/cycle-1.md
+sl push-gate --cycle 1
+ck_exit "(y5) still refusing" 1 "$RC"
+ck_has "(y5) REPRODUCED: an uncommitted note flips the LAST rung to FAIL too" \
+       'FAIL          everything `.swarm-loop/` holds is committed'
+ck_has "(y5) naming the report the operator was told to write" "reports/cycle-1.md"
+
+# Obey it as it reads now.
+gq add .swarm-loop; gq commit -qm "cycle 1: push declined — rung2-returned"
+sl push-gate --cycle 1
+ck_exit "(y5) and the real rung still refuses, as it should" 1 "$RC"
+ck_has "(y5) still the outstanding verifier" "rung2-returned"
+ck_has "(y5) but the ledger rung is clean again — no self-inflicted second failure" \
+       'PASS          everything `.swarm-loop/` holds is committed'
+ck_hasnt "(y5) and nothing invents a ledger failure" \
+         'FAIL          everything `.swarm-loop/` holds is committed'
+
+
+# ===========================================================================
 cd / 2>/dev/null || true
 ELAPSED=$(( $(date +%s) - START_TS ))
 echo

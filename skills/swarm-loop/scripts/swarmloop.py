@@ -6700,10 +6700,36 @@ def _push_gate_analysis(d, cycle):
         return "FAIL", ("no measurement at cycle %d for: %s. 'analyze' exits 1 on this, "
                         "and the table it printed is not a verdict on this cycle — "
                         "re-measure before pushing" % (cycle, ", ".join(stale)))
-    if a.get("harness_integrity") == "VIOLATED":
-        return "FAIL", ("%s was written while the frozen harness read VIOLATED — the "
-                        "numbers in it are void whatever 'verify' says now" % rel)
-    return "PASS", ("%s exists, records cycle %d, and no metric is stale" % (rel, cycle))
+    # Read POSITIVELY: the rung passes only on the one value that means the
+    # numbers were written against a verified-intact harness.
+    #
+    # This was `== "VIOLATED"`, a refusal that could not fire: `analyze` is the
+    # only writer of this file and it routes through `_integrity_gate`, which
+    # `die()`s on VIOLATED before `save_json` is ever reached — so no file on
+    # disk can carry that string, and a violated-at-analyze-time epoch has no
+    # cycle-N.json at all (caught above by 'does not exist'). A rung that reads
+    # as a live guard and cannot fire is exactly what this command was added to
+    # remove. What CAN happen is what the cycle-mismatch guard above already
+    # guards for — a hand-edited or copied file — plus a file written by another
+    # tool or a future schema; any value that is not "intact" means nothing here
+    # has established that the harness was sound when these numbers were taken.
+    integ = a.get("harness_integrity")
+    if integ is None:
+        # An analysis written before this key existed. Not a pass and not a
+        # failure: the question cannot be answered from the file. UNANSWERABLE
+        # blocks the push exactly like FAIL, so this degrades safely.
+        return "UNANSWERABLE", ("%s carries no harness_integrity — it predates the key "
+                                "(a run resumed across a skill upgrade), so whether the "
+                                "harness was intact when these numbers were written is "
+                                "not recorded. Re-run 'verify' and 'analyze --cycle %d', "
+                                "or read the epoch report by hand." % (rel, cycle))
+    if integ != "intact":
+        return "FAIL", ("%s records harness_integrity=%r, not 'intact' — nothing here "
+                        "establishes that the frozen harness was sound when those numbers "
+                        "were taken, and no later 'verify' makes them retroactively sound. "
+                        "Re-run 'analyze --cycle %d'." % (rel, integ, cycle))
+    return "PASS", ("%s exists, records cycle %d, records harness_integrity=intact, and "
+                    "no metric is stale" % (rel, cycle))
 
 
 def _push_gate_tracked(state, cycle):
@@ -6760,8 +6786,11 @@ def cmd_push_gate(args):
     A false PASS is the expensive direction, so every rung that cannot be answered
     is printed as unanswered rather than counted.
 
-    Exit 0 = every mechanical rung passed (the two operator rungs are still
-    yours). Exit 1 = do not push. Never exit 2: this is not a terminal signal.
+    Exit 0 = every mechanical rung was ANSWERED and passed (the two operator
+    rungs are still yours). Exit 1 = do not push — which covers a rung that came
+    back UNANSWERABLE just as much as one that FAILED, because a gate that could
+    not read one of its own conditions has not cleared it. Never exit 2: this is
+    not a terminal signal.
     """
     root = repo_root()
     d = sd(root)
@@ -6861,22 +6890,43 @@ def cmd_push_gate(args):
     failed = [c for c in conds if c["status"] == "FAIL"]
     unans = [c for c in conds if c["status"] == "UNANSWERABLE"]
     scored = [c for c in conds if c["status"] in ("PASS", "FAIL")]
+    # D-1b: an UNANSWERABLE rung blocks exactly like a FAIL. It used not to, and
+    # the command then printed "1 mechanical condition(s) this command could NOT
+    # answer ... they are not passes." and "the mechanical conditions are MET"
+    # one line apart, at exit 0 — so `push-gate --cycle N && git push` spent the
+    # unanswered rung as a pass. Two real producers reach it: a state.json that
+    # predates the tracked_files key (a run resumed across a skill upgrade) and
+    # `git status` itself failing, which is the D-1 rung. The sibling `conflicts`
+    # draws the same line for the same reason, and this command's own docstring
+    # says which direction is the expensive one: a false PASS.
+    blocking = failed + unans
 
     if args.as_json:
         print(json.dumps({
             "cycle": cycle,
-            "verdict": "blocked" if failed else "clear",
+            # Three verdicts, not two: "clear" must never be the word for a gate
+            # that could not read one of its own rungs.
+            "verdict": ("blocked" if failed else ("unanswerable" if unans else "clear")),
             "push_remote": mode,
-            "mechanical_conditions": len(scored),
+            # The count of mechanical rungs is a property of the GATE and does
+            # not shrink when one of them cannot be read — it used to be
+            # len(scored), so an unanswered rung silently turned "5 of 7" into
+            # "4 of 7" and the subset looked complete.
+            "mechanical_conditions": len(scored) + len(unans),
+            "mechanical_answered": len(scored),
+            "unanswered": [c["id"] for c in unans],
             "gate_conditions_total": len(scored) + len(unans) + len(PUSH_GATE_OPERATOR),
             "conditions": conds,
             "operator_checklist": [{"id": i, "condition": c, "why_unmechanizable": w}
                                    for i, c, w in PUSH_GATE_OPERATOR],
         }, indent=2))
-        sys.exit(1 if failed else 0)
+        sys.exit(1 if blocking else 0)
 
-    print("push-gate cycle %d (push-remote %s): %d of the gate's conditions are mechanical "
-          "and were scored here" % (cycle, mode, len(scored)))
+    print("push-gate cycle %d (push-remote %s): %d of the gate's conditions are mechanical%s"
+          % (cycle, mode, len(scored) + len(unans),
+             " and were scored here" if not unans else
+             " — %d answered here, %d UNANSWERABLE (an unanswered rung is not a pass)"
+             % (len(scored), len(unans))))
     for c in conds:
         if c["status"] == "NOTE":
             print("      note: %s" % _oneline(c["detail"], 200))
@@ -6894,11 +6944,21 @@ def cmd_push_gate(args):
     if unans:
         print("  --- %d mechanical condition(s) this command could NOT answer (above, "
               "UNANSWERABLE) — they are not passes." % len(unans))
-    if failed:
-        print("push-gate: DO NOT PUSH — %d condition(s) unmet: %s"
-              % (len(failed), ", ".join(c["id"] for c in failed)))
-        print("Name each in the epoch report with why, and carry the push to the next "
-              "epoch's gate. Do not push a subset and do not push anyway.")
+    if blocking:
+        if failed:
+            print("push-gate: DO NOT PUSH — %d condition(s) unmet: %s"
+                  % (len(failed), ", ".join(c["id"] for c in failed)))
+        if unans:
+            print("push-gate: DO NOT PUSH — %d condition(s) UNANSWERED: %s. This gate has "
+                  "not cleared: an unanswered rung is not a met one. Each line above says "
+                  "how to answer it by hand."
+                  % (len(unans), ", ".join(c["id"] for c in unans)))
+        print("Name each in the epoch report with why, COMMIT that amendment (`git add %s "
+              "&& git commit`) — the report was already committed before this gate ran, so "
+              "an uncommitted note re-dirties %s and this gate's last rung fails on the "
+              "re-run for a reason you created by obeying this line — then carry the push "
+              "to the next epoch's gate. Do not push a subset and do not push anyway."
+              % (STATE_DIR, STATE_DIR))
         sys.exit(1)
     print("push-gate: the mechanical conditions are MET. This is not permission to push — "
           "score the operator conditions above first, then push and verify each remote's "
