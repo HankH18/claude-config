@@ -555,7 +555,27 @@ def run_mutations(verbose):
             c = os.path.join(work, "swarmloop.py")
             for src, dst in ((PRODUCER, p), (INTAKE, i), (CODE, c)):
                 shutil.copyfile(src, dst)
+            before = [open(x, "rb").read() for x in (p, i, c)]
             fn(p, i, c)
+            after = [open(x, "rb").read() for x in (p, i, c)]
+
+            # A mutation that no longer applies is the worst outcome available:
+            # it silently degrades into "the unmutated files still pass", and
+            # every cell under it becomes a lie. Several of these anchor on
+            # literal text in files other agents edit, so this is checked, not
+            # assumed.
+            cells += 1
+            if before == after:
+                fails.append((
+                    "META", name, name,
+                    "mutation %r changed NOTHING — the text it anchors on is gone "
+                    "from the copied files, so the cells below it were measuring "
+                    "the unmutated contract. Re-aim the mutation at text that "
+                    "exists; do not delete it." % name))
+                continue
+            if verbose:
+                print("  ok    %-30s mutation applied" % name)
+
             got = {(cc, ff) for cc, ff, _l, _m in run_checks(p, i, c)[1]}
             new = got - baseline
             for sig in want:
@@ -596,16 +616,25 @@ def run_mutations(verbose):
 # PINNED: the AST pass is not the regex, measured on the REAL file
 # ---------------------------------------------------------------------------
 
-# (field, min regex hits, exact ticket-read sites, what the extra hits are)
+# (field, min gap, exact ticket-read sites or None, what the extra hits are)
 # These are the naive-detector traps that actually exist in swarmloop.py at
 # HEAD. If one of them disappears, this pin must be RE-AIMED at another trap,
 # not deleted — deleting it removes the only proof the detector earns its cost.
+#
+# What is pinned is the GAP (regex hits minus real ticket reads), not the raw
+# counts, because scripts/swarmloop.py is a moving file and pinning absolutes
+# is how a test goes stale over a change it should not care about. Measured:
+# a merge that added the `push-gate` and `conflicts` subcommands took the naive
+# count for `verify` from 5 to 8 while the AST pass held at 2 — the gap grew,
+# which is the claim, and an absolute pin would have gone red over nothing.
+# `acceptance` keeps an exact 0 because "the AST pass reads it ZERO times" IS
+# the load-bearing half of that case.
 REGEX_TRAPS = [
     ("acceptance", 2, 0,
      'os.path.join(d, "acceptance") — a DIRECTORY name, twice'),
-    ("reads", 8, 4,
+    ("reads", 4, None,
      'res["reads"] (the reads-scanner result dict) and the "reads" subcommand'),
-    ("verify", 3, 2,
+    ("verify", 2, None,
      'the "verify" argparse subcommand and a minted-ticket dict literal'),
 ]
 
@@ -613,24 +642,32 @@ REGEX_TRAPS = [
 def run_pins(verbose):
     cells, fails = 0, []
     sites, _ = code_field_sites(CODE)
-    for field, min_regex, want_sites, why in REGEX_TRAPS:
+    for field, min_gap, want_sites, why in REGEX_TRAPS:
         got_regex = naive_regex_count(CODE, field)
         got_sites = len(sites.get(field) or [])
+        gap = got_regex - got_sites
+        ok = gap >= min_gap
+        if want_sites is None:
+            ok = ok and got_sites >= 1
+        else:
+            ok = ok and got_sites == want_sites
         cells += 1
-        if got_regex >= min_regex and got_sites == want_sites:
+        if ok:
             if verbose:
-                print("  ok    %-30s regex=%d ast=%d (%s)"
-                      % ("pin-regex-trap-" + field, got_regex, got_sites, why))
+                print("  ok    %-30s regex=%d ast=%d gap=%d (%s)"
+                      % ("pin-regex-trap-" + field, got_regex, got_sites, gap, why))
             continue
         fails.append((
             "PIN", field, "code-detector",
             "the pinned regex trap for `%s` no longer holds: a naive quoted-name "
-            "scan finds %d occurrence(s) (pinned >= %d) and the AST pass finds %d "
-            "ticket read(s) (pinned %d). Expected extras: %s.\n"
+            "scan finds %d occurrence(s), the AST pass finds %d ticket read(s), so "
+            "the over-count gap is %d (pinned >= %d, sites pinned %s). Expected "
+            "extras: %s.\n"
             "              If swarmloop.py legitimately changed, RE-AIM this pin "
             "at another trap; do not delete it — it is the only proof the AST "
             "pass answers a different question than the regex."
-            % (field, got_regex, min_regex, got_sites, want_sites, why)))
+            % (field, got_regex, got_sites, gap, min_gap,
+               want_sites if want_sites is not None else ">= 1", why)))
     return cells, fails
 
 

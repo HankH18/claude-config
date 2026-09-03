@@ -97,9 +97,12 @@ Consumer classes:
 | `owns` | `code` | Silent fallback to `scope` globs — `check-wave` prints `owns(scope)` and the wave check you just ran was the coarse one, in both directions. |
 | `owned_files` | `code` | Alias for `owns`, read second. Absence is normal; it only matters when a project spells the per-file map with this key. |
 | `reads` | `code` | `swarmloop.py reads --write` derives and fills it; until then the packet carries no "import this, never write it" edge and `freeze`'s closure gate is the first thing to notice. |
+| `provides` | `packet-prose` | Packet carries no *outbound* obligation, so the ticket ships a port that satisfies only its own tests. Consumed by the **Packets** rule below, by hand. No code path, by design. |
+| `conforms_to` | `packet-prose` | Intake gate **D** never fires for this ticket: no frozen conformance test is written, and a worker is free to build a parallel surface with the arguments reversed. Consumed by a person at intake, into `acceptance/`. No code path, by design. |
 | `depends_on` | `code` | The ticket becomes a graph ROOT and the readiness scheduler dispatches it immediately, before the work it actually needs exists. |
 | `non_goals` | `packet-prose` | Packet's **Boundaries** section is empty and the worker's scope creep has nothing to hit. No code path. |
 | `parallel_safe` | `advisory-recorded` | Nothing. `check-wave` prints an advisory line when it is `false` and dispatches on per-file ownership regardless — the flag is unusable as a predicate in both directions. |
+| `bootstrap` | `code` | **OPEN DEFECT — this row is red on purpose.** templates.md documents `"bootstrap": true` as exempting T-0 from the must-go-red check, and `cmd_red_check` has never heard of it: T-0's verify legitimately passes on the scaffold's own smoke test, so red-check scores the graph's sole root VACUOUS and refuses the whole run. Routed as a separate fix to `red-check`. Do NOT resolve this by demoting the row — the producer's promise is the thing that has to become true. |
 | `finding_id` | `loop-minted` | Written by `swarmloop.py findings`; its absence is how the mint loop tells a build-docs ticket from one of its own, so re-minting would duplicate. |
 | `severity` | `loop-minted` | Written by `swarmloop.py findings` from the audit record; the mint report cannot rank or threshold without it. |
 | `location` | `loop-minted` | Written verbatim from the finding; without it the minted ticket names no file and `_finding_scope` derives no ownership. |
@@ -301,6 +304,15 @@ surface. Rule it explicitly at intake, and rule it **as a frozen conformance tes
 (`the ticket's double IS-A LLMDouble`) rather than prose — prose in a packet is
 read once; a test is checked every cycle.
 
+**The field is `conforms_to`, and this gate IS its consumer.** build-docs emits it
+(`"conforms_to": ["conform: tests/doubles.LLMDouble"]`, or prefixed `replace:`) and
+`scripts/swarmloop.py` reads it nowhere — deliberately, because the ruling this gate
+makes is not a dispatch decision the harness could take. What consumes `conforms_to`
+is a person running this gate at intake and turning each entry into a test in
+`acceptance/`, where `freeze` then grades it every cycle. A ticket that carries
+`conforms_to` and no matching frozen conformance test has had this gate skipped, and
+the T-0 scaffold's surface is unguarded for that ticket.
+
 
 ## Per-cycle rules under intake
 
@@ -316,8 +328,11 @@ read once; a test is checked every cycle.
   worktree, the git prohibitions, the discretion tiers, `BUGS-OBSERVED`, the current
   baseline. Include the ticket's R-IDs so reports trace to requirements. **Add the
   two edges `scope` cannot carry:** the ticket's `reads` ("import these, never write
-  them") and its *outbound* obligation ("you are shipping this port for T-032's and
-  T-033's tests, not only your own") — an unstated cross-ticket obligation is exactly
+  them") and its `provides` — the *outbound* obligation ("you are shipping this port
+  for T-032's and T-033's tests, not only your own"). `provides` has **no code
+  consumer and is not supposed to have one**; it is prose the worker reads out of the
+  packet, and writing it into the packet by hand is the only thing that consumes it.
+  An unstated cross-ticket obligation is exactly
   how a ticket ships a port that satisfies only itself.
 - **Re-planning:** discovered reality that invalidates un-started tickets → rewrite
   the un-started tail of the backlog (EXECUTION.md and this loop agree on this). It
