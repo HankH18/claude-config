@@ -47,6 +47,17 @@ background. Read it; never edit it.
 - Worktree (absolute path): <path>   — do all work here
 - Branch: task/<task-id>             — already created and checked out
 - Branch point: <sha>                — the commit your worktree was cut from
+- Scratch: <scratch-root>/<task-id>/ — yours alone; the ROOT is shared
+
+  The scratch ROOT is shared with every other lane in this wave and is NOT
+  isolated the way your worktree is: a file you write there under a guessable
+  name can be read, overwritten, or EXECUTED by a sibling. Two lanes once wrote
+  a probe script at the same path and one of them ran it with ANOTHER lane's
+  worktree as cwd; it died on a nonexistent path and no damage was done, which
+  was luck, not design. So every temporary file you create — probe scripts,
+  dumps, notes — goes under the private subdirectory above, carries a name
+  unique to this ticket, and any script that acts on your ticket's code is run
+  with YOUR worktree as cwd — never a sibling's.
 
   The shared, orchestrator-owned documents in your worktree — decisions.md,
   public-surface.md, backlog.md, learnings.md, the codebase map — are a
@@ -66,7 +77,8 @@ background. Read it; never edit it.
 The GOALS above are frozen; your ROUTE to them is not. Three tiers:
 - Tier 1 — free, no permission needed: your implementation approach and design
   within your owned files, including abandoning the plan sketched in this
-  packet when the evidence says it is wrong (say so in DECISIONS); new files
+  packet when the evidence says it is wrong (the decision goes in DECISIONS,
+  the disproved claim in PREMISES-FALSIFIED); new files
   within your scope; adding tests and assertions (always free); fixing any bug
   you find INSIDE your ownership even when it is not part of this task —
   commit that fix separately and list it in BUGS-OBSERVED, marked fixed.
@@ -155,6 +167,24 @@ permission to change its own route has misread this packet.
   `swarmloop.py restore-harness` — an orchestrator-only command you never run —
   and a branch that writes under `.swarm-loop/` is vetoed by `check-branch`
   before anyone reads it. Report the damage.
+- YOUR OWN SUB-AGENTS ARE READ-ONLY IN THIS WORKTREE. Nothing you spawn writes
+  a file here. The moment a second agent holds a Write tool in your tree, your
+  tree is a shared working tree, and every reason the swarm gives each worker
+  its own applies again one level down. Measured: a lane running the adversarial
+  pass its packet asked for spawned siblings that mutated the tree it was
+  building in — one watched `if False:` appear in a source file between its own
+  restore and its next read and had to throw its entire first pass away, and
+  another was told it could revert source with `git checkout`, with 112
+  uncommitted lines of the lane's own fix sitting in the tree; the PreToolUse
+  git-guard was the only thing standing between that instruction and the loss.
+  Read-only sub-agents are permitted and are not free — they cost context,
+  wall-clock and spend — so spawn the few you need, never all you can. An agent
+  that must MUTATE in order to test — sabotage, mutation testing — works on a
+  copy under YOUR OWN scratch subdirectory, never inside this worktree and never
+  anywhere under the measured repo. Everything in this block binds at every
+  depth of the spawn tree, the repo-global git prohibition above most of all,
+  and you own what they write: a violation by an agent you spawned rejects YOUR
+  branch. Disjoint file scopes are not disjoint state, at any depth.
 - TESTS ARE APPEND-ONLY. Adding tests/assertions: free, encouraged. Modifying or
   deleting an EXISTING assertion requires the `justify-test-edit` ritual — and
   that includes every disguise: changing an expected value, widening a tolerance,
@@ -192,6 +222,17 @@ failed, and what to do differently. Do not repeat the failed approach.>
      `python -c "import <pkg>; print(<pkg>.__file__)"`, `command -v <cli>`. Every
      path must be INSIDE this worktree; one that is not means you are measuring
      main's code, not yours.
+     **Run this on the module your ticket CHANGES and on every module your
+     verify command imports — never on whichever package is handy.** Measured:
+     from one worktree, one package resolved inside it and TWELVE resolved to
+     the primary checkout, so a spot-check that happens to pick the one passes
+     while the module you were sent to change is main's. A virtualenv records
+     ABSOLUTE paths of the checkout it was built in and your worktree has no
+     interpreter of its own, so cwd and inherited env are not the whole
+     story — a recorded absolute entry is consulted regardless of either, and a
+     clean cwd and a cleared env are necessary and not sufficient. Canonicalize BOTH sides before you compare them
+     (`Path(...).resolve()`, `realpath`) — a symlinked checkout or venv makes
+     the raw strings differ for a path that is genuinely inside your tree.
   2. **Flip a value in a file you own** (a return value, a constant), re-run your
      verify, and **confirm the result moves.** Restore the flip.
   If it does not move, your commands are resolving outside your worktree — report it
@@ -264,6 +305,22 @@ failed, and what to do differently. Do not repeat the failed approach.>
   are going to report**, and make the step's last line a READ of the thing —
   the file is present, the row is there, the symbol resolves, the count is N —
   that exits non-zero when it is not. A step that cannot fail has not passed.
+- **The packet is a hypothesis, not a set of facts — measure a premise before
+  you build on it.** Measured, in one wave's briefs: a file:line citation
+  warning that a rewritten module's public surface "may have moved", when the
+  surface was byte-identical and only the line number had drifted; a recovered
+  defect forwarded WITH a prescribed fix that did not cover the reporting
+  lane's own broader reproduction, so both halves were needed and only one was
+  sent; an instruction to build and test against a stub service structurally
+  incapable of serving the routes the ticket needed. None of the three cost
+  real work, because every lane measured the premise instead of accepting it.
+  So: every file:line here may have drifted, a named test or target may be the
+  wrong one, and a prescribed fix is a starting point rather than a solution —
+  you hold the reproduction and the constraint, and deriving the fix is yours.
+  List every premise that did not survive contact under PREMISES-FALSIFIED. You
+  are the only agent standing where this brief can be falsified, and a lane
+  that merely follows its brief builds the wrong thing and reports the failure
+  as its own.
 - Commit in coherent increments with clear messages. Uncommitted work is lost.
 
 ## Report format (return exactly this structure)
@@ -292,6 +349,18 @@ BUGS-OBSERVED: <every defect you noticed ANYWHERE while working — in your
   in this branch (in-ownership drive-by fixes only, committed separately).
   Per item: file:line (or a reproduction), the evidence you saw, suspected
   cause if you have one. Write "none" if none.>
+PREMISES-FALSIFIED: <every factual claim in this packet you found to be false —
+  a file:line that had drifted, a named test or target that was the wrong one,
+  a prescribed fix that did not cover the reproduction, a service or fixture
+  that could not do what the packet said it did. Quote the packet's claim and
+  give what you measured instead.
+  This field is about THIS PACKET's own assertions, measured against your
+  worktree — not CONCERNS (your objection to a frozen goal), not
+  SHARED-DOC-OBSERVATIONS (what a shared document says on its own), and not
+  BUGS-OBSERVED (a defect in the code). The decision you took because a premise
+  was false still goes in DECISIONS; the disproved claim itself goes here,
+  because nothing else in this loop ever checks the orchestrator's own text.
+  Write "none" if none.>
 SHARED-DOC-OBSERVATIONS: <anything in an orchestrator-owned SHARED document
   that looks wrong or stale — decisions.md, public-surface.md, backlog.md,
   learnings.md, the codebase map. These go here and NOT in BUGS-OBSERVED,
@@ -325,7 +394,7 @@ CONCERNS: <anything smelling wrong, including tests you believe are incorrect.
 
   The file is append-only (`.swarm-loop/dispatch.jsonl` — verified against `DISPATCH_FILE` in the shipped script); nothing else in the run is changed by writing to it. `--agent`, `--kind` and `--subject` are all required unless you passed `--list` or `--close`. **`--files` is the load-bearing one:** `check-wave` intersects a candidate wave's ownership not only against in-flight *worktrees* but against these records, which is the only protection a ticket worker has against colliding with an orchestrator-owned agent. A dispatch recorded without `--files` still shows up in `--list` but contributes nothing to the wave check. Closing an agent-ref that is not open is recorded anyway with a warning rather than refused. `resume` reads the same open records, so a recorded agent survives a compaction. Run `dispatch --list` at every `resume` and at the top of every wave; a stale open record is a five-second close, and a missing one is two agents on one file.
 - **Model/effort scaling.** Straightforward, well-bounded tasks can go to a faster model if the environment supports per-subagent model selection; keep the default model for anything with design judgment in it. Matching effort to task difficulty is the main cost lever in a swarm.
-- **The report is a claim.** Phase 5 checks it against the diff and Phase 7 checks it against the metrics. Treat `DECISIONS`, `NEEDS`, `CONFIG-TOUCHED`, and `BUGS-OBSERVED` as the valuable part — they feed the codebase map, the ticket backlog, and the scheduler's next dispatch decisions.
+- **The report is a claim.** Phase 5 checks it against the diff and Phase 7 checks it against the metrics. Treat `DECISIONS`, `NEEDS`, `CONFIG-TOUCHED`, `BUGS-OBSERVED` and `PREMISES-FALSIFIED` as the valuable part — they feed the codebase map, the ticket backlog, and the scheduler's next dispatch decisions.
 - **A worker's frozen-test objection is yours to carry, not to file away.** The worker's wall has exactly one door in it and you are it. When a report's CONCERNS names a frozen acceptance test as *wrong* with the four-part evidence — not merely hard — you neither edit it nor bury it: `swarmloop.py escalate --kind frozen-test --subject <test path> --reason "<the worker's evidence>" --proposed "<the change being asked for>" --cycle <N>`, then keep dispatching everything the disputed test does not judge. Judge the evidence before forwarding it: "this test is hard" is the job, and passing that up as an escalation trains the one human in the loop to stop reading escalations. Until the user amends it, the test stands — the retry packet carries it as an unchanged constraint, and the worker's branch still may not touch it. Reply to the worker's objection in the retry packet either way, so the same objection is not re-litigated from scratch by the next agent.
 - **Every SHARED-DOC-OBSERVATION gets a `main`-side check before it becomes an action.** A long-running worker's copy of every orchestrator-owned document is pinned at its branch point while you keep correcting those documents mid-wave, so its findings are *time-shifted*, not wrong. Observed: both `T-010` and `T-011` reported that `public-surface.md` still said "the five trust dimensions" **after** an amendment had made it six and `main` already read six. Cheap per item, but it is a per-finding tax and a false alarm is one careless step from a re-fix of something already fixed — or from telling the next wave something false. Read the line on `main` first; then either answer the worker in its retry packet or fix `main` once. The separate report field exists so the whole class triages in one pass instead of one finding at a time.
 - **Inject learnings selectively.** Only entries relevant to the task's area; a packet stuffed with every lesson ever learned buries the two that matter.
@@ -379,25 +448,86 @@ is what makes `..` the correct operator here; it has been verified twice, do not
 - Check resolution provenance — did this batch's greens execute the branch's own
   source? For at least one claim per ticket, print the path the runtime actually
   loaded (`require.resolve(…)`, `module.__file__`, `command -v` for a CLI) and
-  confirm it sits inside the tree under test. A green resolved out of the primary
+  confirm it sits inside the tree under test. Canonicalize BOTH sides before
+  comparing (`Path(...).resolve()`, `realpath`, `fs.realpathSync`): a
+  workspace `node_modules` symlink makes the raw strings differ for code that
+  IS inside the tree, and the comparison then fails in the reassuring
+  direction. A green resolved out of the primary
   checkout's `node_modules` or `.venv` is evidence about the wrong code, and rung 1
   is structurally blind to it: `check-branch` inspects a diff, not a resolution path.
 - Find callers of everything the batch added — `swarmloop.py reachable --symbol
   <name> --from <entry point>` for the mechanical answer (defined / called /
   exported / reachable, exit 1 when a symbol is defined and nothing reaches it),
-  CodeGraph or grep to chase what it says it could not follow. An addition with
+  CodeGraph (only if the tree you are standing in is the primary checkout) or
+  grep to chase what it says it could not follow. An addition with
   zero production callers outside itself and its tests means the wiring half was
   skipped at least as often as it means dead code — and `TESTS ONLY` is that same
-  finding with a green suite sitting on top of it.
+  finding with a green suite sitting on top of it. Whether a zero-caller symbol is
+  a FINDING at all turns on one question — does a FROZEN acceptance test currently
+  pass because of it? YES: a measurement-credibility defect regardless of callers
+  (a frozen release-blocker test passed by comparing a URL's host against a
+  bidder-controlled field, because the registry meant to decide it was never wired
+  — the metric counted a security property as met that nothing enforced); if you
+  conclude the frozen test itself is inadequate, say so in the report — you may
+  never touch it. NO: unfinished work — name the consumer that is missing and let
+  the orchestrator, who holds the ticket graph, decide ticket versus dismissal.
+  Report which answer you got either way, so the next pass cannot re-litigate it.
 - Audit every doer claim against the diff: a CHANGED list that omits a changed
   file, an ACCEPTANCE claim the suite contradicts, a DECISIONS entry the code does
   not reflect — each one is a finding.
+- Re-read the batch's DELETIONS over the COMBINED integrated range — the same
+  two-dot `<pre-batch-main>..main` range as the diff above, and never
+  `main...integration/<epoch>-<batch>`: the batch has already landed, so the
+  integration branch is an ancestor of `main`, the merge base IS its tip, and the
+  three-dot form prints NOTHING (measured, both for `--ff-only` and for a merge
+  commit; `retire` may also have deleted the branch by then, which fails to
+  stderr and reads the same). Read the WHOLE diff with `-M -C`, the `'*test*'`
+  glob ORDERING the reading and never scoping it: tests first (a weakened
+  assertion is the highest-value find), then the source side filtered by the
+  guard vocabulary — `raise|throw|except|catch|assert|valid|verif|require|guard|
+  abort|reject|return (False|None|null)|is None|!= *null` — then the rest of the
+  source side, which is read and never skipped. For each removed line, name what
+  now happens on the path that line used to guard — not "looks benign", but the
+  sentence saying who reaches the code that line stood in front of, and with what
+  value. The per-branch clearance you are re-reading was written by the
+  orchestrator that dispatched you: seven of one branch's deletions were read and
+  signed off as benign, and the one that removed a price parse's failure path —
+  an unparseable price became a free item — surfaced only here, on the combined
+  diff, after sign-off.
+
 - At deep depth, sabotage — in a SCRATCH COPY, never in the tree other agents
-  share. Introduce the plausible wrong fix a reasonable person would actually
+  share. Put that copy and every probe script you write under your OWN
+  subdirectory of the run's scratch root (`<scratch-root>/<verifier-id>/`): the
+  root is shared with the other verifiers in this fan-out, a same-named script
+  there can be executed by a sibling, and you have no worktree of your own to
+  fall back on. Introduce the plausible wrong fix a reasonable person would actually
   commit ("check the limit AFTER doing the work"), not mere deletion; purge caches
   between variants; and prove each sabotage actually reached the code path before
   believing any result — a sabotage that changed nothing produces the same green
-  as a working guard.
+  as a working guard. **A witness that has never been seen to fire is not
+  evidence.** Validate the witness against a line you already know executes, and
+  state that positive control in the report: "the witness fired for line X, which
+  I know runs." Measured: a tracer reported `NEVER RAN` for all eight of a lane's
+  mutations, every one of which had run — it compared a traced `co_filename`
+  against a source path the package imports through a symlink, so no comparison
+  could ever match. A broken witness fails toward the comfortable answer in both
+  directions: `NEVER RAN` reads as *inconclusive* when the truth was *caught*,
+  and a working guard watched by a broken witness reads as NOT CAUGHT, which
+  invites a "fix" to code that is already correct.
+- Time every sabotage variant, and every revert-the-fix run, from OUTSIDE it:
+  `timeout <n> <the gate>`. Expiry is a THIRD outcome beside caught and
+  not-caught, and it is the worst of the three: a gate that HANGS on broken code
+  prints no red at all in CI — it burns to the job timeout and the defect reads
+  as ABSENT. (The metric-command rule is the opposite, and deliberately so:
+  there you want a number, here you want to learn that it hung.) Measured: a
+  revert-the-fix check deadlocked forever because the test held a lock its own
+  teardown could not release until the reverted function returned, and that
+  function blocked on the same lock; it emitted nothing and had to be killed
+  externally. Report the hang as a finding of its own. And never treat a killed
+  run as a clean one — that backend never noticed its client was gone and
+  committed its queued destructive statement afterwards, destroying shared state
+  for every later session; re-read the shared state a kill left behind before
+  believing the next run.
 
 **Depth scales with batch contents, not anxiety:**
 
@@ -438,8 +568,24 @@ deltas:
   how you know.** A patch that silences the repro while the cause survives re-mints
   the same ticket next audit loop, minus the trust.
 - **Sweep the blast radius for SIBLING instances of the same defect class**
-  (CodeGraph when indexed, grep otherwise) and list every one in the report.
+  (`git grep` in your worktree — an index CLI there answers about another
+  codebase instead of failing) and list every one in the report.
   Fixing one of five instances is a report line, not a completion.
+- **A fix defeated a SECOND time gets a new ORACLE, not another case.** Once is a
+  miss; twice means the check asks a NARROWER question than the surface it
+  protects — it compares against known spellings while the surface renders
+  whatever it likes. Measured: a fix removing a secret from a published message
+  was defeated four times running, each through a fragment the last pass never
+  looked at — another field of the same input, a second copy of it built
+  elsewhere, an error raised while parsing it, and finally attributes the
+  renderer prints but the check's own string conversion omits. Each pass closed
+  exactly what it was shown; each next verifier found the next channel. The
+  repair is to make check and surface ask the same question: render the object
+  the way the surface renders it and inspect THAT, after which whole classes are
+  covered by construction. **Say that in the packet, and do not hand over the
+  case list** — three of those four briefs listed the measured cases and got back
+  exactly those cases closed. Two defeats on one surface is the trigger; the
+  orchestrator names it in the packet, from the prior tickets on that surface.
 - **The reproduction becomes a permanent test, committed with the fix.** Tests are
   append-only, so adding it is always free — and a fix without its repro test is
   free to regress silently.
@@ -457,7 +603,10 @@ place twice.
 
 The framing is adversarial: the job is to find what is wrong, not to confirm the
 work. Ask of every green thing what the green is evidence OF. Hunt false claims,
-stubs wearing green suites, mechanisms with zero production callers, and the drift
+stubs wearing green suites, mechanisms with zero production callers (for each one,
+answer and REPORT the discriminator: does a frozen acceptance test currently pass
+because of it? yes ⇒ a measurement-credibility defect regardless of callers; no ⇒
+unfinished work, name the consumer that is missing), and the drift
 no frozen metric can see — duplication, architecture erosion, dead code,
 convention violations, hotspot files accumulating unrelated responsibilities, test
 smells outside the frozen suite. Audit against the codebase map AND the spec: what
@@ -477,7 +626,10 @@ HAZARDS: structural facts the codebase map should record
 ```
 
 The orchestrator converts findings into TICKETS — each with a blast radius and
-`depends_on` — and the readiness scheduler resolves them exactly like build work;
+`depends_on` — and the readiness scheduler resolves them exactly like build work
+(except a finding under a protected path or under `.swarm-loop/`, which `findings`
+refuses to mint at any severity and the orchestrator files with `escalate --kind
+harness`: no worker can close what `check-branch` vetoes);
 metric-linked findings go to the front of the frontier. A loop whose auditors mint
 zero tickets ends the run early via the prune phase: full coverage plus nothing
 found is the one honest form of done.

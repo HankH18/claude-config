@@ -33,11 +33,19 @@ The premise: worktrees moved conflicts from silent runtime corruption to visible
    it unbounded; they are the same fix at two ends.
 
    *And "clean" is a COMMAND, not an impression — it was prose in this step for its
-   whole life, and prose is exactly the half that did not happen.* Run it per branch at
+   whole life, and prose is exactly the half that did not happen. It is a VETO now —
+   `check-branch --worktree <path>` — for every collection that passes the flag.* Run it per branch at
    collection, before any other check reads that tree:
 
    ```bash
-   git -C <worktree> status --porcelain    # required EMPTY. One line is a refusal.
+   python3 <skill>/scripts/swarmloop.py check-branch --branch <sha> --base main --worktree <worktree>
+   #   `--worktree` IS this step: check-branch refuses the branch unless that path is
+   #   this branch's tree AND `git status --porcelain` in it is empty, and it prints the
+   #   uncommitted paths. It is deliberately NOT auto-discovered — the integration
+   #   worktree is legitimately dirty mid-merge and the primary checkout is dirty for
+   #   most of a run — so passing it is you asserting WHICH tree produced the numbers,
+   #   and omitting it leaves this step unenforced.
+   git -C <worktree> status --porcelain    # the same question by hand. One line is a refusal.
    ```
 
    **Measured: a lane's verifier found the worktree dirty at the moment it was briefed —
@@ -55,7 +63,7 @@ The premise: worktrees moved conflicts from silent runtime corruption to visible
    numbers you pass on as much as the ones you take — the verifier above was handed
    greens as facts, and had no way to know they came from bytes the SHA does not contain.
 
-1. **Eligibility gate (per branch, from Phase 5):** `check-branch` passed; changed files ⊆ ownership map; completion report received; **worktree clean at the pinned SHA** (`git -C <worktree> status --porcelain` empty — step 0), because a branch whose reported greens were measured against uncommitted bytes has not been measured at the tip you are about to merge. Ineligible branches don't enter integration at all.
+1. **Eligibility gate (per branch, from Phase 5):** `check-branch` passed; changed files ⊆ ownership map; completion report received; **worktree clean at the pinned SHA** (`check-branch --worktree <path>` refuses it otherwise, and refuses a path that is not this branch's tree — step 0), because a branch whose reported greens were measured against uncommitted bytes has not been measured at the tip you are about to merge. Ineligible branches don't enter integration at all.
 
    **Per-ticket attribution — measure "this ticket is done", do not judge it.** Every
    frozen metric is suite- or epic-level, so `@pytest.mark.ticket(...)` — whose whole
@@ -116,7 +124,7 @@ The premise: worktrees moved conflicts from silent runtime corruption to visible
 
    **Its blind spot, which it prints on every run: it compares branches to EACH OTHER, never to the base.** `merge-tree` is unaffected by a stale base — two branches forked 27 commits ago both come back clean and then die at `git merge --ff-only` with exit 128 (reproduced; it is the same finding step 9 exists for). The command names every branch that is behind the base, out of the same commit counts `check-branch` and `check-wave` print — but that line is beside the verdict, never inside it. A clean pairwise verdict is never permission to land.
 
-   **File intersection is the cheap first pass and never the answer — and this protocol reasons that way in two places.** The ADVISORY row above intersects two branches' touched files; `check-branch`'s staleness line intersects the files that moved on the base with the files the lane owns, and clears the lane when that intersection is empty. The case that actually breaks is invisible to both: a lane whose TESTS depend on semantics a sibling changed — a validation rule tightened, a default flipped, an error type swapped, a serialization narrowed — **in files the lane never touches.** Textual mergeability is unaffected by every one of those, so `merge-tree` returns CLEAN, the staleness advisory stays silent, and the branch then fails at runtime or, worse, passes a weaker assertion than the one the base now requires. So when the intersection is empty, spend the second pass before clearing the lane: grep the lane's own directory for REFERENCES to the modules that moved on the base — imports, error types, constants, fixture factories — and read the base's diff for *behavioural* change rather than for moved paths. An empty intersection is a statement about text; the lane's tests encode expectations about behaviour.
+   **File intersection is the cheap first pass and never the answer — and this protocol reasons that way in two places.** The ADVISORY row above intersects two branches' touched files; `check-branch`'s staleness line intersects the files that moved on the base with the files the lane owns — and it USED to clear the lane when that intersection was empty, which it no longer does. The case that actually breaks is invisible to both: a lane whose TESTS depend on semantics a sibling changed — a validation rule tightened, a default flipped, an error type swapped, a serialization narrowed — **in files the lane never touches.** Textual mergeability is unaffected by every one of those, so `merge-tree` returns CLEAN, the staleness advisory sees nothing to intersect, and the branch then fails at runtime or, worse, passes a weaker assertion than the one the base now requires. So when the intersection is empty, spend the second pass before clearing the lane: grep the lane's own directory for REFERENCES to the modules that moved on the base — imports, error types, constants, fixture factories — and read the base's diff for *behavioural* change rather than for moved paths. An empty intersection is a statement about text; the lane's tests encode expectations about behaviour.
 
    **And when you do warn a lane, hand it the ANCESTRY FACT and let it measure the impact.** An inference about impact, shipped as if it were measured, is its own defect: one brief warned a lane that a rewritten module's "public surface may have moved" and the warning was simply wrong — the exported surface was byte-identical, and only a line number had drifted. State what you measured (this base moved these files, at these SHAs, since your fork) and leave the cost to the lane, which is standing in the tree where it can be measured. A lane sent to re-verify against a fact re-measures one thing and reports what it found; a lane sent to chase an inference you never tested spends its wave on your guess, and reports the failure as its own.
 
@@ -167,7 +175,7 @@ The premise: worktrees moved conflicts from silent runtime corruption to visible
        print(<newpkg>.__file__, m.version('<newpkg>'))"      # the effect, asserted
    ```
 
-   **The same obligation applies per-worktree at dispatch** (cross-reference SKILL.md Phase 4): a fresh worktree contains only *tracked* files, so every gitignored dependency or build directory is missing, and how that missing dependency presents depends on where the worktree sits. Beside the repo (the default) it is a loud `MODULE_NOT_FOUND` — a blocked worker, but a visible one. Under the in-tree fallback it is silent and worse: Node's resolver climbs UP out of the nested worktree into the primary tree's `node_modules` and, under workspaces, into MAIN's source, so an unprovisioned worktree quietly tests main's code while the worker believes it is testing its own. Either way the fix is the same and it is the dispatcher's job: provision each worktree's environment as an explicit dispatch step, never as the worker's first guess.
+   **The same obligation applies per-worktree at dispatch** (cross-reference SKILL.md Phase 4): a fresh worktree contains only *tracked* files, so every gitignored dependency or build directory is missing, and how that missing dependency presents depends on where the worktree sits. Beside the repo (the default) it is a loud `MODULE_NOT_FOUND` — a blocked worker, but a visible one. (That taxonomy covers the RESOLVER; a package reached through a recorded absolute entry in an interpreter the tree does not own is silent in both placements — SKILL.md Phase 4.) Under the in-tree fallback it is silent and worse: Node's resolver climbs UP out of the nested worktree into the primary tree's `node_modules` and, under workspaces, into MAIN's source, so an unprovisioned worktree quietly tests main's code while the worker believes it is testing its own. Either way the fix is the same and it is the dispatcher's job: provision each worktree's environment as an explicit dispatch step, never as the worker's first guess.
 
 9. **Land it — rebase onto `main` FIRST, then fast-forward:**
    ```bash
@@ -197,14 +205,19 @@ The premise: worktrees moved conflicts from silent runtime corruption to visible
    obvious shortcut and it is blocked one gate later: `check-branch` refuses any branch whose diff
    touches `.swarm-loop/` — reproduced, `VETO: branch writes orchestrator-owned state under
    .swarm-loop/`, exit 1. The ledger belongs to `main` and to Phase 8; the batch rebases around it.
-   **Mandatory at every landing — re-read the batch's DELETIONS, over the whole integrated range.** The per-branch removed-lines audit at collection (SKILL.md Phase 5 step 3) is a first pass, not a verdict. Measured: the orchestrator read all seven of one branch's deletions and signed them off as benign. One was not — a deletion removed the failure path from a price parse, so the caller swallowed the exception and coerced the resulting empty value to zero, and **a price that could not be parsed became a free item.** It was caught only on the COMBINED diff of the integrated batch, and only after the sign-off had already cleared it. A deletion that is locally benign becomes a fail-open in combination with what the rest of the batch — or an earlier one — leaves around it, which is why the pass that matters is the one over the range, and why the orchestrator's own clearance is the one that most needs a second reader.
+   **Mandatory at every landing — re-read the batch's DELETIONS, over the whole integrated range.** The per-branch removed-lines audit at collection (SKILL.md Phase 5 step 4) is a first pass, not a verdict. Measured: the orchestrator read all seven of one branch's deletions and signed them off as benign. One was not — a deletion removed the failure path from a price parse, so the caller swallowed the exception and coerced the resulting empty value to zero, and **a price that could not be parsed became a free item.** It was caught only on the COMBINED diff of the integrated batch, and only after the sign-off had already cleared it. A deletion that is locally benign becomes a fail-open in combination with what the rest of the batch — or an earlier one — leaves around it, which is why the pass that matters is the one over the range, and why the orchestrator's own clearance is the one that most needs a second reader.
 
    **Audit the WHOLE diff. The `'*test*'` glob orders the reading; it must never decide what is eligible to be read.** That price-parse deletion was SOURCE-side, so a glob-filtered audit could not match it on any branch at any rung — the orchestrator "audited the removed lines" and the removed line was never in the set it read. It is the second time that scoping has cost something: the frozen-metric bypass, a two-line `pyproject.toml` that drove a metric from 50 to 100, also passed the diff audit precisely because the file did not match the glob. A filter deciding what is *eligible* for review is a policy about what can be found, not a convenience.
 
    The counter-failure is just as real — an unfiltered deletion dump over a batch-sized range is unreadable, and an instruction nobody can follow is another way of not being followed. So read it in this order. The two pathspecs **partition the range exactly** — probed on a real range: the test pathspec listed 1 file, its `:(exclude)` complement 4, and the unfiltered `--stat` the same 5 — so nothing falls out between them:
 
    ```bash
-   R=main...integration/<epoch>-<batch>
+   R=<pre-batch-main>..main        # TWO dots. This step runs AFTER the ff above, so
+                                   # main...integration/<epoch>-<batch> diffs a commit
+                                   # against itself and prints NOTHING (measured, both
+                                   # for --ff-only and for a merge commit); `retire` may
+                                   # also have deleted the branch, which fails to stderr
+                                   # and grep-counts to 0 the same way.
    git diff -M -C --stat $R                                     # shape first: what moved, and how much
    git diff -M -C $R -- '*test*' | grep -E '^-[^-]'             # 1. tests — a weakened assertion is the highest-value find
    git diff -M -C $R -- . ':(exclude)*test*' | grep -E '^-[^-]' \

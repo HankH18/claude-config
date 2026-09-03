@@ -2272,7 +2272,10 @@ cat > tickets.json <<'EOF'
   "scope": ["d/**"], "depends_on": []},
  {"id": "T-104", "title": "a genuinely red gate",
   "verify": "echo 'collected 3 items'; echo '3 failed'; exit 1",
-  "scope": ["e/**"], "depends_on": []}
+  "scope": ["e/**"], "depends_on": []},
+ {"id": "T-105", "title": "a gate that hangs instead of going red",
+  "verify": "sleep 300",
+  "scope": ["f/**"], "depends_on": []}
 ]}
 EOF
 gq add -A; gq commit -qm "red-check graph"
@@ -2300,6 +2303,19 @@ sl red-check --ticket T-104
 ck_exit "P2 control: a genuinely red gate still PASSES red-check" 0 "$RC"
 ck_has "P2 control: ...and is still called a real gate" "a real gate"
 ck_has "P2 control: ...counting what was SELECTED" "3 test(s) selected"
+
+# A gate that HANGS is its own verdict, never a shade of WEAK. It is the one
+# outcome that looks like ABSENCE: in CI it burns to the job timeout and prints
+# no red at all, so the defect it should have caught reads as not there. Filed
+# under `weak` it was byte-identical in the LEDGER to "exited non-zero, selected
+# nothing" — and the ledger, not the terminal, is what check-branch reads later.
+sl red-check --ticket T-105 --per-ticket-timeout 2
+ck_exit "P2 a gate that HANGS fails the check" 1 "$RC"
+ck_has "P2 ...and is HUNG, not a shade of WEAK" "HUNG"
+ck_has "P2 ...counted in the summary" "1 HUNG"
+ck_has "P2 ...named as the outcome that looks like ABSENCE" "looks like ABSENCE"
+ck "P2 ...and the LEDGER carries it, since check-branch reads the stamp" "hung" \
+   "$(python3 -c 'import json;print(json.loads(open(".swarm-loop/redcheck.jsonl").read().splitlines()[-1])["verdict"])')"
 
 sl red-check --ticket T-100,T-101,T-102,T-103,T-104
 ck_exit "P2 a mixed set fails on the weak members, not only on a vacuous one" 1 "$RC"
@@ -2974,6 +2990,67 @@ ck_hasnt "(o) CONTROL: no false stale-base warning" "STALE BASE"
 ck_has "(o) CONTROL: the count is reported either way" "commit(s) ahead"
 
 # ===========================================================================
+# (o2) check-branch --worktree. A tip pins what was COMMITTED and says nothing
+#      about what sits uncommitted beside it. Live: a lane's verifier was
+#      briefed at a pinned SHA over a worktree carrying 112 uncommitted lines
+#      in two files, and the "verified facts" it was handed — 46 tests green,
+#      verify exit 0 — had all been measured against those bytes.
+# ===========================================================================
+section "(o2) check-branch --worktree  [repo: bwt]"
+mk_repo bwt
+sl freeze
+gq add -A; gq commit -qm harness
+WTB="$TMP/bwt-worktrees"
+gq worktree add -q "$WTB/T-1" -b task/T-1 main
+( cd "$WTB/T-1" && git add -A >/dev/null 2>&1
+  echo "# lane work" >> src/app.py && git add -A && git commit -qm "lane work" ) >/dev/null 2>&1
+
+sl check-branch --branch task/T-1 --base main --worktree "$WTB/T-1"
+ck_exit "(o2) a CLEAN worktree at the branch tip passes" 0 "$RC"
+ck_has "(o2) and names the sha it attributed the numbers to" "CLEAN at"
+
+echo "uncommitted" >> "$WTB/T-1/src/app.py"
+sl check-branch --branch task/T-1 --base main --worktree "$WTB/T-1"
+ck_exit "(o2) a DIRTY worktree is REFUSED" 1 "$RC"
+ck_has "(o2) the refusal states the finding" "is DIRTY"
+ck_has "(o2) and prints the uncommitted path" "src/app.py"
+ck_has "(o2) and says a tip cannot see these bytes" "uncommitted beside it"
+ck_has "(o2) and sends the operator to the LANE, not to git commit" "Ask the LANE"
+ck_hasnt "(o2) a dirty worktree is never reported OK" "check-branch: OK"
+( cd "$WTB/T-1" && git checkout -q -- src/app.py )
+
+mkdir -p "$WTB/T-1/.venv/lib"; : > "$WTB/T-1/.venv/lib/a"; : > "$WTB/T-1/.venv/lib/b"
+sl check-branch --branch task/T-1 --base main --worktree "$WTB/T-1"
+ck_exit "(o2) an unignored provisioned directory is dirt too" 1 "$RC"
+ck_has "(o2) reported COLLAPSED, never one line per file" "?? .venv/"
+rm -rf "$WTB/T-1/.venv"
+
+gq worktree add -q "$WTB/T-2" -b task/T-2 main
+( cd "$WTB/T-2" && echo "# other lane" >> src/app.py && git add -A && git commit -qm other ) >/dev/null 2>&1
+sl check-branch --branch task/T-1 --base main --worktree "$WTB/T-2"
+ck_exit "(o2) a CLEAN worktree of ANOTHER branch is REFUSED" 1 "$RC"
+ck_has "(o2) and says the tree it read did not build this branch" "did not build this branch"
+
+sl check-branch --branch task/T-1 --base main --worktree "$TMP/bwt-does-not-exist"
+ck_exit "(o2) a path that is not a worktree is REFUSED, never advisory" 1 "$RC"
+ck_has "(o2) and names the disarm it would otherwise have been" "DISARMING"
+
+sl check-branch --branch task/T-1 --base main --worktree "$WTB/T-1/src"
+ck_exit "(o2) a SUBDIRECTORY of the worktree is REFUSED" 1 "$RC"
+ck_has "(o2) and names the root to pass instead" "subdirectory of the worktree rooted at"
+
+sl check-branch --branch task/T-1 --base main
+ck_exit "(o2) WITHOUT --worktree check-branch is unchanged" 0 "$RC"
+ck_hasnt "(o2) ...and says nothing about any worktree" "CLEAN at"
+PIN=$(cd "$WTB/T-1" && git rev-parse HEAD)
+( cd "$WTB/T-1" && echo "# later fix" >> src/app.py && git add -A && git commit -qm w2 ) >/dev/null 2>&1
+sl check-branch --branch "$PIN" --base main --worktree "$WTB/T-1"
+ck_exit "(o2) a tree that MOVED past the pinned SHA is REFUSED" 1 "$RC"
+ck_has "(o2) ...named as step zero's VOID collection" "MOVED"
+ck_hasnt "(o2) ...and never claims it is not this branch's tree" "did not build this branch"
+
+
+# ===========================================================================
 # (p) check-wave asks the reciprocal question BEFORE dispatch: how far has
 #     the base moved since an existing member branch forked from it, and does
 #     that drift land inside what the ticket owns. Live: seven lanes were
@@ -3165,6 +3242,61 @@ ck_has "(s) and says why" "cannot become a ticket anyone can act on"
 sl findings --file findings.json --no-tickets
 ck_exit "(s) --no-tickets exits 0" 0 "$RC"
 ck_has "(s) --no-tickets records without minting" "Every severity is on disk"
+
+# The PARTITION, on WHO MAY FIX IT. Two adversarial swarms returned in one
+# session — one on the product, one on the frozen acceptance harness that
+# grades it — and the orchestrator piped both reports in with one gesture,
+# minutes after stating the correct distinction in prose. Every finding of the
+# second named a protected path, so ~30 tickets were nearly minted at workers
+# whom `check-branch` vetoes from that path every time. The recorded location
+# decides the destination now; memory does not get a vote.
+cat > harnessfind.json <<'EOF'
+[
+ {"severity":"CRITICAL","location":".swarm-loop/goals.json","defect":"the metric command greps a file it does not measure"},
+ {"severity":"LOW","location":".swarm-loop/acceptance/test_feature.py:9-12","defect":"the acceptance test asserts nothing"},
+ {"severity":"HIGH","location":".swarm-loop/worker-preamble.md:4","defect":"the preamble states a rule the harness does not enforce"},
+ {"severity":"HIGH","location":"./.swarm-loop/acceptance/test_feature.py:9","defect":"same file, a spelling an auditor actually writes"},
+ {"severity":"HIGH","location":"src/pricing.py:12","defect":"a genuine product defect"}
+]
+EOF
+sl findings --file harnessfind.json --min-severity MEDIUM
+ck_exit "(s) a mixed product/harness report is not refused wholesale" 0 "$RC"
+ck "(s) NO ticket is minted for a finding under a protected path" "0" \
+   "$(jget tickets.json "len([t for t in d['tickets'] if str(t.get('location','')).startswith('.swarm-loop/')])")"
+ck "(s) ...while the product finding in the SAME report mints normally" "1" \
+   "$(jget tickets.json "len([t for t in d['tickets'] if 'pricing' in str(t.get('location'))])")"
+ck_has "(s) the refusal names the boundary it partitioned on" "NO WORKER MAY TOUCH"
+ck_has "(s) ...and says why no worker can close one" "check-branch"
+ck_has "(s) ...routing them to the ledger the orchestrator owns" "escalate --kind harness"
+ck_has "(s) ...and the reconciliation counts them, so none can vanish" \
+       "+ 4 harness-owned = 5 recorded"
+ck "(s) a harness finding is still RECORDED verbatim at every severity" "3" \
+   "$(python3 -c '
+import json
+n = 0
+for line in open(".swarm-loop/findings.jsonl"):
+    line = line.strip()
+    if line and str(json.loads(line).get("location","")).startswith(".swarm-loop/"):
+        n += 1
+print(n)')"
+# The partition runs BEFORE the threshold, deliberately: lowering
+# --min-severity must never turn a harness defect into a ticket, and reporting
+# one as "ticketable later" would be a lie about who is allowed to fix it.
+sl findings --file harnessfind.json --min-severity LOW
+ck_exit "(s) the same report at LOW exits 0" 0 "$RC"
+ck "(s) lowering --min-severity does NOT make a harness finding ticketable" "0" \
+   "$(jget tickets.json "len([t for t in d['tickets'] if str(t.get('location','')).startswith('.swarm-loop/')])")"
+
+# All-harness: nothing to mint, so the graph is never opened and never re-sealed.
+GRAPH_BEFORE_H="$(sha_of tickets.json)"
+cat > allharness.json <<'EOF'
+[{"severity":"HIGH","location":".swarm-loop/acceptance/test_feature.py:3","defect":"tautological assert"}]
+EOF
+sl findings --file allharness.json --min-severity MEDIUM
+ck_exit "(s) a report that is ALL harness exits 0" 0 "$RC"
+ck "(s) ...and does not touch the ticket graph's bytes" "$GRAPH_BEFORE_H" "$(sha_of tickets.json)"
+ck_has "(s) ...and still reconciles every recorded finding" \
+       "0 minted + 0 below threshold + 0 already ticketed + 1 harness-owned = 1 recorded"
 
 
 # ===========================================================================

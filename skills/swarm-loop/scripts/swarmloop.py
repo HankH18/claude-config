@@ -3015,6 +3015,57 @@ def _lane_commits(root, base, branch):
     return {"ahead": n_ahead, "behind": n_behind, "fork": fork_sha, "base_files": files}
 
 
+def _worktree_status(path):
+    """(dirty lines, HEAD sha, error) for a lane's worktree; error is None on success.
+
+    A tip pins what was COMMITTED and says nothing about what sits uncommitted
+    beside it. Measured: a lane's verifier was briefed at a pinned SHA over a
+    worktree carrying 112 uncommitted lines across two files, and the "verified
+    facts" it was handed -- 46 tests green, `verify` exit 0 -- had all been
+    measured against those bytes. Every other check in cmd_check_branch reads the
+    COMMIT, which is precisely where the uncommitted bytes are not, so nothing in
+    the collection sequence could have revealed it.
+
+    Untracked directories stay COLLAPSED -- the one place this deliberately
+    diverges from _swarm_dirty's -uall. That flag is right for a small STATE_DIR;
+    a provisioned lane worktree holds a .venv or node_modules, and where the
+    repo's .gitignore omits one (Phase 4's ignore warning, and the live run where
+    nine dependency files rode onto a branch) -uall prints tens of thousands of
+    paths in place of the single `?? .venv/` an operator can act on.
+
+    Unknown does NOT keep a tree here, and the inversion from every other "git
+    could not answer" in this file is the point: those are questions about a repo
+    nobody named, while this path was TYPED. The caller vetoes on error, because
+    a gate reporting clean about a tree it never read is the mistyped --ticket in
+    another costume.
+    """
+    def _why(proc, fallback):
+        return ((proc.stderr or "").strip().splitlines() or [fallback])[0]
+
+    path = os.path.abspath(path)
+    if not os.path.isdir(path):
+        return [], "", "it is not a directory"
+    top = subprocess.run(["git", "-C", path, "rev-parse", "--show-toplevel"],
+                         capture_output=True, text=True)
+    if top.returncode != 0:
+        return [], "", _why(top, "it is not inside a git worktree")
+    top_path = (top.stdout or "").strip()
+    if os.path.realpath(top_path) != os.path.realpath(path):
+        return [], "", ("it is a subdirectory of the worktree rooted at %s — name that "
+                        "root, so the status this gate reads is the whole lane's tree"
+                        % top_path)
+    st = subprocess.run(["git", "-C", path, "status", "--porcelain"],
+                        capture_output=True, text=True)
+    if st.returncode != 0:
+        return [], "", _why(st, "git status exited %d" % st.returncode)
+    head = subprocess.run(["git", "-C", path, "rev-parse", "HEAD"],
+                          capture_output=True, text=True)
+    if head.returncode != 0:
+        return [], "", _why(head, "git rev-parse HEAD exited %d" % head.returncode)
+    return ([ln for ln in (st.stdout or "").splitlines() if ln.strip()],
+            (head.stdout or "").strip(), None)
+
+
 def cmd_check_branch(args):
     root = repo_root()
     d = sd(root)
@@ -3092,10 +3143,78 @@ def cmd_check_branch(args):
     if swarm_hits:
         print(f"VETO: branch writes orchestrator-owned state under {STATE_DIR}/ — do not merge")
         sys.exit(1)
-    # Optional and last of the vetoes: the three above are statements about the
-    # DIFF and hold whatever the ticket is, while this one needs to be told which
-    # gate it is judging. Placed after them so a branch that tampers with the
-    # frozen harness is still refused for that, not for its paperwork.
+    # Optional, like --ticket below, and for the same reason: the three vetoes
+    # above are statements about the DIFF and hold whatever tree the lane left
+    # behind, while this one has to be TOLD which tree to read. It is NOT
+    # discovered from `git worktree list`, deliberately — the integration
+    # branch's own worktree is legitimately dirty mid-merge and the primary
+    # checkout is dirty for most of a run (every epoch writes under STATE_DIR),
+    # so a gate that found its own tree would refuse the protocol's own
+    # integration checks. Naming the path is the operator asserting WHICH tree
+    # produced this branch's numbers.
+    if args.worktree:
+        dirty, wt_head, wt_err = _worktree_status(args.worktree)
+        if wt_err:
+            print(f"VETO: --worktree {args.worktree} could not be read as a worktree "
+                  f"root: {wt_err}.")
+            print("  A path this gate cannot query proves NOTHING about the bytes that "
+                  "produced this branch's reported greens, and accepting it silently is "
+                  "a typo DISARMING the check — the same disarm a mistyped --ticket "
+                  "used to be. Give the lane's worktree root, or omit the flag and "
+                  "establish provenance by hand before briefing anyone at this tip.")
+            sys.exit(1)
+        # Identity before cleanliness: a listing of dirt in some OTHER tree sends
+        # the operator to the wrong lane to ask for a commit.
+        tip = _git(root, "rev-parse", "--verify", f"{args.branch}^{{commit}}")
+        tip_sha = (tip.stdout or "").strip() if tip.returncode == 0 else ""
+        if tip_sha and wt_head != tip_sha:
+            moved = bool(wt_head) and _git(root, "merge-base", "--is-ancestor",
+                                           tip_sha, wt_head).returncode == 0
+            if moved:
+                print(f"VETO: {args.worktree} IS this branch's tree, and it has MOVED "
+                      f"past the ref you are checking — the tree is at {wt_head[:12]}, "
+                      f"you asked about {tip_sha[:12]}.")
+                print("  This is step zero's own failure, caught mechanically for the "
+                      "first time: three tips moved mid-collection in one run — one of "
+                      "the new commits was the fix for the branch's worst blocker — and "
+                      "every one was caught by eyeballing a commit count. The collection "
+                      "is VOID: re-pin the tip and redo every check against the new SHA.")
+            else:
+                print(f"VETO: {args.worktree} is a worktree at {wt_head[:12]}, which is "
+                      f"neither {tip_sha[:12]} nor a descendant of it — that tree did "
+                      "not build this branch.")
+                print("  A clean status about the wrong tree establishes provenance for a "
+                      "branch nobody is merging. Point --worktree at the lane that built "
+                      f"{args.branch}.")
+            sys.exit(1)
+        if dirty:
+            print(f"VETO: the worktree at {args.worktree} is DIRTY — {len(dirty)} "
+                  "uncommitted path(s) sitting beside the commit you are merging:")
+            for ln in dirty[:40]:
+                print(f"    {ln}")
+            if len(dirty) > 40:
+                print(f"    ... and {len(dirty) - 40} more")
+            print("  A tip pins what was COMMITTED and says nothing about what sits "
+                  "uncommitted beside it, and every other check here reads the commit — "
+                  "which is precisely where these bytes are not. Measured: a verifier "
+                  "briefed at a pinned SHA over a tree carrying 112 uncommitted lines "
+                  "was handed 46 green tests and a `verify` exit 0 as FACTS, and every "
+                  "one of them had been measured against bytes that SHA does not "
+                  "contain.")
+            print("  Ask the LANE for the commit, re-pin, and re-measure. Do not commit "
+                  "it yourself: a tip you wrote is not the lane's delivery, and it "
+                  "merges the one diff no worker's report covers.")
+            print("  A `??` line naming a provisioned directory (.venv/, node_modules/) "
+                  "is the Phase 4 ignore check failing HERE instead of at the worker's "
+                  "next commit — fix .gitignore, then re-run this.")
+            sys.exit(1)
+        print(f"worktree {args.worktree}: CLEAN at {wt_head[:12]} — this branch's "
+              "reported numbers can be attributed to the commit being merged")
+    # Optional and last of the vetoes: the three DIFF vetoes above are
+    # statements about the diff and hold whatever the ticket is, while this one
+    # needs to be told which gate it is judging. Placed after them so a branch
+    # that tampers with the frozen harness is still refused for that, not for
+    # its paperwork.
     if args.ticket:
         # THE ID IS VALIDATED AGAINST THE GRAPH FIRST. It was not, and cmd_check_branch
         # did not load the graph at all — so an unknown or mistyped id had no stamps
@@ -3171,9 +3290,24 @@ def cmd_check_branch(args):
                   f"that no longer exists. Rebase onto {base} and re-run its verify before "
                   "integrating, or read each overlapping file's diff on both sides.")
         else:
-            print("    None of them intersect this branch's own changes, so the merge itself "
-                  f"is low-risk — but the branch's verify still ran against a {base} that is "
-                  f"{lane['behind']} commit(s) old.")
+            print("    None of them intersect this branch's own changes — a statement about "
+                  "TEXT, and NOT a clearance. What an empty intersection cannot see is this "
+                  "lane's tests depending on semantics a sibling changed (a validation rule "
+                  "tightened, a default flipped, an error type swapped, a serialization "
+                  "narrowed) in files the lane never touches: the merge stays clean, and the "
+                  f"branch fails at runtime or passes a weaker assertion than {base} now "
+                  f"requires. Its verify ran against a {base} that is {lane['behind']} "
+                  "commit(s) old either way.")
+            print("    Grep this lane's own directory for REFERENCES to the modules that "
+                  "moved on the base — imports, error types, constants, fixture "
+                  "factories. An empty intersection is a statement about text; the "
+                  "lane's tests encode expectations about behaviour.")
+            print(f"    Read {base}'s diff for BEHAVIOURAL change, not for moved paths, before "
+                  "clearing the lane. If you send the lane back, hand it the ancestry FACT — "
+                  f"forked at {lane['fork'][:12]}, {base} moved {len(lane['base_files'])} "
+                  "file(s) since — and let the LANE measure the impact: an inference about "
+                  "impact, shipped as if it were measured, is its own defect, and the lane is "
+                  "the one standing in the tree where the impact can be measured.")
     print("check-branch: OK (review the file list above against the task's ownership map)")
 
 
@@ -5941,6 +6075,67 @@ def cmd_findings(args):
             _state = json.load(_sf)
     except (OSError, ValueError):
         _state = {}                      # a graph passed by --graph needs no state
+
+    # --- 1b. PARTITION ON WHO MAY FIX IT, before a ticket exists that nobody
+    #     can close. Two adversarial swarms returned in one session — one on the
+    #     product, one on the frozen acceptance harness that grades it — and the
+    #     orchestrator piped both reports into this command in a single gesture,
+    #     minutes after stating the correct distinction in prose. The split was
+    #     perfectly clean and machine-detectable: every finding from the second
+    #     swarm named a protected path. Roughly thirty tickets would have been
+    #     minted at workers whom `check-branch` vetoes from that path EVERY
+    #     time; only an unrelated --dry-run stopped it. A distinction an
+    #     orchestrator can state correctly and act against in the next tool call
+    #     is not a prose problem, so the recorded location decides the
+    #     destination here and memory never gets a vote.
+    #
+    #     Before the threshold test, deliberately: lowering --min-severity must
+    #     not turn a harness defect into a ticket, and reporting one as
+    #     "ticketable later" would be a lie. Before the graph load too — a
+    #     report that is ALL harness needs no graph, writes nothing, and must
+    #     not re-seal anything.
+    _protected = [str(p).strip() for p in
+                  (_state.get("protected_paths") or MANDATORY_PROTECTED)
+                  if str(p).strip()]
+    harness, mintable = [], []
+    for out in stamped:
+        _sc = _finding_scope(out.get("location"))
+        # Normalised, because a location is FREE TEXT from a checker subagent while
+        # check-branch reads `git diff --name-only`, already canonical. A leading
+        # "./" was enough to smuggle a harness finding into the ticket ledger.
+        # (normpath alone drops "./" and collapses "//" and ".."; never lstrip("./"),
+        # which takes a CHARACTER SET and silently disarms the whole partition.)
+        if _sc:
+            _sc = os.path.normpath(_sc)
+        # BOTH of check-branch's vetoes, or this asks a NARROWER question than the
+        # surface it protects: protected_paths ("modifies the frozen goal harness")
+        # AND all of STATE_DIR/ ("orchestrator-owned state"). A finding at
+        # .swarm-loop/worker-preamble.md is exactly as unclosable as one in the
+        # acceptance suite.
+        if _sc and (any(_sc == p or _sc.startswith(p.rstrip("/") + "/") for p in _protected)
+                    or _sc == STATE_DIR or _sc.startswith(STATE_DIR + "/")):
+            harness.append(out)
+        else:
+            mintable.append(out)
+    if harness:
+        _rec = "recorded" if not args.dry_run else "NOT recorded — this is a --dry-run"
+        print(f"\n{len(harness)} finding(s) name a path NO WORKER MAY TOUCH — {_rec}, "
+              "and REFUSED a ticket at every severity:")
+        for out in harness:
+            print(f"  {out['severity']:<8} {str(out.get('location') or '')[:70]}")
+        print("  No worker may fix these — `check-branch` vetoes every branch that touches a\n"
+              "  protected path or orchestrator-owned state, so each would be a ticket\n"
+              "  dispatched to somebody forbidden to close it. They belong to the\n"
+              "  ORCHESTRATOR, and only the user can authorise the change. File each:")
+        print("    swarmloop.py escalate --kind harness --subject <path> "
+              "--reason \"<the finding and its evidence>\" --proposed \"<the exact change>\"")
+        print("  and act on the ruling with `freeze --amend`. Never mint these by hand either: "
+              "a\n  worker cannot close what the branch veto rejects.")
+    if not mintable:
+        print(f"\nEVERY severity band is accounted for: 0 minted + 0 below threshold + 0 "
+              f"already ticketed + {len(harness)} harness-owned = {len(stamped)} recorded.")
+        return
+
     gpath, tickets = _load_graph(root, _state, args.graph, required=True)
     idx, _dupes = _graph_index(tickets)
     already = {str(t.get("finding_id") or "") for t in tickets if isinstance(t, dict)}
@@ -6006,7 +6201,7 @@ def cmd_findings(args):
 
     minted, below, dup = [], [], []
     resealed, reseal_seq = None, None
-    for out in stamped:
+    for out in mintable:
         if out["finding_id"] in already:
             dup.append(out)
             continue
@@ -6047,7 +6242,7 @@ def cmd_findings(args):
     # --- 3. the reconciliation. Every recorded finding is minted, deliberately
     #     below the threshold, or already present. Anything else is a bug in
     #     this command, and it dies rather than reporting a clean run.
-    accounted = len(minted) + len(below) + len(dup)
+    accounted = len(minted) + len(below) + len(dup) + len(harness)
     if accounted != len(stamped):
         die(f"INTERNAL: {len(stamped)} findings recorded but only {accounted} accounted for "
             f"({len(minted)} minted, {len(below)} below threshold, {len(dup)} already "
@@ -6105,7 +6300,9 @@ def cmd_findings(args):
     if dup:
         print(f"\n{len(dup)} finding(s) already carry a ticket — skipped.")
     print(f"\nEVERY severity band is accounted for: {len(minted)} minted + {len(below)} "
-          f"below threshold + {len(dup)} already ticketed = {len(stamped)} recorded.")
+          f"below threshold + {len(dup)} already ticketed"
+          + (f" + {len(harness)} harness-owned" if harness else "")
+          + f" = {len(stamped)} recorded.")
     if minted:
         print("Each minted ticket's `verify` is a PLACEHOLDER that red-check refuses. Write a "
               "gate that fails on the finding before dispatching it.")
@@ -6632,6 +6829,13 @@ def cmd_red_check(args):
     # against must survive `main` moving on after the check was run.
     base_sha = (rev.stdout or "").strip() or base
     vacuous, weak, red, nogate, skipped, bootstrap = [], [], [], [], [], []
+    # HUNG is its own bucket, never a shade of WEAK. A gate that DEADLOCKS on
+    # broken code is worse than one that passes on it: in CI it burns to the job
+    # timeout and prints no red at all, so the defect reads as ABSENT. Filed
+    # under `weak` it was byte-identical in the ledger to "exited non-zero,
+    # selected nothing" — and the ledger, not this terminal, is what
+    # check-branch reads after the fact.
+    hung = []
     # The two close-time buckets. They are REFUSALS only under --close and
     # advisory otherwise, because a false positive on the pre-dispatch path stops
     # a ticket that has nothing wrong with it while a false positive at merge
@@ -6689,7 +6893,7 @@ def cmd_red_check(args):
                 # It exempts a ticket from MUST-GO-RED and from nothing else: the
                 # NO GATE check above still fires (a bootstrap ticket with no
                 # `verify` is still refused), SKIPPED still fires, and a timeout
-                # is still WEAK — none of those is "a green empty pipeline". The
+                # is still HUNG — none of those is "a green empty pipeline". The
                 # producer's other half is what keeps this from being a hole:
                 # build-docs still requires T-0 to ship one attributed smoke test
                 # (`test_harness_runs`, marked ticket("T-0")), so freeze's
@@ -6812,9 +7016,10 @@ def cmd_red_check(args):
                 for line in extra:
                     print("            " + line)
             except subprocess.TimeoutExpired:
-                weak.append(tid)
-                stamps.append((tid, "weak", cmd, None))
-                print(f"  {tid:<9} WEAK — `{cmd}` timed out after {args.timeout}s")
+                hung.append(tid)
+                stamps.append((tid, "hung", cmd, None))
+                print(f"  {tid:<9} HUNG — `{cmd}` produced NO VERDICT in "
+                      f"{args.timeout}s and was killed by process group")
             finally:
                 _git(root, "worktree", "remove", "--force", wt)
     finally:
@@ -6835,6 +7040,7 @@ def cmd_red_check(args):
     print("")
     print(f"red-check: {len(red)} real · {len(vacuous)} VACUOUS · {len(weak)} weak · "
           f"{len(nogate)} with no gate · {len(skipped)} SKIPPED"
+          + (f" · {len(hung)} HUNG" if hung else "")
           + (f" · {len(bootstrap)} BOOTSTRAP" if bootstrap else "")
           + (f" · {len(swallowed)} SWALLOWED · {len(deselected_t)} DESELECTED"
              if args.close else ""))
@@ -6862,6 +7068,13 @@ def cmd_red_check(args):
         print("passes on an empty tree measures the scaffold, not the work; a gate that")
         print("collects nothing measures nothing at all. Rewrite these before dispatching")
         print("them, and say in each task packet which grader is the real one.")
+    if hung:
+        print("A gate that HANGS is not a gate that failed — it is the one outcome that")
+        print("looks like ABSENCE: in CI it runs to the job timeout and prints no red at")
+        print("all, so the defect it should have caught reads as not there. Fix the hang as")
+        print("its own defect before judging the gate, then audit what the kill left behind:")
+        print("a backend does not notice its client is gone, and a queued destructive")
+        print("statement can commit after it, wrecking shared state for every later run.")
     if swallowed or deselected_t:
         print("A gate that went red for a reason unrelated to this ticket is not this")
         print("ticket's gate. Measured: a verify of `pytest -q -m 'not slow' tests` scored a")
@@ -6887,7 +7100,9 @@ def cmd_red_check(args):
     # are deliberately still in it. The exemption removes a ticket from
     # vacuous/weak at the point of classification, so it cannot silently widen:
     # a bootstrap ticket with no `verify` never reaches the exemption at all.
-    if vacuous or weak or nogate or skipped or swallowed or deselected_t:
+    # `hung` is in the list for the same reason as `skipped`: a gate that produced
+    # no verdict was not checked, and an unchecked gate is not a red one.
+    if vacuous or weak or nogate or skipped or hung or swallowed or deselected_t:
         sys.exit(1)
 
 
@@ -10295,6 +10510,18 @@ def main():
                         "onward — a resumed run has no stamps for work already in flight and "
                         "must not be wedged by a gate it predates. Omitting the flag leaves "
                         "check-branch behaving exactly as before.")
+    s.add_argument("--worktree", default=None, metavar="PATH",
+                   help="OPTIONAL: also refuse this branch unless the worktree at PATH "
+                        "IS this branch's tree and `git -C PATH status --porcelain` is "
+                        "EMPTY, printing the uncommitted paths. A tip pins what was "
+                        "committed and says nothing about what sits uncommitted beside "
+                        "it: a verifier was once briefed at a pinned SHA over a tree "
+                        "holding 112 uncommitted lines, and the greens it was handed as "
+                        "facts had been measured against those bytes. NOT discovered "
+                        "from `git worktree list` — the integration worktree and the "
+                        "primary checkout are both legitimately dirty during a run. "
+                        "Omitting the flag leaves check-branch behaving exactly as "
+                        "before.")
     s.set_defaults(func=cmd_check_branch)
 
     s = sub.add_parser("measure", help="run all metric commands and record")
@@ -10452,7 +10679,7 @@ def main():
     s.set_defaults(func=cmd_push_gate)
 
     s = sub.add_parser("red-check", help="prove each ticket's verify command FAILS before it "
-                                         "is built (exit 1 on VACUOUS, WEAK, NO GATE or "
+                                         "is built (exit 1 on VACUOUS, WEAK, HUNG, NO GATE or "
                                          "SKIPPED — exit 0 means every gate is real; a ticket "
                                          "carrying `bootstrap: true` in the graph is exempt "
                                          "from must-go-red and from nothing else)")
@@ -10466,7 +10693,9 @@ def main():
     # third flag of the same name inside a different subparser is a
     # cross-command collision waiting to confuse both.
     s.add_argument("--per-ticket-timeout", type=int, default=600, dest="timeout",
-                   help="per-ticket timeout in seconds (default 600)")
+                   help="per-ticket timeout in seconds (default 600). Expiry is its own "
+                        "verdict, HUNG — a gate that deadlocks on an unbuilt tree prints "
+                        "no red at all in CI, which is worse than one that passes")
     s.add_argument("--close", action="store_true",
                    help="CLOSE-TIME retro-check: point --base at the ticket's merge parent and "
                         "ask 'was this gate red immediately before this work landed?'. Turns the "
