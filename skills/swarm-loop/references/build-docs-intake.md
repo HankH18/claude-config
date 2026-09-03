@@ -54,6 +54,60 @@ trust them blindly either — the intake procedure below is the trust boundary.
 | T-0 bootstrap ticket | The cycle-1 scaffold task (greenfield Phase 1) | — |
 | EXECUTION.md | Orchestration cross-check | This skill's protocol governs |
 
+### The ticket-field consumer ledger
+
+The table above maps *tiers*. This one maps *fields*, and it is the authoritative
+per-field declaration: for every key in the build-docs ticket contract, WHO consumes
+it and — for anything a code path reads — what happens when it is absent.
+
+It exists because the failure it prevents does not fail at the boundary. `build-docs`
+can start emitting a field and `swarmloop.py` can never read it, and nothing says so
+until `freeze` refuses or `red-check` scores a gate wrong, hours into a run. **A field
+with no row here is not "obviously prose" — it is undeclared, and undeclared is the
+bug.** Silence has to be a decision someone wrote down.
+
+`tests/test_contract.py` reads this table mechanically, against
+`skills/build-docs/references/templates.md` on one side and `scripts/swarmloop.py` on
+the other. Editing a row without the code or the contract to back it turns the row red.
+
+Consumer classes:
+
+- **`code`** — `scripts/swarmloop.py` reads it off a ticket. The *On absence* cell must
+  say what breaks.
+- **`advisory-recorded`** — read by code, printed, and deliberately **never** a
+  predicate.
+- **`packet-prose`** — no code path, by design. It is mapped into the worker's task
+  packet as prose and a human/agent consumes it. This is a real consumer; it is just
+  not a machine one.
+- **`loop-minted`** — not a build-docs field at all. `swarmloop.py` writes it onto the
+  tickets *it* mints from audit findings and reads it back. Declared so that "code
+  reads a field the producer never emits" stays a usable alarm.
+
+<!-- CONTRACT-LEDGER:BEGIN -->
+
+| Field | Consumer | On absence |
+|---|---|---|
+| `id` | `code` | `_graph_index` SKIPS the entry entirely and `_graph_unusable` reports the count — a ticket the frontier never lists is indistinguishable from one that does not exist. |
+| `title` | `code` | `frontier` and the freeze coverage report print an empty label. Nothing refuses; the graph is just harder to read. |
+| `objective` | `packet-prose` | Packet's **Objective** section is empty and the worker has the acceptance criteria with no statement of why. No code path. |
+| `refs` | `packet-prose` | Packet carries no R-IDs, so cycle and final reports cannot trace a ticket back to a spec requirement. No code path. |
+| `acceptance` | `packet-prose` | Packet's **Done means** loses its numbered criteria, and intake step 4 has no source for `acceptance/`. Read by hand at intake, never by code. |
+| `verify` | `code` | `red-check` prints `NO GATE — the ticket declares no 'verify' command` and exits non-zero; `frontier` shows the ticket with no done-condition. |
+| `scope` | `code` | Fallback write-ownership. With `owns` also empty the ticket is treated as owning **everything**, so `check-wave` VETOes the wave (or REFUSES it when no member declares anything). |
+| `owns` | `code` | Silent fallback to `scope` globs — `check-wave` prints `owns(scope)` and the wave check you just ran was the coarse one, in both directions. |
+| `owned_files` | `code` | Alias for `owns`, read second. Absence is normal; it only matters when a project spells the per-file map with this key. |
+| `reads` | `code` | `swarmloop.py reads --write` derives and fills it; until then the packet carries no "import this, never write it" edge and `freeze`'s closure gate is the first thing to notice. |
+| `depends_on` | `code` | The ticket becomes a graph ROOT and the readiness scheduler dispatches it immediately, before the work it actually needs exists. |
+| `non_goals` | `packet-prose` | Packet's **Boundaries** section is empty and the worker's scope creep has nothing to hit. No code path. |
+| `parallel_safe` | `advisory-recorded` | Nothing. `check-wave` prints an advisory line when it is `false` and dispatches on per-file ownership regardless — the flag is unusable as a predicate in both directions. |
+| `finding_id` | `loop-minted` | Written by `swarmloop.py findings`; its absence is how the mint loop tells a build-docs ticket from one of its own, so re-minting would duplicate. |
+| `severity` | `loop-minted` | Written by `swarmloop.py findings` from the audit record; the mint report cannot rank or threshold without it. |
+| `location` | `loop-minted` | Written verbatim from the finding; without it the minted ticket names no file and `_finding_scope` derives no ownership. |
+| `reproduction` | `loop-minted` | Written from the finding when present; the field the old formatter never read. Absent means the ticket carries no repro. |
+| `scope_note` | `loop-minted` | Written only when a finding named no file — the marker that ownership must be declared by hand before the ticket joins a wave. |
+
+<!-- CONTRACT-LEDGER:END -->
+
 ## Intake procedure (runs inside Phases 0–3)
 
 1. **Read every tier.** If SPEC's *Open questions* section is non-empty, stop and put
