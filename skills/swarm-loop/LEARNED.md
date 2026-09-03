@@ -22,6 +22,18 @@ at every run's termination (Phase: Termination), following these rules:
   template) — before moving forward with further runs. Do not silently trim to
   make room; a full learnings file means the skill itself has a backlog.
 
+Every rule above is now enforced mechanically, because for the whole life of this
+file they were prose and this file stayed empty across every run. The append is
+`scripts/swarmloop.py distil --to-skill --lesson "..." --because "..."`: it
+refuses an entry that names a project, a path, a host, a product or a ticket;
+refuses one that is not imperative, is a stub, or duplicates an entry already
+here; refuses the 41st entry with the capacity message above rather than trimming
+to make room; and appends under a lock, byte-for-byte after the file it read, so
+two runs terminating at once cannot SILENTLY lose each other's entry — the loser
+of the race is REFUSED with a message naming the lockfile and told to re-run, and
+nothing of its is written. Nothing below is ever rewritten or reordered by the
+harness. Curation is still yours.
+
 Slate wiped 2026-08-31 after a full improvement pass: every prior entry was
 promoted into SKILL.md, the references, or the harness — or deliberately retired.
 The historical sets are archived at
@@ -30,6 +42,10 @@ The historical sets are archived at
 ---
 
 ## Entries
+
+<!-- Appended newest-last by `distil --to-skill` at Termination. Empty is a
+     real state and the harness reports it: `resume` and `checkpoint` print the
+     entry count every cycle, so a run that ends without distilling says so. -->
 
 Seeded 2026-09-02 from the proxyshop run, cycle 10 — mid-run rather than at termination,
 because this file has been empty across every run so far and the checkpoint has flagged it
