@@ -2175,6 +2175,33 @@ MALFORMED_PAYLOADS = [
 # THE PAIRING IS THE POINT: an absence assertion on its own is satisfied by a
 # guard that prints nothing at all, so each "must not contain SAFE_HINT" case is
 # paired with a case proving the stash family still gets exactly that text.
+# The fragments UNIQUE to SAFE_HINT. `_STASH_FOOTER` cannot serve as the
+# "must not contain" list for the other families, because its "SAFE ALTERNATIVES:"
+# header is shared by every footer — asserting its absence would fail on a
+# refusal that is perfectly correct. Split out so an absence assertion tests the
+# family and not the formatting.
+_SAFE_HINT_ONLY = [
+    "WHY: this git op is repo-global",
+    "destroys EVERY parallel agent's uncommitted work",
+    "refs/stash is one ref shared by all worktrees",
+    "`git show HEAD:<file>`",
+    "never stash",
+]
+
+_HISTORY_FOOTER = [
+    "WHY: this op destroys REFS, OBJECTS or HISTORY",
+    "not anyone's uncommitted work",
+    "--force-with-lease",
+    "Create a NEW one (`git branch <new> <commit>`, allowed)",
+]
+
+_LEDGER_FOOTER = [
+    "WHY: this writes or removes ONE thing",
+    "It is not a repo-global operation",
+    "READING it is never blocked",
+    "Changing it is `swarmloop.py`'s job",
+]
+
 _STASH_FOOTER = [
     "WHY: this git op is repo-global",
     "destroys EVERY parallel agent's uncommitted work",
@@ -2226,6 +2253,115 @@ TEXT_CASES = [
       "tool_input": {"command": "git reset --hard"}},
      _STASH_FOOTER,
      ["DO NOT SKIP THE PUSH"]),
+
+    # -- the families 9bcbb2d's survey left carrying the wrong footer --------
+    #
+    # Each case asserts its OWN footer present AND the other two absent, so the
+    # pairing is inside every case: an assertion set that only checked absence
+    # would pass against a guard that printed nothing, and one that only checked
+    # presence would pass against a guard that printed all three.
+    #
+    # REF/OBJECT destroyers. These take no one's uncommitted work, so being told
+    # they "destroy EVERY parallel agent's uncommitted work" and offered
+    # `git show HEAD:<file>` was false advice, acted on by a reader with no
+    # human to sanity-check it.
+    ("text-branch-force-history-footer",
+     {"tool_name": "Bash", "cwd": "{REPO}",
+      "tool_input": {"command": "git branch -f main HEAD~1"}},
+     _HISTORY_FOOTER + ["moves an existing branch to another commit",
+                        "delete and re-create it explicitly"],
+     _SAFE_HINT_ONLY + _LEDGER_FOOTER),
+    ("text-push-force-history-footer",
+     {"tool_name": "Bash", "cwd": "{REPO}",
+      "tool_input": {"command": "git push --force origin main"}},
+     _HISTORY_FOOTER + ["overwrites the remote branch"],
+     _SAFE_HINT_ONLY + _LEDGER_FOOTER),
+    # `checkout -B` and `switch -C` sit INSIDE checkers whose other refusals are
+    # working-tree destroyers, so they are the two sites a per-subcommand
+    # classification would have got wrong. Pinned for exactly that reason.
+    ("text-checkout-B-history-footer",
+     {"tool_name": "Bash", "cwd": "{REPO}",
+      "tool_input": {"command": "git checkout -B feat HEAD"}},
+     _HISTORY_FOOTER + ["force-resets an existing branch"],
+     _SAFE_HINT_ONLY + _LEDGER_FOOTER),
+    ("text-switch-C-history-footer",
+     {"tool_name": "Bash", "cwd": "{REPO}",
+      "tool_input": {"command": "git switch -C feat"}},
+     _HISTORY_FOOTER + ["force-resets an existing branch"],
+     _SAFE_HINT_ONLY + _LEDGER_FOOTER),
+    # ...and the sibling of those two that IS a working-tree destroyer, from the
+    # same checker, keeping SAFE_HINT. Without this the pair above is satisfied
+    # by a guard that gave the whole checker the history footer.
+    ("text-switch-discard-keeps-stash-footer",
+     {"tool_name": "Bash", "cwd": "{REPO}",
+      "tool_input": {"command": "git switch --discard-changes main"}},
+     _SAFE_HINT_ONLY + ["throws away uncommitted working-tree changes"],
+     _HISTORY_FOOTER + _LEDGER_FOOTER),
+
+    # LEDGER writes. One file, not a shared working tree.
+    ("text-sed-ledger-footer",
+     {"tool_name": "Bash", "cwd": "{REPO}",
+      "tool_input": {"command": "sed -i '' s/x/y/ {SWARM}/goals.json"}},
+     _LEDGER_FOOTER + ["rewrites the run's ledger in place"],
+     _SAFE_HINT_ONLY + _HISTORY_FOOTER),
+    # The one refusal that calls `block()` directly rather than returning a
+    # reason — a different code path to the same footer.
+    ("text-redirect-ledger-footer",
+     {"tool_name": "Bash", "cwd": "{REPO}",
+      "tool_input": {"command": "> {SWARM}/state.json"}},
+     _LEDGER_FOOTER + ["writes the run's ledger from a shell"],
+     _SAFE_HINT_ONLY + _HISTORY_FOOTER),
+    # The Edit/Write path, which reaches `block()` from `_main` and not through
+    # any Bash tokenizer at all.
+    ("text-file-tool-ledger-footer",
+     {"tool_name": "Edit", "cwd": "{REPO}",
+      "tool_input": {"file_path": "{SWARM}/state.json", "old_string": "a",
+                     "new_string": "b"}},
+     _LEDGER_FOOTER + ["edits the run's ledger by hand"],
+     _SAFE_HINT_ONLY + _HISTORY_FOOTER),
+    # The other two decorated ledger checkers, so the family is pinned at every
+    # checker that carries it and not only at the two easiest to reach.
+    ("text-mv-ledger-footer",
+     {"tool_name": "Bash", "cwd": "{REPO}",
+      "tool_input": {"command": "mv {SWARM} /tmp/"}},
+     _LEDGER_FOOTER + ["moves the run's own state out from under the harness"],
+     _SAFE_HINT_ONLY + _HISTORY_FOOTER),
+    ("text-find-delete-ledger-footer",
+     {"tool_name": "Bash", "cwd": "{REPO}",
+      "tool_input": {"command": "find {SWARM} -name x -delete"}},
+     _LEDGER_FOOTER + ["deletes the run's own state under"],
+     _SAFE_HINT_ONLY + _HISTORY_FOOTER),
+    # `rm -rf .swarm-loop` is a LEDGER refusal living among the `rm -r` PATH
+    # rules — the fourth mixed site.
+    ("text-rm-swarm-ledger-footer",
+     {"tool_name": "Bash", "cwd": "{REPO}",
+      "tool_input": {"command": "rm -rf {SWARM}"}},
+     _LEDGER_FOOTER + ["deletes the run's own state under"],
+     _SAFE_HINT_ONLY + _HISTORY_FOOTER),
+
+    # `rm -r` PATH rules: ONE hint, the specific one. These already carried
+    # RM_HINT and then got SAFE_HINT stacked underneath it — two closing hints,
+    # the second generic enough to argue with the first.
+    ("text-rm-worktree-single-hint",
+     {"tool_name": "Bash", "cwd": "{REPO}",
+      "tool_input": {"command": "rm -rf {WT}"}},
+     ["that is a live worktree root",
+      "Retire a worktree with `git worktree remove <path>`"],
+     _SAFE_HINT_ONLY + _HISTORY_FOOTER + _LEDGER_FOOTER),
+    # A DIFFERENT rm-path reason, so the rule above is not one message's
+    # special case. (`rm -rf {REPO}` would have been the obvious second pick and
+    # is the wrong one: the primary tree is itself listed by `git worktree
+    # list`, so it answers "that is a live worktree root" and pins nothing new.)
+    ("text-rm-worktree-parent-single-hint",
+     {"tool_name": "Bash", "cwd": "{REPO}",
+      "tool_input": {"command": "rm -rf {OUTSIDE}"}},
+     # Measured, not assumed: the worktrees PARENT answers "repository root (or
+     # an ancestor of it)" and not "CONTAINS live worktrees", because a linked
+     # worktree's own `rev-parse --show-toplevel` names the worktree, so the
+     # ancestor test above matches first. Pinned as it actually reads.
+     ["that is the repository root (or an ancestor of it)",
+      "Retire a worktree with `git worktree remove <path>`"],
+     _SAFE_HINT_ONLY + _HISTORY_FOOTER + _LEDGER_FOOTER),
 ]
 
 

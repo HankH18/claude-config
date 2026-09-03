@@ -431,6 +431,77 @@ SAFE_HINT = (
 )
 
 
+HISTORY_HINT = (
+    "WHY: this op destroys REFS, OBJECTS or HISTORY — not anyone's uncommitted "
+    "work. No working tree is touched, so there is nothing here to stash and "
+    "nothing to restore from HEAD; what goes is the commits themselves, and for "
+    "a remote ref the copy other agents have already pushed.\n"
+    "SAFE ALTERNATIVES:\n"
+    "  - Publishing? Push WITHOUT force (`git push <remote> <branch>`), or "
+    "`--force-with-lease` if you must overwrite and can state what you expect to "
+    "be overwriting. Both are allowed.\n"
+    "  - Moving a branch? Create a NEW one (`git branch <new> <commit>`, allowed) "
+    "instead of force-moving a name another agent may have branched from.\n"
+    "  - Reclaiming space, or cleaning up a mess? Don't, mid-run: the dangling "
+    "objects are the only residue of work that has not been collected yet, which "
+    "is exactly what makes a lost commit recoverable.\n"
+    "If you genuinely must run this, do it yourself outside the swarm, or ask the "
+    "orchestrator to run it once the wave has been collected and committed."
+)
+
+def hinted(reason: str, footer: str) -> SelfHinted:
+    """One refusal, with the footer for ITS family and no other.
+
+    Used at the three return sites whose checker is MIXED and so cannot be
+    classified at the definition: `checkout -B` and `switch -C` (ref moves
+    sitting among working-tree refusals) and the `.swarm-loop` branch of
+    `check_rm_paths` (a ledger refusal sitting among the `rm -r` path rules)."""
+    return SelfHinted(reason + "\n\n" + footer)
+
+
+def refuses(footer: str | None):
+    """Declare, AT THE DEFINITION, which family a checker's refusals belong to.
+
+    THE BUG THIS REPLACES was structural, not a wording slip: `block()` stapled
+    `SAFE_HINT` onto every refusal and no rule opted in or out, so a footer
+    written for the working-tree destroyers ("reverts or destroys EVERY parallel
+    agent's uncommitted work", "refs/stash is one ref shared by all worktrees",
+    "compare with READ-ONLY `git show HEAD:<file>`") was also the closing advice
+    on `git branch -f`, on `sed -i` over the ledger, and on a `rm -rf` that had
+    just been given a more specific hint of its own. Measured across the file:
+    49 refusal sites, of which 22 carried outright false advice and 5 carried a
+    second footer contradicting the specificity of their first.
+
+    That matters more than tidiness because of who reads it. There is no human
+    in the loop; the refusal text is the entire basis on which an autonomous
+    orchestrator picks its next move, and false advice in a refusal is worse
+    than a terse refusal, because the agent acts on it. `9bcbb2d` measured
+    exactly that on the push gate: the generic half talked the reader out of
+    pushing at all.
+
+    A decorator rather than a lookup table keyed on the subcommand, because the
+    table would live far from the text it governs and a checker added later
+    would silently inherit whatever the default was — which is precisely how the
+    original defect arose. Here the family is one line above the refusals it
+    applies to.
+
+    `footer=None` means "this refusal already carries its own closing advice";
+    it is still marked `SelfHinted` so nothing is stapled underneath. A reason
+    that is ALREADY `SelfHinted` passes through untouched, so a checker that
+    delegates to one that classified itself (`check_push` -> the ledger gate)
+    does not get a second footer."""
+    def wrap(fn):
+        def inner(*a, **k):
+            reason = fn(*a, **k)
+            if reason is None or isinstance(reason, SelfHinted):
+                return reason
+            return SelfHinted(reason + "\n\n" + footer) if footer else SelfHinted(reason)
+        inner.__name__ = getattr(fn, "__name__", "inner")
+        inner.__doc__ = getattr(fn, "__doc__", None)
+        return inner
+    return wrap
+
+
 def allow() -> None:
     sys.exit(0)
 
@@ -1065,9 +1136,13 @@ def check_checkout(rest: list[str]) -> str | None:
     # exactly as `git branch -f` does. It has to be tested before the
     # branch-create early-return below, which used to swallow it.
     if short_flag_has(rest, "B", "bB"):
-        return ("`git checkout -B <branch>` force-resets an existing branch to the "
+        # REF_HISTORY, alone among this checker's refusals: `-B` moves a branch,
+        # it does not touch the working tree. Classified here rather than at the
+        # definition because `check_checkout` is mixed.
+        return hinted("`git checkout -B <branch>` force-resets an existing branch to the "
                 "start point (`-b` creates without clobbering, and is allowed).\n"
-                + 'If the branch really must move, delete and re-create it explicitly (`git branch -D <b>` is allowed) so the move is a deliberate two-step, not a flag.')
+                + 'If the branch really must move, delete and re-create it explicitly (`git branch -D <b>` is allowed) so the move is a deliberate two-step, not a flag.',
+                HISTORY_HINT)
     branch_flags = {"-b", "-B", "--orphan", "--detach", "-t", "--track"}
     if short_flag_has(rest, "bB", "bB") or any(
         a in branch_flags or a.startswith("--track") for a in rest
@@ -1097,9 +1172,11 @@ def check_switch(rest: list[str]) -> str | None:
         return "`git switch --discard-changes/-f` throws away uncommitted working-tree changes."
     # -C is to -c what checkout's -B is to -b: it force-resets an existing branch.
     if short_flag_has(rest, "C", "cC"):
-        return ("`git switch -C <branch>` force-resets an existing branch to the "
+        # REF_HISTORY, for the same reason as `checkout -B` above.
+        return hinted("`git switch -C <branch>` force-resets an existing branch to the "
                 "start point (`-c` creates without clobbering, and is allowed).\n"
-                + 'If the branch really must move, delete and re-create it explicitly (`git branch -D <b>` is allowed) so the move is a deliberate two-step, not a flag.')
+                + 'If the branch really must move, delete and re-create it explicitly (`git branch -D <b>` is allowed) so the move is a deliberate two-step, not a flag.',
+                HISTORY_HINT)
     return None
 
 
@@ -1230,6 +1307,7 @@ def check_apply(rest: list[str]) -> str | None:
 #     with a dirty tree, and it touches only the current branch.
 # A false block on a loop-mandated command is worse than either miss.
 
+@refuses(HISTORY_HINT)
 def check_push(rest: list[str]) -> str | None:
     # `--force-with-lease` is NOT an abbreviation of `--force` (it is longer), so
     # long_opt_abbrev leaves the loop's allowed lease-push alone. `-o` takes an
@@ -1448,6 +1526,7 @@ def _ledger_refusal(tree: str, branch: str, status: str) -> str:
         "silently.")
 
 
+@refuses(HISTORY_HINT)
 def check_branch(rest: list[str]) -> str | None:
     """`git branch -f <b> <commit>` MOVES an existing branch ref to another
     commit — the plumbing under it is `git update-ref`, which this guard already
@@ -1469,6 +1548,7 @@ def check_branch(rest: list[str]) -> str | None:
     return None
 
 
+@refuses(HISTORY_HINT)
 def check_fetch(rest: list[str]) -> str | None:
     """A `+` refspec is `--force` for one ref. Fetching into `refs/remotes/…`
     (or a tag) that way is the ORDINARY default refspec and must stay allowed;
@@ -1499,6 +1579,7 @@ def check_fetch(rest: list[str]) -> str | None:
     return None
 
 
+@refuses(HISTORY_HINT)
 def check_pull(rest: list[str]) -> str | None:
     """`git pull` is fetch + merge, and the FETCH half was judged by no rule.
 
@@ -1519,6 +1600,7 @@ def check_pull(rest: list[str]) -> str | None:
     return check_fetch(rest)
 
 
+@refuses(HISTORY_HINT)
 def check_update_ref(rest: list[str]) -> str | None:
     # Every form of update-ref mutates a ref, including the shared refs/stash;
     # nothing in the loop uses this plumbing at all.
@@ -1526,6 +1608,7 @@ def check_update_ref(rest: list[str]) -> str | None:
             "protection the run relies on.")
 
 
+@refuses(HISTORY_HINT)
 def check_reflog(rest: list[str]) -> str | None:
     sc = first_operand(rest)
     if sc in ("expire", "delete"):
@@ -1534,6 +1617,7 @@ def check_reflog(rest: list[str]) -> str | None:
     return None  # `git reflog` / `git reflog show` are read-only
 
 
+@refuses(HISTORY_HINT)
 def check_gc(rest: list[str]) -> str | None:
     # Bare `git gc` keeps unreachable objects for two weeks, which is what makes
     # "recoverable from a dangling stash commit" true. `--prune=now` is what makes
@@ -1546,11 +1630,13 @@ def check_gc(rest: list[str]) -> str | None:
     return None
 
 
+@refuses(HISTORY_HINT)
 def check_prune(rest: list[str]) -> str | None:
     return ("`git prune` deletes unreachable objects — the dangling commits that "
             "are the only residue of a clobbered stash or a deleted branch.")
 
 
+@refuses(HISTORY_HINT)
 def check_repack(rest: list[str]) -> str | None:
     # `-d` alone drops redundant packs (harmless). `-a`/`-A` WITH `-d` is the
     # combination that discards unreachable objects.
@@ -1559,11 +1645,13 @@ def check_repack(rest: list[str]) -> str | None:
     return None
 
 
+@refuses(HISTORY_HINT)
 def check_filter_branch(rest: list[str]) -> str | None:
     return ("`git filter-branch` rewrites history repo-wide; every other agent's "
             "branch point stops existing.")
 
 
+@refuses(HISTORY_HINT)
 def check_symbolic_ref(rest: list[str]) -> str | None:
     ops = [a for a in rest if not a.startswith("-")]
     if long_opt_abbrev(rest, "--delete") or short_flag_has(rest, "d") or len(ops) >= 2:
@@ -1600,6 +1688,26 @@ def check_sparse_checkout(rest: list[str]) -> str | None:
 #   sed -i '' 's/x/y/' .swarm-loop/goals.json  ·  mv .swarm-loop /tmp/
 
 SWARM_DIR = ".swarm-loop"
+
+# Defined HERE rather than beside HISTORY_HINT because it names `SWARM_DIR`, and
+# every rule it is attached to is defined below this line. One definition of
+# "where the run state lives", as everywhere else in this file.
+LEDGER_HINT = (
+    "WHY: this writes or removes ONE thing — the run's ledger under `" + SWARM_DIR
+    + "`. It is not a repo-global operation, it is not destructive to a shared "
+    "working tree, and it takes no one's uncommitted work. What it destroys is "
+    "the evidence the run scores itself by (`history.csv`, `state.json`, "
+    "`goals.json`, `manifest.json`, the frozen acceptance suite) AND the detector "
+    "that would have noticed it was gone.\\n"
+    "SAFE ALTERNATIVES:\\n"
+    "  - READING it is never blocked. `cat`, `git show`, `jq` over any of it, "
+    "freely.\\n"
+    "  - Changing it is `swarmloop.py`'s job — `measure`, `analyze`, `checkpoint`, "
+    "`freeze --amend`. A hand-edited ledger voids every score computed from it, "
+    "which is why the edit is refused rather than merely discouraged.\\n"
+    "  - Just need somewhere to write? Anywhere else. Only `" + SWARM_DIR
+    + "` is protected."
+)
 
 # The run's LEDGER: bookkeeping the harness writes from python (`swarmloop.py`),
 # never from a shell. A truncating redirect into any of these voids the run's
@@ -2381,14 +2489,19 @@ def expand_known_vars(op: str) -> str | None:
     return out if out != op else None
 
 
+@refuses(None)
 def check_rm_paths(args: list[str]) -> str | None:
     """Non-git `rm`. This is the rule the guard was missing entirely."""
     recursive = long_opt_abbrev(args, "--recursive") or short_cluster_has(args, "rRd")
     unknown: str | None = None
     for op in operands_after_options(args):
         if is_ledger(op) or in_swarm_tree(op):
-            return ("`rm " + op + "` deletes the run's own state under `" + SWARM_DIR
-                    + "` — frozen goals, acceptance suite, manifest, history.")
+            # LEDGER, alone among this checker's refusals — one directory, not a
+            # repo-global delete, so it gets the ledger footer and not the
+            # `rm -r` path rules' silence.
+            return hinted("`rm " + op + "` deletes the run's own state under `" + SWARM_DIR
+                    + "` — frozen goals, acceptance suite, manifest, history.",
+                    LEDGER_HINT)
         if not recursive:
             continue  # a non-recursive rm cannot take a directory
         why = rm_target_reason(op)
@@ -2425,6 +2538,7 @@ def check_rm_paths(args: list[str]) -> str | None:
     return None
 
 
+@refuses(LEDGER_HINT)
 def check_mv_paths(args: list[str]) -> str | None:
     for op in operands_after_options(args):
         if is_ledger(op) or in_swarm_tree(op):
@@ -2433,6 +2547,7 @@ def check_mv_paths(args: list[str]) -> str | None:
     return None
 
 
+@refuses(LEDGER_HINT)
 def _ledger_write(args: list[str], verb: str) -> str | None:
     for op in operands_after_options(args):
         if is_ledger(op):
@@ -2466,6 +2581,7 @@ def check_tee_paths(args: list[str]) -> str | None:
     return _ledger_write(args, "tee")
 
 
+@refuses(LEDGER_HINT)
 def check_find_paths(args: list[str]) -> str | None:
     # Narrow on purpose: only a find ROOTED IN the run-state directory. A blanket
     # rule on `find . ... -delete` would false-block `find . -name '*.pyc'
@@ -2524,11 +2640,14 @@ def check_redirect_target(target: str) -> None:
     can be reproduced from a single cwd, which is why no case in a 482-case
     battery had ever disagreed with it."""
     if is_ledger(target):
-        block("`> " + target + "` writes the run's ledger from a shell. Only "
+        # The one refusal that calls `block()` directly instead of returning a
+        # reason, so it is classified here rather than by a decorator.
+        block(hinted("`> " + target + "` writes the run's ledger from a shell. Only "
               "`swarmloop.py` may write it; a hand-written ledger voids every "
-              "score computed from it.")
+              "score computed from it.", LEDGER_HINT))
 
 
+@refuses(LEDGER_HINT)
 def protected_write_reason(path: str) -> str | None:
     """Path rule for the non-Bash file tools (Edit/Write/NotebookEdit/MultiEdit
     — every member of FILE_TOOLS, all of which must appear in REQUIRED_MATCHER).
