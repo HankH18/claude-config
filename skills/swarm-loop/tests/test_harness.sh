@@ -3827,6 +3827,638 @@ ck_has "W48c-7 --help names last-verdict-wins for the ledger" \
 
 
 # ===========================================================================
+# (y) push-gate — the Phase 7 gate that no epoch could ever satisfy.
+#
+# D-1: the gate's last condition was "everything .swarm-loop/ holds is
+# committed", evaluated inside Phase 7 — while Phase 7's own four commands write
+# into .swarm-loop/ (measure appends history.csv, analyze writes
+# analysis/cycle-N.json, checkpoint rewrites state.json). The condition was false
+# the instant the sequence finished, in every epoch of every run, forever, and
+# the failure was SILENT: an orchestrator that never pushes prints nothing about
+# not pushing, so the run's only offsite copy was withheld by a gate nobody could
+# satisfy. The prose now fires the push at the END of Phase 8; this battery pins
+# the mechanical half, including the two rungs the command deliberately REFUSES
+# to score.
+# ===========================================================================
+section "(y) push-gate: the gate no epoch could satisfy  [repo: pgate]"
+mk_repo pgate
+sl freeze
+gq add -A; gq commit -qm freeze
+sl measure --cycle 1 --timeout 60
+ck_exit "(y) cycle 1 measures" 0 "$RC"
+sl analyze --cycle 1
+sl checkpoint --cycle 1
+ck_exit "(y) cycle 1 checkpoints" 0 "$RC"
+
+sl push-gate --cycle 1
+ck_exit "(y) D-1 REPRODUCED: the gate refuses straight after Phase 7's commands" 1 "$RC"
+ck_has "(y) naming the rung that cannot be met inside Phase 7" "swarm-committed"
+ck_has "(y) and the file measure just appended" ".swarm-loop/history.csv"
+ck_has "(y) and the file analyze just wrote" "analysis/cycle-1.json"
+ck_has "(y) verdict is unambiguous" "push-gate: DO NOT PUSH"
+# Pin the per-rung STATUS, not just the prose beside it. Asserting on the detail
+# text alone is green whichever verdict the rung reached — the same defect this
+# file catalogues, one layer down.
+ck_has "(y) the committed rung is marked FAIL" \
+       'FAIL          everything `.swarm-loop/` holds is committed'
+ck_has "(y) and the rungs Phase 7 CAN satisfy are marked PASS" \
+       'PASS          `verify` passed this epoch'
+ck_has "(y) including the analysis rung" 'PASS          `analyze` did not exit 1'
+ck_has "(y) and the tracked-file rung" "PASS          this epoch's tracked-file count"
+
+# The same command, same cycle, after Phase 8's ledger commit. This is the whole
+# claim of the reorder: the condition is satisfiable HERE and nowhere earlier.
+gq add .swarm-loop; gq commit -qm "epoch 1 ledger"
+sl push-gate --cycle 1
+ck_exit "(y) and CLEARS after Phase 8's ledger commit — same cycle, same gate" 0 "$RC"
+ck_has "(y) saying only the mechanical conditions are met" "the mechanical conditions are MET"
+ck_has "(y) exit 0 is explicitly not permission" "This is not permission to push"
+# The two conditions no command can answer are printed on the PASS path too. A
+# gate that scores five of seven while LOOKING like seven is the defect class
+# this whole file exists to catch.
+ck_has "(y) the unscorable integration condition is printed on the PASS path" \
+       "OPERATOR      this epoch's integrations landed green"
+ck_has "(y) so is the unscorable findings condition" \
+       "OPERATOR      no rung-2 verifier finding invalidates"
+ck_has "(y) and the count of what WAS scored is stated" \
+       "5 of the gate's conditions are mechanical"
+
+# A cycle that never happened must not pass vacuously.
+sl push-gate --cycle 2
+ck_exit "(y) a cycle nobody measured cannot push" 1 "$RC"
+ck_has "(y) naming the missing analysis" "analysis/cycle-2.json does not exist"
+ck_has "(y) and the missing checkpoint" "has no entry in state.json head_history"
+ck_has "(y) the analysis rung is marked FAIL, not merely mentioned" \
+       'FAIL          `analyze` did not exit 1'
+ck_has "(y) and so is the tracked-file rung" \
+       "FAIL          this epoch's tracked-file count"
+
+# Rung 2 is async: an outstanding verifier is an unmet condition, not a pass.
+sl dispatch --agent V-1 --kind verifier --subject "batch e1-b1"
+gq add .swarm-loop; gq commit -qm dispatched
+sl push-gate --cycle 1
+ck_exit "(y) an outstanding rung-2 verifier blocks the push" 1 "$RC"
+ck_has "(y) naming the verifier that has not returned" "V-1"
+ck_has "(y) as the rung it is" "rung2-returned"
+
+# The counterpart, and it is the load-bearing half: dispatch is ROLLING, so an
+# open TICKET dispatch is the normal state of a wide swarm. Blocking on every
+# open dispatch would rebuild the unsatisfiable gate in a new place.
+sl dispatch --close V-1
+sl dispatch --agent W-9 --kind ticket --subject T-900
+gq add .swarm-loop; gq commit -qm "rolling dispatch"
+sl push-gate --cycle 1
+ck_exit "(y) an open TICKET dispatch does NOT block — dispatch is rolling" 0 "$RC"
+ck_has "(y) it is reported as context instead of a veto" "not a push blocker"
+
+# A violated harness voids the scores, so there is no number to have read.
+echo "def test_injected(): assert True" >> .swarm-loop/acceptance/test_feature.py
+sl push-gate --cycle 1
+ck_exit "(y) a violated harness blocks the push" 1 "$RC"
+ck_has "(y) named as an integrity violation, not a bookkeeping miss" "harness VIOLATED"
+ck_has "(y) with the verify rung marked FAIL, not merely annotated" \
+       'FAIL          `verify` passed this epoch'
+write_acceptance_test
+sl verify
+ck_exit "(y) control: verify is green again once the frozen bytes are back" 0 "$RC"
+
+# A stale metric: 'analyze' exits 1, the table is not a verdict on the cycle,
+# and the epoch has no values for a push to be carrying.
+gq rm -q score.txt
+gq commit -qm "break the measuring stick"
+sl measure --cycle 2 --timeout 60
+ck_exit "(y) measure exits 1 when a metric command fails" 1 "$RC"
+sl analyze --cycle 2
+ck_exit "(y) analyze exits 1 on a stale metric" 1 "$RC"
+sl checkpoint --cycle 2
+gq add .swarm-loop; gq commit -qm "epoch 2 ledger"
+sl push-gate --cycle 2
+ck_exit "(y) a stale metric blocks the push" 1 "$RC"
+ck_has "(y) naming the metric with no row this cycle" "no measurement at cycle 2 for: accept"
+ck_has "(y) carried by the analysis rung's own FAIL" 'FAIL          `analyze` did not exit 1'
+
+# --push-remote never: the honest answer to "may I push?" is no, and the text
+# has to say that is a configuration rather than a failed condition.
+set_state push_remote '"never"'
+sl push-gate --cycle 2
+ck_exit "(y) --push-remote never answers no" 1 "$RC"
+ck_has "(y) and says it is configuration, not a failure" "NOT APPLICABLE"
+ck_hasnt "(y) scoring nothing at all in that mode" "OPERATOR"
+
+# ===========================================================================
+# (y2) The tracked-file rung, against checkpoint's OWN arithmetic — the two
+#      sites must not disagree about what "sharp" means.
+# ===========================================================================
+section "(y2) push-gate: the tracked-file drop rung  [repo: pgdrop]"
+mk_repo pgdrop
+sl freeze
+gq add -A; gq commit -qm freeze
+sl measure --cycle 1 --timeout 60
+sl analyze --cycle 1
+sl checkpoint --cycle 1
+mkdir -p bulk
+i=1
+while [ "$i" -le 60 ]; do echo "x" > "bulk/f$i.txt"; i=$((i + 1)); done
+gq add -A; gq commit -qm bulk
+sl measure --cycle 2 --timeout 60
+sl analyze --cycle 2
+sl checkpoint --cycle 2
+gq add .swarm-loop; gq commit -qm "epoch 2 ledger"
+sl push-gate --cycle 2
+ck_exit "(y2) control: a tree that GREW pushes fine" 0 "$RC"
+ck_has "(y2) with the rung marked PASS" "PASS          this epoch's tracked-file count"
+ck_has "(y2) and both numbers printed" "tracked files"
+
+gq rm -r -q bulk
+gq commit -qm "index wipe shape"
+sl measure --cycle 3 --timeout 60
+sl analyze --cycle 3
+sl checkpoint --cycle 3
+ck_has "(y2) checkpoint's own tripwire fires on the drop" "TRACKED FILE COUNT DROPPED SHARPLY"
+gq add .swarm-loop; gq commit -qm "epoch 3 ledger"
+sl push-gate --cycle 3
+ck_exit "(y2) and the push gate REFUSES on the same arithmetic" 1 "$RC"
+ck_has "(y2) naming the rung" "tracked-files"
+ck_has "(y2) marked FAIL, not merely reported" "FAIL          this epoch's tracked-file count"
+ck_has "(y2) citing checkpoint's own threshold, not a second opinion" "max(25, 10%)"
+
+# ===========================================================================
+# (z) conflicts — pairwise TEXTUAL conflict between task branches, answered by
+#     git rather than by declared globs.
+#
+# D-2: `merge-tree` appeared four times in this skill and all four were prose.
+# check-wave's veto reasons about the ownership globs a ticket DECLARED and can
+# only ever be as right as the declarations; nothing anywhere compared two
+# branches' actual content. This is deliberately NOT a pre-dispatch check —
+# at check-wave time every lane holds zero commits, so a tidy pairwise verdict
+# there would be a green about work that does not exist yet.
+# ===========================================================================
+section "(z) conflicts: pairwise merge-tree verdicts  [repo: cflct]"
+mk_repo cflct
+printf 'A = 1\nB = 2\nC = 3\n' > shared.py
+gq add -A; gq commit -qm shared
+
+gq checkout -q -b task/T-101 main
+printf 'A = 111\nB = 2\nC = 3\n' > shared.py
+gq commit -qam T101
+gq checkout -q main
+gq checkout -q -b task/T-102 main
+printf 'A = 999\nB = 2\nC = 3\n' > shared.py
+gq commit -qam T102
+gq checkout -q main
+gq checkout -q -b task/T-103 main
+printf 'A = 1\nB = 2\nC = 333\n' > shared.py
+gq commit -qam T103
+gq checkout -q main
+gq checkout -q -b task/T-104 main
+echo "x = 1" > only_mine.py
+gq add -A; gq commit -qm T104
+gq checkout -q main
+gq branch task/T-105 main          # provisioned, never dispatched
+
+sl conflicts T-101,T-102 T-103 T-104 T-105 T-999
+ck_exit "(z) a conflicting pair takes the batch to exit 1" 1 "$RC"
+ck_has "(z) the conflicting PAIR is named" "task/T-101 <-> task/T-102"
+ck_has "(z) with the path git actually conflicted on" "! shared.py"
+ck_has "(z) clean-but-same-file is ADVISORY, never a veto" "ADVISORY (merges clean)"
+ck_has "(z) naming the file both sides touched" "task/T-101 <-> task/T-103   via  shared.py"
+ck_has "(z) a genuinely disjoint pair reads CLEAN" "CLEAN     task/T-101 <-> task/T-104"
+ck_has "(z) an EMPTY lane is named, never dropped" "task/T-105: 0 commits ahead"
+ck_has "(z) a branch that does not exist is named too" "T-999: no such branch"
+ck_has "(z) and the base-staleness blind spot is stated" "BLIND SPOT"
+ck_hasnt "(z) a VETOed pair is not ALSO reported clean" "CLEAN     task/T-101 <-> task/T-102"
+ck_hasnt "(z) nor advisory" "task/T-101 <-> task/T-102   via"
+
+# A wholly clean batch: the blind spot is printed here TOO, which is the point of
+# printing it — a clean pairwise answer is never permission to land.
+sl conflicts T-103 T-104
+ck_exit "(z) two disjoint branches exit 0" 0 "$RC"
+ck_hasnt "(z) with no veto" "VETO:"
+ck_has "(z) a bare ticket id resolves task/<id>" "CLEAN     task/T-103 <-> task/T-104"
+ck_has "(z) the blind spot prints on the all-clean path as well" "BLIND SPOT"
+
+# Base staleness is the half merge-tree structurally cannot see.
+echo "main moved" > src/app.py
+gq add -A; gq commit -qm "main moves"
+sl conflicts T-103 T-104
+ck_exit "(z) a stale base is not a veto" 0 "$RC"
+ck_has "(z) but it IS named, per branch" "STALE BASE  task/T-103"
+ck_has "(z) with the commit count behind base" "1 commit(s) behind main"
+
+# No merge base at all: not comparable, and it says so rather than guessing.
+gq checkout --orphan task/T-106
+gq reset -q
+echo "z = 1" > z.py
+gq add z.py; gq commit -qm orphan
+gq checkout -qf main
+sl conflicts T-103 T-106
+ck_exit "(z) a branch with no merge base is not comparable" 1 "$RC"
+ck_has "(z) and is reported, not silently dropped" "git could not count commits against main"
+
+sl conflicts T-101 T-102 --json
+ck_exit "(z) --json keeps the exit code" 1 "$RC"
+ck_has "(z) --json carries the verdict" '"verdict": "veto"'
+ck_has "(z) --json carries the blind spot too" '"blind_spot"'
+
+sl conflicts T-103 --base nope
+ck_exit "(z) an unresolvable base is a refusal, not a clean answer" 1 "$RC"
+ck_has "(z) named as such" "does not resolve"
+
+# The documented merge-tree mapping is WRONG in a way that manufactures a
+# confident false VETO, and this was measured before the command was written:
+# `git merge-tree` exits 1 both for a real conflict AND for a ref it cannot
+# resolve, with stdout EMPTY. Read as "exit 1 == conflicts", a typo'd branch
+# name comes back as a conflict naming zero files.
+: > "$OUT"
+python3 - > "$OUT" 2>&1 <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["SL_DIR"])
+import swarmloop
+r = os.getcwd()
+print("badref=%s"   % swarmloop._merge_tree_pair(r, "task/T-101", "nosuchref")[0])
+print("nomergebase=%s" % swarmloop._merge_tree_pair(r, "task/T-101", "task/T-106")[0])
+print("conflict=%s" % swarmloop._merge_tree_pair(r, "task/T-101", "task/T-102")[0])
+print("clean=%s"    % swarmloop._merge_tree_pair(r, "task/T-101", "task/T-104")[0])
+PY
+ck_has "(z) a ref merge-tree cannot resolve is UNKNOWN, never a conflict" "badref=unknown"
+ck_has "(z) unrelated histories are UNKNOWN, never clean" "nomergebase=unknown"
+ck_has "(z) a real conflict is still reported as one" "conflict=conflict"
+ck_has "(z) and a real clean merge as clean" "clean=clean"
+
+# A pair git could not judge must never be folded into the clean list — the
+# prototype's clean set was "everything not vetoed and not advisory", which
+# printed each UNKNOWN pair a second time as CLEAN.
+: > "$OUT"
+python3 - > "$OUT" 2>&1 <<'PY'
+import argparse, os, sys
+sys.path.insert(0, os.environ["SL_DIR"])
+import swarmloop
+swarmloop._merge_tree_pair = lambda root, a, b: ("unknown", ["stubbed: git refused"])
+try:
+    swarmloop.cmd_conflicts(argparse.Namespace(
+        branches=["T-103", "T-104"], base="main", as_json=False))
+except SystemExit as e:
+    print("exit=%d" % e.code)
+PY
+ck_has "(z) a pair git could not judge prints UNKNOWN" "UNKNOWN   task/T-103 <-> task/T-104"
+ck_hasnt "(z) and is NEVER also listed as clean" "CLEAN     task/T-103 <-> task/T-104"
+ck_has "(z) an unanswered pair is exit 1, not a green" "exit=1"
+
+# The other way a CLEAN can be manufactured: 'no shared files' is what an EMPTY
+# file set looks like, so a failed `git diff` coerced to set() prints CLEAN about
+# a pair nothing was compared for.
+: > "$OUT"
+python3 - > "$OUT" 2>&1 <<'PY'
+import argparse, os, sys
+sys.path.insert(0, os.environ["SL_DIR"])
+import swarmloop
+swarmloop._branch_files = lambda root, base, ref: None
+try:
+    swarmloop.cmd_conflicts(argparse.Namespace(
+        branches=["T-103", "T-104"], base="main", as_json=False))
+except SystemExit as e:
+    print("exit=%d" % e.code)
+PY
+ck_has "(z) a branch whose file list git refuses is UNANSWERABLE" \
+       "git could not list the files it changed"
+ck_hasnt "(z) never a CLEAN built from an empty file set" \
+       "CLEAN     task/T-103 <-> task/T-104"
+ck_has "(z) and that is exit 1" "exit=1"
+
+
+# ===========================================================================
+# (y3) push-gate — an UNANSWERABLE rung is NOT a pass.
+#
+# The gate shipped printing, one line apart, "1 mechanical condition(s) this
+# command could NOT answer ... they are not passes." and "the mechanical
+# conditions are MET", at exit 0 — so `push-gate --cycle N && git push` spent an
+# unread rung as a passed one. That is the defect class the command was written
+# to remove, reappearing inside it. Both directions are pinned here, because a
+# refusal that fires on everything is not an improvement: the SAME fixture
+# clears at exit 0 before the rung is broken and refuses at exit 1 after.
+# ===========================================================================
+section "(y3) push-gate: an unanswered rung is not a pass  [repo: pgunans]"
+mk_repo pgunans
+sl freeze
+gq add -A; gq commit -qm freeze
+sl measure --cycle 1 --timeout 60
+sl analyze --cycle 1
+sl checkpoint --cycle 1
+echo "cycle 2 product change" >> src/app.py
+gq add -A; gq commit -qm c2
+sl measure --cycle 2 --timeout 60
+sl analyze --cycle 2
+sl checkpoint --cycle 2
+gq add .swarm-loop; gq commit -qm "epoch 2 ledger"
+
+# POSITIVE CONTROL, first and on the same fixture: a genuinely met gate clears.
+sl push-gate --cycle 2
+ck_exit "(y3) control: a genuinely met gate still exits 0" 0 "$RC"
+ck_has "(y3) control: and says so" "the mechanical conditions are MET"
+ck_has "(y3) control: with all five mechanical rungs answered here" \
+       "5 of the gate's conditions are mechanical and were scored here"
+sl push-gate --cycle 2 --json
+ck_exit "(y3) control: --json agrees on the exit code" 0 "$RC"
+ck_has "(y3) control: --json verdict is clear" '"verdict": "clear"'
+ck_has "(y3) control: --json counts five mechanical rungs" '"mechanical_conditions": 5'
+ck_has "(y3) control: all five of them answered" '"mechanical_answered": 5'
+ck_has "(y3) control: and nothing left unanswered" '"unanswered": []'
+
+# Now break exactly ONE rung's ability to answer, and nothing else: a state.json
+# that predates the tracked_files key — a run resumed across a skill upgrade.
+python3 - <<'PY'
+import json
+p = ".swarm-loop/state.json"
+s = json.load(open(p))
+for h in s.get("head_history", []):
+    h.pop("tracked_files", None)
+json.dump(s, open(p, "w"), indent=2)
+PY
+gq add .swarm-loop; gq commit -qm "state.json predating tracked_files"
+sl push-gate --cycle 2
+ck_exit "(y3) an UNANSWERABLE rung refuses the push, exactly like a FAIL" 1 "$RC"
+ck_has "(y3) the rung is marked UNANSWERABLE, not PASS" \
+       "UNANSWERABLE  this epoch's tracked-file count"
+ck_has "(y3) and the verdict line says DO NOT PUSH" "push-gate: DO NOT PUSH"
+ck_has "(y3) naming it as UNANSWERED rather than as a failure" "condition(s) UNANSWERED"
+ck_has "(y3) and naming WHICH rung went unanswered" "UNANSWERED: tracked-files"
+ck_has "(y3) in the gate's own words" "an unanswered rung is not a met one"
+# The whole defect in one assertion: these two sentences appeared together.
+ck_hasnt "(y3) and it must NOT also report the conditions met" \
+         "the mechanical conditions are MET"
+# The header count is a property of the GATE and must not shrink to the subset
+# it managed to read — "4 of the gate's conditions are mechanical" is how a
+# partial answer looks complete.
+ck_has "(y3) the mechanical rung COUNT does not degrade to the answered subset" \
+       "5 of the gate's conditions are mechanical"
+ck_has "(y3) the header states the split instead" "4 answered here, 1 UNANSWERABLE"
+# The operator checklist is still printed — an unanswerable rung must not also
+# swallow the two conditions no command can score.
+ck_has "(y3) the operator conditions are still printed on the refusal path" \
+       "OPERATOR      this epoch's integrations landed green"
+
+sl push-gate --cycle 2 --json
+ck_exit "(y3) --json refuses on the same rung" 1 "$RC"
+ck_has "(y3) --json verdict is 'unanswerable', never 'clear'" '"verdict": "unanswerable"'
+ck_hasnt "(y3) --json must not call it clear" '"verdict": "clear"'
+ck_has "(y3) --json still counts five mechanical rungs" '"mechanical_conditions": 5'
+ck_has "(y3) --json says only four were answered" '"mechanical_answered": 4'
+ck_has "(y3) --json names the unanswered rung for a machine reader" '"tracked-files"'
+
+# ===========================================================================
+# (y4) push-gate — the analysis rung's integrity check had no red path.
+#
+# It read `harness_integrity == "VIOLATED"`, and nothing can ever write that:
+# `analyze` is the only writer of analysis/cycle-N.json and it routes through
+# `_integrity_gate`, which die()s on VIOLATED before the file is saved. A new
+# refusal with no reachable red path, added by the change whose stated purpose
+# was removing gates with no red path. It now reads POSITIVELY — anything that
+# is not "intact" is not a pass — which is reachable, and a file predating the
+# key is UNANSWERABLE rather than a silent pass.
+# ===========================================================================
+section "(y4) push-gate: the analysis integrity rung, positively  [repo: pgunans]"
+cd "$TMP/pgunans" || exit 1
+python3 - <<'PY'
+import json
+p = ".swarm-loop/state.json"
+s = json.load(open(p))
+for i, h in enumerate(s.get("head_history", [])):
+    h["tracked_files"] = 40 + i     # restore the key the (y3) block stripped
+json.dump(s, open(p, "w"), indent=2)
+PY
+gq add .swarm-loop; gq commit -qm "state.json with tracked_files back"
+
+# CONTROL first: the untouched analysis passes, and says on what grounds.
+sl push-gate --cycle 2
+ck_exit "(y4) control: an intact analysis clears the gate" 0 "$RC"
+ck_has "(y4) control: and the rung says WHY it passed" "records harness_integrity=intact"
+
+# The reachable red path the old '== VIOLATED' comparison could not see.
+python3 - <<'PY'
+import json
+p = ".swarm-loop/analysis/cycle-2.json"
+a = json.load(open(p)); a["harness_integrity"] = "tampered"
+json.dump(a, open(p, "w"), indent=2)
+PY
+gq add .swarm-loop; gq commit -qm "analysis records a non-intact integrity"
+sl push-gate --cycle 2
+ck_exit "(y4) an analysis whose integrity is not 'intact' refuses the push" 1 "$RC"
+ck_has "(y4) the analysis rung is the one marked FAIL" \
+       'FAIL          `analyze` did not exit 1'
+ck_has "(y4) quoting the value it actually found" "harness_integrity='tampered'"
+ck_has "(y4) and saying what the rung requires" "not 'intact'"
+ck_hasnt "(y4) and the gate does not report the conditions met" \
+         "the mechanical conditions are MET"
+
+# The sibling hand-edit guard on this same rung, which had no case either.
+python3 - <<'PY2'
+import json
+p = ".swarm-loop/analysis/cycle-2.json"
+a = json.load(open(p)); a["cycle"] = 99
+json.dump(a, open(p, "w"), indent=2)
+PY2
+gq add .swarm-loop; gq commit -qm "analysis recording someone else's cycle"
+sl push-gate --cycle 2
+ck_exit "(y4) an analysis recording another cycle refuses" 1 "$RC"
+ck_has "(y4) naming both numbers" "records cycle 99, not 2"
+python3 - <<'PY2'
+import json
+p = ".swarm-loop/analysis/cycle-2.json"
+a = json.load(open(p)); a["cycle"] = 2
+json.dump(a, open(p, "w"), indent=2)
+PY2
+gq add .swarm-loop; gq commit -qm "analysis cycle restored"
+
+# The historical value still refuses — the old branch's intent is preserved.
+python3 - <<'PY'
+import json
+p = ".swarm-loop/analysis/cycle-2.json"
+a = json.load(open(p)); a["harness_integrity"] = "VIOLATED"
+json.dump(a, open(p, "w"), indent=2)
+PY
+gq add .swarm-loop; gq commit -qm "analysis records VIOLATED"
+sl push-gate --cycle 2
+ck_exit "(y4) a VIOLATED integrity still refuses" 1 "$RC"
+ck_has "(y4) named" "harness_integrity='VIOLATED'"
+
+# A file written before the key existed: not a pass and not a failure. It must
+# not read as a pass, which is what '== VIOLATED' did with an absent key.
+python3 - <<'PY'
+import json
+p = ".swarm-loop/analysis/cycle-2.json"
+a = json.load(open(p)); a.pop("harness_integrity", None)
+json.dump(a, open(p, "w"), indent=2)
+PY
+gq add .swarm-loop; gq commit -qm "analysis predating harness_integrity"
+sl push-gate --cycle 2
+ck_exit "(y4) an analysis predating the key is UNANSWERABLE, not a pass" 1 "$RC"
+ck_has "(y4) marked as such on the rung" 'UNANSWERABLE  `analyze` did not exit 1'
+ck_has "(y4) explaining what is missing" "carries no harness_integrity"
+ck_hasnt "(y4) and it is not laundered into a met gate" \
+         "the mechanical conditions are MET"
+
+# ===========================================================================
+# (y5) push-gate — the fail path the reorder left unsatisfiable.
+#
+# F7: the gate moved to the END of Phase 8, AFTER the epoch report is written
+# and committed, but its fail-path instruction still read "name the failing item
+# in the epoch report" with nothing said about committing that note. Obeying it
+# re-dirtied .swarm-loop/ and flipped the gate's LAST rung to FAIL on the re-run
+# — a refusal the operator created by following the instruction. This is that
+# sequence, mechanically: the middle step is the reproduction and the last step
+# is the fix SKILL.md and the command's own refusal text now both prescribe.
+# ===========================================================================
+section "(y5) push-gate: recording a refusal must not create one  [repo: pgnote]"
+mk_repo pgnote
+sl freeze
+gq add -A; gq commit -qm freeze
+sl measure --cycle 1 --timeout 60
+sl analyze --cycle 1
+sl checkpoint --cycle 1
+echo "# cycle 1" > .swarm-loop/reports/cycle-1.md
+sl dispatch --agent V-7 --kind verifier --subject "batch e1-b1"
+gq add .swarm-loop; gq commit -qm "epoch 1: report + ledger"
+
+sl push-gate --cycle 1
+ck_exit "(y5) the gate refuses on the outstanding verifier" 1 "$RC"
+ck_has "(y5) that is the rung that failed" "rung2-returned"
+ck_has "(y5) and the ledger rung is clean at this point" \
+       'PASS          everything `.swarm-loop/` holds is committed'
+ck_has "(y5) the refusal text tells you to commit the note it asks for" \
+       "COMMIT that amendment"
+
+# Obey the instruction as it USED to read — write the note, commit nothing.
+echo "- push declined: rung2-returned (V-7 outstanding)" >> .swarm-loop/reports/cycle-1.md
+sl push-gate --cycle 1
+ck_exit "(y5) still refusing" 1 "$RC"
+ck_has "(y5) REPRODUCED: an uncommitted note flips the LAST rung to FAIL too" \
+       'FAIL          everything `.swarm-loop/` holds is committed'
+ck_has "(y5) naming the report the operator was told to write" "reports/cycle-1.md"
+
+# Obey it as it reads now.
+gq add .swarm-loop; gq commit -qm "cycle 1: push declined — rung2-returned"
+sl push-gate --cycle 1
+ck_exit "(y5) and the real rung still refuses, as it should" 1 "$RC"
+ck_has "(y5) still the outstanding verifier" "rung2-returned"
+ck_has "(y5) but the ledger rung is clean again — no self-inflicted second failure" \
+       'PASS          everything `.swarm-loop/` holds is committed'
+ck_hasnt "(y5) and nothing invents a ledger failure" \
+         'FAIL          everything `.swarm-loop/` holds is committed'
+
+# ===========================================================================
+# (z2) conflicts — zero branches, and one branch counted twice.
+#
+# ZERO branches is the maximal form of "a shorter list read as a clean list",
+# which this command's own comment names as its whole failure mode: `conflicts
+# ""` / `,` / `"  "` — an unset `"$IDS"` in `conflicts "$IDS" && git merge ...` —
+# printed "0 comparable branch(es) ... nothing to compare" and exited 0.
+# Separately, dedupe was on the raw ARGUMENT string, so the two spellings this
+# command advertises for one branch both entered the live set and the branch was
+# compared to ITSELF, printing an ADVISORY that a branch disagrees with itself.
+# ===========================================================================
+section "(z2) conflicts: zero branches, and a branch named twice  [repo: cflct2]"
+mk_repo cflct2
+printf 'A = 1\nB = 2\nC = 3\n' > shared.py
+gq add -A; gq commit -qm shared
+gq checkout -q -b task/T-103 main
+printf 'A = 1\nB = 2\nC = 333\n' > shared.py
+gq commit -qam T103
+gq checkout -q main
+gq checkout -q -b task/T-104 main
+echo "x = 1" > only_mine.py
+gq add -A; gq commit -qm T104
+gq checkout -q main
+
+# POSITIVE CONTROL first: a real argument list is still answered, so the new
+# refusal is not one that fires on everything.
+sl conflicts T-103 T-104
+ck_exit "(z2) control: a real two-branch batch still answers, exit 0" 0 "$RC"
+ck_has "(z2) control: with the pair judged" "CLEAN     task/T-103 <-> task/T-104"
+
+sl conflicts ""
+ck_exit "(z2) an EMPTY argument refuses — nothing compared is not a clean batch" 1 "$RC"
+ck_has "(z2) saying exactly what resolved to nothing" "resolved to ZERO branch names"
+ck_hasnt "(z2) and never prints a comparable-branch count for it" "comparable branch(es)"
+sl conflicts ","
+ck_exit "(z2) a comma-only argument refuses too" 1 "$RC"
+ck_has "(z2) same reason" "resolved to ZERO branch names"
+sl conflicts "   "
+ck_exit "(z2) whitespace-only refuses too" 1 "$RC"
+ck_has "(z2) same reason" "resolved to ZERO branch names"
+
+# And the line is drawn at ZERO, not at "few": one real branch cannot conflict
+# with a peer, so it stays exit 0 — but the text refuses to be read as a clean
+# verdict about a comparison that never happened.
+sl conflicts T-104
+ck_exit "(z2) ONE real branch is still exit 0 — nothing can conflict with a peer" 0 "$RC"
+ck_has "(z2) but it says no pair was judged" "no pair was formed, so no pair was judged"
+
+# One branch, two spellings, both advertised by --help.
+sl conflicts T-103 task/T-103 T-104
+ck_exit "(z2) the two spellings of one branch do not manufacture a third" 0 "$RC"
+ck_has "(z2) the branch count is the number of BRANCHES, not of arguments" \
+       "conflicts: 2 comparable branch(es)"
+ck_hasnt "(z2) and no branch is compared to itself" "task/T-103 <-> task/T-103"
+ck_hasnt "(z2) so no ADVISORY is raised about a branch disagreeing with itself" \
+         "ADVISORY (merges clean)"
+n=$(grep -c -F "CLEAN     task/T-103 <-> task/T-104" "$OUT")
+ck "(z2) the one genuine pair is judged exactly once" "1" "$n"
+
+# --json must carry the branches the human-readable path is tested to name, or a
+# machine reader can be blinded to exactly the ones that made the exit code 1.
+sl conflicts T-103 T-104 T-999 --json
+ck_exit "(z2) --json refuses on an unresolvable branch" 1 "$RC"
+ck_has "(z2) --json names it in the unanswerable array, not just in the exit code" \
+       '"branch": "T-999"'
+ck_has "(z2) with the reason" "no such branch"
+ck_has "(z2) and the pair it COULD judge is still there" '"verdict": "CLEAN"'
+
+# ===========================================================================
+# (doc) The prose and the code must not contradict each other.
+#
+# The last pass at this reorder amended three sites and missed two, and a doc
+# claim that outlived its code is what F3/F6 were: merge-protocol.md documented
+# an ownership-glob comparison `conflicts` has never performed, and SKILL.md
+# still told an orchestrator mid-integration that the push happens in Phase 7.
+# Nothing executes prose, so nothing was red. These cases are the grep the last
+# pass did not run.
+# ===========================================================================
+section "(doc) SKILL.md and references must not contradict the code"
+SKILL_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$SKILL_ROOT" || exit 1
+
+: > "$OUT"; cat "$SKILL_ROOT/SKILL.md" >> "$OUT"
+ck_hasnt "(doc) Phase 6's body no longer puts the push in Phase 7" \
+         "any push all happen in Phase 7"
+ck_has "(doc) it says where the push actually fires" \
+       "the push fires at the END of Phase 8"
+ck_hasnt "(doc) nor does Phase 2 step 4 still say 'the push in Phase 7'" \
+         "the push in Phase 7 ships a"
+ck_has "(doc) the fail path tells you to COMMIT the amendment it asks for" \
+       "commit that amendment"
+ck_has "(doc) because the report was already committed when the gate ran" \
+       "written **and committed** before the gate answered"
+ck_has "(doc) and the terminal path covers a FINAL epoch that declined to push" \
+       "that refusal is the last thing this run records"
+ck_has "(doc) SKILL.md names the conflicts command at the step that runs it" \
+       "swarmloop.py conflicts <ids> --base main"
+
+: > "$OUT"; cat "$SKILL_ROOT/references/merge-protocol.md" >> "$OUT"
+ck_hasnt "(doc) merge-protocol no longer claims a comparison the code never makes" \
+         "compares the files a branch **touched** against the globs its ticket **declared**"
+ck_has "(doc) it states what ADVISORY actually reads" "loads no ticket graph"
+ck_has "(doc) and hands the declared-glob half to the operator" \
+       "check the named file against what each ticket **declared** it owns"
+ck_has "(doc) the zero-branch refusal is documented where the command is" \
+       "resolves to **zero** branch names"
+
+: > "$OUT"; cat "$SKILL_ROOT/scripts/swarmloop.py" >> "$OUT"
+ck_hasnt "(doc) and the docstring carries no copy of the retired claim" \
+         "ACTUAL touched files against check-wave's DECLARED globs"
+ck_has "(doc) it says plainly what ADVISORY is" \
+       "It is NOT a comparison against"
+
+# ===========================================================================
 cd / 2>/dev/null || true
 ELAPSED=$(( $(date +%s) - START_TS ))
 echo

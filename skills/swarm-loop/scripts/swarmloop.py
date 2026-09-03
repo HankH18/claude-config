@@ -19,6 +19,8 @@ Subcommands:
   escalate    Ask the USER to change something frozen/blocked (records ONLY)
   frontier    Ready set from the ticket graph (readiness + blast radius)
   check-wave  Refuse a wave whose members could own the same file
+  conflicts   Pairwise TEXTUAL conflict between task branches (git merge-tree)
+  push-gate   Score the mechanical rungs of the Phase 7 push gate
   reads       Read edges the graph does not declare (gates freeze)
   findings    Record checker findings durably, then mint tickets from them
   red-check   Prove each ticket's verify command FAILS before it is built
@@ -6620,6 +6622,592 @@ def cmd_retire(args):
     sys.exit(0)
 
 
+# ------------------------------------------------------- push gate / conflicts
+#
+# D-1, reproduced on a fresh fixture before a line of this was written. SKILL.md's
+# Phase 7 push gate required that "everything .swarm-loop/ currently holds is
+# committed" — while Phase 7's OWN four commands write into .swarm-loop/:
+# `measure` appends history.csv, `analyze` writes analysis/cycle-N.json,
+# `checkpoint` rewrites state.json. After the sequence the tree reads
+# `M .swarm-loop/history.csv`, `M .swarm-loop/state.json`, `?? .swarm-loop/
+# analysis/`, so the condition was false the instant it was evaluated — in every
+# epoch, of every run, forever — and the failure was SILENT, because an
+# orchestrator that never pushes prints nothing about not pushing. The one and
+# only offsite copy of the run's evidence was withheld by a gate nobody could
+# satisfy. The prose now fires the push at the END of Phase 8, after the ledger
+# commit, which is the only ordering under which that bullet's own rationale is
+# true; this is the mechanical half, because a prose ordering forces nothing and
+# prose invariants in this skill have a measured 100% failure rate.
+#
+# It is deliberately INCOMPLETE and says so on every run. SKILL.md's six bullets
+# are seven conditions once the rung-2 bullet is split into its mechanical half
+# (has the verifier returned) and its judgement half (does its finding invalidate
+# a merged branch); this command scores five and cannot score two. A gate that
+# quietly answers five of seven while LOOKING like it answered seven is the exact
+# defect class this file keeps producing, so the other two are printed as an
+# operator checklist — on the pass path as loudly as on the fail path.
+
+# The two conditions no command can answer, verbatim in the gate's own terms.
+PUSH_GATE_OPERATOR = (
+    ("integrations-green",
+     "this epoch's integrations landed green on `main`",
+     "The suite that proves it ran in the primary checkout at merge time "
+     "(merge-protocol step 4), and left no artifact this command can read. "
+     "Re-reading a green from a log is not the same claim."),
+    ("rung2-findings",
+     "no rung-2 verifier finding invalidates a branch merged into this epoch's "
+     "`main`",
+     "Whether a finding invalidates a merged branch is a judgement about the "
+     "finding's content. The command can only see THAT a verifier is still "
+     "outstanding, which is the half above."),
+)
+
+
+def _swarm_dirty(root):
+    """Uncommitted paths under .swarm-loop/, or None if git could not answer.
+
+    -uall on purpose: git collapses an untracked DIRECTORY to a single entry,
+    and `?? .swarm-loop/analysis/` was the exact shape of the D-1 reproduction —
+    the directory tells an operator less than the cycle file inside it. Ignored
+    paths (worktrees/, archive/, tool caches) are absent by construction, which
+    is why this is a usable gate condition at all.
+    """
+    out = _git(root, "status", "--porcelain", "-uall", "--", STATE_DIR)
+    if out.returncode != 0:
+        return None
+    return [ln for ln in (out.stdout or "").splitlines() if ln.strip()]
+
+
+def _push_gate_analysis(d, cycle):
+    """(status, detail) for the 'analyze did not exit 1' rung."""
+    jpath = os.path.join(d, ANALYSIS_DIR, "cycle-%d.json" % cycle)
+    rel = "%s/%s/cycle-%d.json" % (STATE_DIR, ANALYSIS_DIR, cycle)
+    if not os.path.exists(jpath):
+        return "FAIL", ("%s does not exist — cycle %d was never analyzed, so this "
+                        "epoch has no values to have read before pushing. Run "
+                        "'analyze --cycle %d'." % (rel, cycle, cycle))
+    try:
+        with open(jpath) as f:
+            a = json.load(f)
+    except (OSError, ValueError) as e:
+        return "FAIL", "%s will not parse (%s) — treat it as no analysis at all" % (rel, e)
+    if a.get("cycle") is not None and int(a["cycle"]) != cycle:
+        return "FAIL", ("%s records cycle %s, not %d — the file was hand-edited or "
+                        "copied; re-run 'analyze --cycle %d'"
+                        % (rel, a.get("cycle"), cycle, cycle))
+    stale = list(a.get("stale_metrics") or [])
+    if stale:
+        return "FAIL", ("no measurement at cycle %d for: %s. 'analyze' exits 1 on this, "
+                        "and the table it printed is not a verdict on this cycle — "
+                        "re-measure before pushing" % (cycle, ", ".join(stale)))
+    # Read POSITIVELY: the rung passes only on the one value that means the
+    # numbers were written against a verified-intact harness.
+    #
+    # This was `== "VIOLATED"`, a refusal that could not fire: `analyze` is the
+    # only writer of this file and it routes through `_integrity_gate`, which
+    # `die()`s on VIOLATED before `save_json` is ever reached — so no file on
+    # disk can carry that string, and a violated-at-analyze-time epoch has no
+    # cycle-N.json at all (caught above by 'does not exist'). A rung that reads
+    # as a live guard and cannot fire is exactly what this command was added to
+    # remove. What CAN happen is what the cycle-mismatch guard above already
+    # guards for — a hand-edited or copied file — plus a file written by another
+    # tool or a future schema; any value that is not "intact" means nothing here
+    # has established that the harness was sound when these numbers were taken.
+    integ = a.get("harness_integrity")
+    if integ is None:
+        # An analysis written before this key existed. Not a pass and not a
+        # failure: the question cannot be answered from the file. UNANSWERABLE
+        # blocks the push exactly like FAIL, so this degrades safely.
+        return "UNANSWERABLE", ("%s carries no harness_integrity — it predates the key "
+                                "(a run resumed across a skill upgrade), so whether the "
+                                "harness was intact when these numbers were written is "
+                                "not recorded. Re-run 'verify' and 'analyze --cycle %d', "
+                                "or read the epoch report by hand." % (rel, cycle))
+    if integ != "intact":
+        return "FAIL", ("%s records harness_integrity=%r, not 'intact' — nothing here "
+                        "establishes that the frozen harness was sound when those numbers "
+                        "were taken, and no later 'verify' makes them retroactively sound. "
+                        "Re-run 'analyze --cycle %d'." % (rel, integ, cycle))
+    return "PASS", ("%s exists, records cycle %d, records harness_integrity=intact, and "
+                    "no metric is stale" % (rel, cycle))
+
+
+def _push_gate_tracked(state, cycle):
+    """(status, detail) for the tracked-file-drop rung, using checkpoint's own
+    arithmetic — drop > max(25, 10% of previous) — so the two sites cannot
+    disagree about what 'sharp' means."""
+    hist = state.get("head_history") or []
+    entry = prev = None
+    for h in hist:
+        try:
+            c = int(h.get("cycle"))
+        except (TypeError, ValueError):
+            continue
+        if c == cycle:
+            entry = h
+        elif c < cycle:
+            if prev is None or c > int(prev.get("cycle", -1)):
+                prev = h
+    if entry is None:
+        return "FAIL", ("cycle %d has no entry in state.json head_history — "
+                        "'checkpoint --cycle %d' has not run, so the tracked-file "
+                        "number this rung is sourced from does not exist. A condition "
+                        "nobody sources a number for passes vacuously every epoch."
+                        % (cycle, cycle))
+    if prev is None:
+        return "PASS", ("cycle %d is the first checkpoint of this run — %s tracked "
+                        "files, nothing earlier to drop from"
+                        % (cycle, entry.get("tracked_files", "?")))
+    if "tracked_files" not in entry or "tracked_files" not in prev:
+        return "UNANSWERABLE", ("state.json predates the tracked_files key on cycle %d "
+                                "or %s — the count cannot be compared. Read "
+                                "`git ls-tree -r HEAD --name-only | wc -l` against the "
+                                "epoch report by hand." % (cycle, prev.get("cycle")))
+    now, was = entry["tracked_files"], prev["tracked_files"]
+    drop = was - now
+    if drop > max(25, 0.10 * was):
+        return "FAIL", ("tracked files fell %d (cycle %s: %d -> cycle %d: %d), past "
+                        "checkpoint's own max(25, 10%%) line. That is the index-wipe "
+                        "signature; explain the drop in the epoch report before the "
+                        "push, or do not push."
+                        % (drop, prev.get("cycle"), was, cycle, now))
+    return "PASS", ("tracked files %d -> %d since cycle %s (no sharp drop)"
+                    % (was, now, prev.get("cycle")))
+
+
+def cmd_push_gate(args):
+    """Score the mechanically checkable rungs of SKILL.md's Phase 7 push gate.
+
+    Runs at the END of Phase 8, after the ledger commit — see the D-1 note above
+    for why nowhere earlier can satisfy it. A false refusal here is CHEAP by
+    construction: the prescribed response to any unmet condition is already
+    "name it in the epoch report and carry it to the next epoch's gate", and this
+    command sits nowhere near dispatch, where a false refusal would wedge the run.
+    A false PASS is the expensive direction, so every rung that cannot be answered
+    is printed as unanswered rather than counted.
+
+    Exit 0 = every mechanical rung was ANSWERED and passed (the two operator
+    rungs are still yours). Exit 1 = do not push — which covers a rung that came
+    back UNANSWERABLE just as much as one that FAILED, because a gate that could
+    not read one of its own conditions has not cleared it. Never exit 2: this is
+    not a terminal signal.
+    """
+    root = repo_root()
+    d = sd(root)
+    state = load_json(os.path.join(d, STATE_FILE), "state")
+    cycle = args.cycle
+    mode = state.get("push_remote", "when-clean")
+    conds = []
+
+    def add(cid, ref, status, detail):
+        conds.append({"id": cid, "condition": ref, "status": status, "detail": detail})
+
+    if mode == "never":
+        # The honest answer to "may I push?" is no, so this is exit 1 — but it is
+        # a configuration, not a failed gate, and the text has to say which.
+        out = {"cycle": cycle, "verdict": "no-remote", "push_remote": mode,
+               "conditions": [], "operator_checklist": []}
+        if args.as_json:
+            print(json.dumps(out, indent=2))
+        else:
+            print("push-gate cycle %d: NOT APPLICABLE — this run was initialized "
+                  "--push-remote never." % cycle)
+            print("  The loop never touches a remote. Skip the push step entirely; there is "
+                  "no condition here to satisfy and nothing to carry to the next epoch.")
+            print("  Exit 1 because the answer to 'may I push?' is no — not because "
+                  "anything failed.")
+        sys.exit(1)
+
+    # (1) verify — the live integrity oracle, not a remembered one.
+    status, bad, notes = _verify_quiet(root, d, state)
+    if status == "intact":
+        add("verify", "`verify` passed this epoch", "PASS",
+            "frozen manifest re-hashed and authenticated: intact")
+    elif status == "not frozen":
+        add("verify", "`verify` passed this epoch", "FAIL",
+            "goals were never frozen — there are no locked targets for a measurement "
+            "to have been against, so there is no number this push would be carrying")
+    else:
+        add("verify", "`verify` passed this epoch", "FAIL",
+            "harness VIOLATED (%d finding(s), first: %s) — a violated harness voids the "
+            "scores, so there is no number to have read"
+            % (len(bad), bad[0] if bad else "?"))
+    for n in notes:
+        add("verify-note", "`verify` passed this epoch", "NOTE", n)
+
+    # (2) analyze produced values for THIS cycle.
+    st, detail = _push_gate_analysis(d, cycle)
+    add("analysis", "`analyze` did not exit 1 — no metric is stale", st, detail)
+
+    # (3) tracked-file count, sourced from checkpoint's own recorded number.
+    st, detail = _push_gate_tracked(state, cycle)
+    add("tracked-files", "this epoch's tracked-file count is not an unexplained drop",
+        st, detail)
+
+    # (4) rung-2 verifiers returned. ONLY dispatches of kind 'verifier' block.
+    # Blocking on every open dispatch would make the gate unsatisfiable in the
+    # healthy case the skill is built around — dispatch is rolling, so one
+    # epoch's merges and the next epoch's builds overlap by design, and an open
+    # TICKET dispatch is the normal state of a wide swarm, not a push blocker.
+    # That would have re-created D-1 in a new place.
+    open_recs = _open_dispatches(d)
+    verifiers = [r for r in open_recs if (r.get("kind") or "") == "verifier"]
+    others = [r for r in open_recs if (r.get("kind") or "") != "verifier"]
+    if verifiers:
+        add("rung2-returned", "every rung-2 verifier dispatched for this epoch has returned",
+            "FAIL",
+            "%d verifier dispatch(es) still open in %s/%s: %s. A verdict still outstanding "
+            "is an unmet condition, not a pass — wait for it, or carry the push to the next "
+            "epoch's gate."
+            % (len(verifiers), STATE_DIR, DISPATCH_FILE,
+               ", ".join(str(r.get("agent_ref")) for r in verifiers)))
+    else:
+        add("rung2-returned", "every rung-2 verifier dispatched for this epoch has returned",
+            "PASS",
+            "no open dispatch of kind 'verifier' in %s/%s%s"
+            % (STATE_DIR, DISPATCH_FILE,
+               "" if not others else
+               " (%d other dispatch(es) open — rolling dispatch, not a push blocker: %s)"
+               % (len(others), ", ".join(str(r.get("agent_ref")) for r in others))))
+
+    # (5) .swarm-loop/ committed — the rung D-1 was about.
+    dirty = _swarm_dirty(root)
+    if dirty is None:
+        add("swarm-committed", "everything `.swarm-loop/` holds is committed", "UNANSWERABLE",
+            "git status failed — check the repository by hand before pushing")
+    elif dirty:
+        add("swarm-committed", "everything `.swarm-loop/` holds is committed", "FAIL",
+            "%d uncommitted path(s) under %s/: %s. Phase 8's ledger commit "
+            "(`git add %s && git commit`) has not run — a push of a main carrying none of "
+            "the epoch's evidence is what makes 'resume' on a fresh clone useless, and "
+            "this push is the run's only offsite copy of it."
+            % (len(dirty), STATE_DIR, "; ".join(x.strip() for x in dirty[:8])
+               + (" ..." if len(dirty) > 8 else ""), STATE_DIR))
+    else:
+        add("swarm-committed", "everything `.swarm-loop/` holds is committed", "PASS",
+            "%s/ is clean at HEAD" % STATE_DIR)
+
+    failed = [c for c in conds if c["status"] == "FAIL"]
+    unans = [c for c in conds if c["status"] == "UNANSWERABLE"]
+    scored = [c for c in conds if c["status"] in ("PASS", "FAIL")]
+    # D-1b: an UNANSWERABLE rung blocks exactly like a FAIL. It used not to, and
+    # the command then printed "1 mechanical condition(s) this command could NOT
+    # answer ... they are not passes." and "the mechanical conditions are MET"
+    # one line apart, at exit 0 — so `push-gate --cycle N && git push` spent the
+    # unanswered rung as a pass. Two real producers reach it: a state.json that
+    # predates the tracked_files key (a run resumed across a skill upgrade) and
+    # `git status` itself failing, which is the D-1 rung. The sibling `conflicts`
+    # draws the same line for the same reason, and this command's own docstring
+    # says which direction is the expensive one: a false PASS.
+    blocking = failed + unans
+
+    if args.as_json:
+        print(json.dumps({
+            "cycle": cycle,
+            # Three verdicts, not two: "clear" must never be the word for a gate
+            # that could not read one of its own rungs.
+            "verdict": ("blocked" if failed else ("unanswerable" if unans else "clear")),
+            "push_remote": mode,
+            # The count of mechanical rungs is a property of the GATE and does
+            # not shrink when one of them cannot be read — it used to be
+            # len(scored), so an unanswered rung silently turned "5 of 7" into
+            # "4 of 7" and the subset looked complete.
+            "mechanical_conditions": len(scored) + len(unans),
+            "mechanical_answered": len(scored),
+            "unanswered": [c["id"] for c in unans],
+            "gate_conditions_total": len(scored) + len(unans) + len(PUSH_GATE_OPERATOR),
+            "conditions": conds,
+            "operator_checklist": [{"id": i, "condition": c, "why_unmechanizable": w}
+                                   for i, c, w in PUSH_GATE_OPERATOR],
+        }, indent=2))
+        sys.exit(1 if blocking else 0)
+
+    print("push-gate cycle %d (push-remote %s): %d of the gate's conditions are mechanical%s"
+          % (cycle, mode, len(scored) + len(unans),
+             " and were scored here" if not unans else
+             " — %d answered here, %d UNANSWERABLE (an unanswered rung is not a pass)"
+             % (len(scored), len(unans))))
+    for c in conds:
+        if c["status"] == "NOTE":
+            print("      note: %s" % _oneline(c["detail"], 200))
+            continue
+        print("  %-13s %s" % (c["status"], c["condition"]))
+        print("      %s" % _oneline(c["detail"], 400))
+    # Printed on the PASS path too, and it is the whole point of printing it: a
+    # gate that answers a strict subset while looking complete is how a green
+    # gets manufactured.
+    print("  --- NOT ANSWERED HERE — %d condition(s) only you can score:"
+          % len(PUSH_GATE_OPERATOR))
+    for _i, cond, why in PUSH_GATE_OPERATOR:
+        print("  OPERATOR      %s" % cond)
+        print("      %s" % why)
+    if unans:
+        print("  --- %d mechanical condition(s) this command could NOT answer (above, "
+              "UNANSWERABLE) — they are not passes." % len(unans))
+    if blocking:
+        if failed:
+            print("push-gate: DO NOT PUSH — %d condition(s) unmet: %s"
+                  % (len(failed), ", ".join(c["id"] for c in failed)))
+        if unans:
+            print("push-gate: DO NOT PUSH — %d condition(s) UNANSWERED: %s. This gate has "
+                  "not cleared: an unanswered rung is not a met one. Each line above says "
+                  "how to answer it by hand."
+                  % (len(unans), ", ".join(c["id"] for c in unans)))
+        print("Name each in the epoch report with why, COMMIT that amendment (`git add %s "
+              "&& git commit`) — the report was already committed before this gate ran, so "
+              "an uncommitted note re-dirties %s and this gate's last rung fails on the "
+              "re-run for a reason you created by obeying this line — then carry the push "
+              "to the next epoch's gate. Do not push a subset and do not push anyway."
+              % (STATE_DIR, STATE_DIR))
+        sys.exit(1)
+    print("push-gate: the mechanical conditions are MET. This is not permission to push — "
+          "score the operator conditions above first, then push and verify each remote's "
+          "SHA (the verify-the-deploy skill), never the command's exit code.")
+    sys.exit(0)
+
+
+OID_RE = re.compile(r"^[0-9a-f]{40,64}$")
+
+
+def _merge_tree_pair(root, a, b):
+    """(verdict, [detail]) — 'clean' | 'conflict' | 'unknown'. Needs git 2.38+.
+
+    Touches no working tree and needs no worktree, which is why this can be asked
+    of a whole batch at once.
+
+    MEASURED, because the documented mapping is wrong in a way that manufactures
+    a confident false VETO: `git merge-tree` exits 1 both for a real conflict AND
+    for a ref it cannot resolve ("merge-tree: nosuch - not something we can
+    merge", stdout EMPTY). Read as the docs describe it, a typo'd branch name
+    comes back as a conflict naming zero files. The tell is stdout: a real
+    conflict writes the merged tree's OID on line 0 and the conflicted paths
+    after it. No OID, no answer. Unrelated histories exit 128 and a git too old
+    for --write-tree exits 129; both are 'unknown', never 'clean'.
+    """
+    r = _git(root, "merge-tree", "--write-tree", "--name-only", "--no-messages", a, b)
+    lines = [x for x in (r.stdout or "").splitlines()]
+    if r.returncode == 0 and lines and OID_RE.match(lines[0].strip()):
+        return "clean", []
+    if r.returncode == 1 and lines and OID_RE.match(lines[0].strip()):
+        return "conflict", [x.strip() for x in lines[1:] if x.strip()]
+    msg = ((r.stderr or "").strip() or (r.stdout or "").strip()
+           or "exit %d with no output" % r.returncode)
+    return "unknown", ["git merge-tree could not answer (exit %d): %s"
+                       % (r.returncode, msg.splitlines()[0])]
+
+
+def _resolve_branch(root, ref):
+    """(resolved_ref, sha) or (None, None). A bare ticket id also tries task/<id>."""
+    cands = [ref] if ref.startswith("task/") else [ref, "task/" + ref]
+    for cand in cands:
+        r = _git(root, "rev-parse", "--verify", "--quiet", cand + "^{commit}")
+        sha = (r.stdout or "").strip()
+        if r.returncode == 0 and sha:
+            return cand, sha
+    return None, None
+
+
+def _branch_files(root, base, ref):
+    """Files `ref` changed since it forked from `base`, or None if git failed.
+
+    --no-renames -z -- for the reasons check-branch spells out: default rename
+    detection prints only a rename's destination, and a non-ASCII path comes back
+    \\-escaped and quoted without -z.
+    """
+    r = _git(root, "diff", "--no-renames", "--name-only", "-z",
+             "%s...%s" % (base, ref), "--")
+    if r.returncode != 0:
+        return None
+    return set(p for p in (r.stdout or "").split("\0") if p.strip())
+
+
+def cmd_conflicts(args):
+    """Pairwise TEXTUAL conflict between task branches, answered by git.
+
+    D-2: `merge-tree` appeared four times in this skill and all four were prose.
+    check-wave's ownership veto reasons about DECLARED globs and can only ever be
+    as right as the declarations; nothing anywhere compared two branches' actual
+    content to each other.
+
+    NOT a pre-dispatch check, and it must never be moved into check-wave. Phase 4
+    makes check-wave a precondition of SPAWNING, so at check-wave time every lane
+    holds zero commits — measured at exactly that moment this command reports
+    "0 comparable branches", and a variant that printed a tidy pairwise verdict
+    over empty branches would be read as a green about work that does not exist
+    yet. This belongs at Phase 5 / merge-protocol step 3, where every branch
+    carries its final commits.
+
+    The ADVISORY verdict is the higher-value half, and it is worth stating
+    exactly what it is and is not. It IS `files[a] & files[b]` — branch A's
+    touched files intersected with branch B's. It is NOT a comparison against
+    check-wave's declared globs: nothing here loads the ticket graph or reads a
+    ticket's `owns`/`scope`, and no ticket id appears in the output. This
+    docstring and merge-protocol.md both used to claim the glob comparison, and
+    the code never did it — the claim was the load-bearing justification for the
+    verdict, so it is corrected rather than softened. What ADVISORY actually
+    buys, which is real: it is the first check anywhere that compares two
+    branches' ACTUAL content to each other rather than to their declarations, so
+    a wrong ownership map becomes visible as two branches editing one file. The
+    operator does the second half — read both diffs against what those tickets
+    declared. Textual mergeability is not agreement.
+    """
+    root = repo_root()
+    base = args.base
+    if _resolve_branch(root, base)[0] is None:
+        die("base ref %r does not resolve — nothing to compare branches against" % base)
+
+    wanted = []
+    for raw in args.branches:
+        for b in re.split(r"[,\s]+", raw):
+            if b.strip() and b.strip() not in wanted:
+                wanted.append(b.strip())
+
+    # ZERO branches is the shortest possible version of this command's whole
+    # failure mode. argparse's nargs="+" only guarantees a non-empty ARGV, not a
+    # non-empty branch list: `conflicts ""`, `conflicts ,` and `conflicts "  "`
+    # all split to nothing, which is exactly what an unset shell variable
+    # expands to in `conflicts "$IDS" --base main && git merge ...`. That used to
+    # print "0 comparable branch(es)" and exit 0 — a green handed back for
+    # comparing nothing at all.
+    if not wanted:
+        die("the argument list resolved to ZERO branch names (%s) — nothing was compared, "
+            "and nothing compared is not a clean batch. An unset or empty shell variable "
+            "expanded into this command line is the usual cause. Name the branches."
+            % ", ".join(repr(x) for x in args.branches))
+
+    live, skipped, files = [], [], {}
+    # Dedupe on the RESOLVED ref, not on the argument spelling. This command
+    # advertises that a bare ticket id also resolves task/<id>, so `conflicts
+    # T-103 task/T-103` used to put ONE branch into the live set twice and then
+    # compare it to itself — printing an ADVISORY that a branch disagrees with
+    # itself over the files it touched, a verdict that cannot reflect reality, at
+    # exactly the moment the operator is choosing merge order.
+    seen = set()
+    for b in wanted:
+        ref, _sha = _resolve_branch(root, b)
+        if ref is None:
+            skipped.append((b, "no such branch (nor task/%s) — nothing to compare" % b))
+            continue
+        if ref in seen:
+            continue
+        seen.add(ref)
+        lane = _lane_commits(root, base, ref)
+        if lane is None:
+            skipped.append((ref, "git could not count commits against %s" % base))
+            continue
+        if lane["ahead"] == 0:
+            skipped.append((ref, "0 commits ahead of %s — an EMPTY lane. At merge time "
+                                 "that is a task that delivered nothing, and a clean "
+                                 "answer about it is an answer about nothing" % base))
+            continue
+        touched = _branch_files(root, base, ref)
+        if touched is None:
+            # Never substitute an empty set here. Empty makes every pair look
+            # like disjoint file sets and prints CLEAN — a confident wrong
+            # verdict manufactured out of a failed subprocess.
+            skipped.append((ref, "git could not list the files it changed since %s, so "
+                                 "whether its file set is disjoint from anything cannot "
+                                 "be checked" % base))
+            continue
+        live.append((ref, lane))
+        files[ref] = touched
+
+    pairs = []
+    for i, (a, _la) in enumerate(live):
+        for b, _lb in live[i + 1:]:
+            verdict, detail = _merge_tree_pair(root, a, b)
+            shared = sorted(files[a] & files[b])
+            if verdict == "conflict":
+                pairs.append({"a": a, "b": b, "verdict": "VETO", "files": detail,
+                              "shared": shared})
+            elif verdict == "unknown":
+                pairs.append({"a": a, "b": b, "verdict": "UNKNOWN", "files": [],
+                              "shared": shared, "why": detail[0]})
+            elif shared:
+                pairs.append({"a": a, "b": b, "verdict": "ADVISORY", "files": [],
+                              "shared": shared})
+            else:
+                pairs.append({"a": a, "b": b, "verdict": "CLEAN", "files": [],
+                              "shared": []})
+
+    stale = [{"branch": ref, "behind": lane["behind"], "fork": lane["fork"]}
+             for ref, lane in live if lane["behind"]]
+    veto = [p for p in pairs if p["verdict"] == "VETO"]
+    unknown = [p for p in pairs if p["verdict"] == "UNKNOWN"]
+    advisory = [p for p in pairs if p["verdict"] == "ADVISORY"]
+    clean = [p for p in pairs if p["verdict"] == "CLEAN"]
+    # A shorter list read as a clean list is this command's failure mode, so an
+    # unanswerable BRANCH is exit 1 exactly like an unanswerable PAIR. At the one
+    # place this is meant to run — ordering a collected batch's merges — a
+    # missing ref is a typo and an empty lane is a failed task, and neither is a
+    # reason to hand back exit 0. Nothing here is on the dispatch path, so a
+    # false refusal costs a reread, not a wedged run.
+    bad = bool(veto or unknown or skipped)
+
+    if args.as_json:
+        print(json.dumps({
+            "base": base,
+            "comparable": [ref for ref, _l in live],
+            "unanswerable": [{"branch": b, "why": w} for b, w in skipped],
+            "pairs": pairs,
+            "stale_base": stale,
+            "verdict": "veto" if veto else ("unknown" if unknown else
+                                            ("advisory" if advisory else "clean")),
+            "blind_spot": "merge-tree says nothing about base staleness: a branch forked "
+                          "27 commits ago merges clean pairwise and still dies at "
+                          "`merge --ff-only`. See stale_base.",
+        }, indent=2))
+        sys.exit(1 if bad else 0)
+
+    print("conflicts: %d comparable branch(es) against base %s" % (len(live), base))
+    for b, why in skipped:
+        print("  UNANSWERABLE  %s: %s" % (b, why))
+    if len(live) < 2:
+        print("conflicts: nothing to compare — fewer than two branches carry commits.")
+        print("  This is NOT a clean verdict about anything: no pair was formed, so no "
+              "pair was judged.")
+        sys.exit(1 if bad else 0)
+
+    if veto:
+        print("VETO: these branch PAIRS conflict textually — they cannot both land unattended:")
+        for p in veto:
+            print("  %s <-> %s" % (p["a"], p["b"]))
+            for f_ in p["files"]:
+                print("      ! %s" % f_)
+        print("  Merge them one at a time in dependency order and resolve on the integration")
+        print("  branch (merge-protocol step 5), or return the later one to the backlog.")
+    for p in unknown:
+        print("  UNKNOWN   %s <-> %s: %s" % (p["a"], p["b"], p.get("why")))
+        print("      Not a clean answer. Do not read it as one.")
+    if advisory:
+        print("ADVISORY (merges clean) — the same file changed by BOTH sides:")
+        for p in advisory:
+            print("  %s <-> %s   via  %s" % (p["a"], p["b"], ", ".join(p["shared"])))
+        print("  Textual mergeability is not agreement: two clean hunks in one file are how")
+        print("  the ownership map gets contradicted without anything failing. These files")
+        print("  were TOUCHED; check-wave only ever saw what the tickets DECLARED.")
+    for p in clean:
+        print("  CLEAN     %s <-> %s   (disjoint file sets, merges clean)" % (p["a"], p["b"]))
+
+    # The blind spot, printed every run including the all-clean one. A clean
+    # pairwise answer is not permission to land: merge-tree is unaffected by a
+    # stale base, and both stale branches in the fixture merged clean (exit 0)
+    # while `git merge --ff-only` died with exit 128.
+    print("  BLIND SPOT: this command compares branches to EACH OTHER, never to the base.")
+    print("  A branch forked long ago merges clean pairwise and still fails "
+          "`merge --ff-only`;")
+    print("  merge-protocol step 9 rebases the batch onto %s first for exactly that reason."
+          % base)
+    if stale:
+        for s in stale:
+            print("      STALE BASE  %s: %d commit(s) behind %s (forked at %s)"
+                  % (s["branch"], s["behind"], base, s["fork"][:12]))
+    else:
+        print("      (no branch here is behind %s right now — that can change before you "
+              "merge)" % base)
+    sys.exit(1 if bad else 0)
+
+
 def cmd_status(args):
     root = repo_root()
     d = sd(root)
@@ -6862,6 +7450,26 @@ def main():
                         "EXISTING member branch has drifted behind it (report only, "
                         "never a veto)")
     s.set_defaults(func=cmd_check_wave)
+
+    s = sub.add_parser("conflicts", help="pairwise TEXTUAL conflict between task branches, "
+                                        "answered by git merge-tree rather than by declared "
+                                        "globs (Phase 5 / merge-protocol step 3)")
+    s.add_argument("branches", nargs="+", metavar="BRANCH",
+                   help="comma- or space-separated; a bare ticket id also resolves task/<id>")
+    s.add_argument("--base", default="main",
+                   help="the ref every branch forked from (default: main)")
+    s.add_argument("--json", action="store_true", dest="as_json",
+                   help="machine-readable report, same exit codes")
+    s.set_defaults(func=cmd_conflicts)
+
+    s = sub.add_parser("push-gate", help="score the mechanical rungs of the Phase 7 push gate "
+                                        "(run at the END of Phase 8, after the ledger commit; "
+                                        "exit 1 = do not push)")
+    s.add_argument("--cycle", type=int, required=True,
+                   help="the epoch being closed — the cycle measure/analyze/checkpoint just ran")
+    s.add_argument("--json", action="store_true", dest="as_json",
+                   help="machine-readable report, same exit codes")
+    s.set_defaults(func=cmd_push_gate)
 
     s = sub.add_parser("red-check", help="prove each ticket's verify command FAILS before it "
                                          "is built (exit 1 on VACUOUS, WEAK, NO GATE or "
