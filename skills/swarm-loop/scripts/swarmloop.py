@@ -50,6 +50,13 @@ history row or state field. An agent may ask; only the user may grant. That
 inertness is what keeps "the door can be opened" from becoming a goalpost-moving
 hole.
 
+INVARIANT: an ask nobody sees is an ask nobody filed. `escalate --open-asks`
+prints every open request and NOTHING AT ALL when there are none, so the end of
+every user-facing turn can run it unconditionally; that silence is what makes it
+runnable that often. `--resolve` records what the USER decided and demands a
+note; `--withdraw` is the loop retracting a question that became moot, is
+recorded as NEVER ANSWERED, and is refused outright for a blocking one.
+
 Exit codes: 0 ok · 1 error/violation · 2 kill switch or terminal condition ·
 3 usage error (bad flag/subcommand — never a terminal signal; fix and re-run) ·
 130 interrupted (Ctrl-C/SIGINT) — nothing was concluded, re-run the command.
@@ -1282,6 +1289,16 @@ def _load_escalations(d):
                 cur["resolved_at"] = rec.get("timestamp")
                 cur["resolved_cycle"] = rec.get("cycle")
                 cur["resolution_note"] = rec.get("note")
+            elif action == "withdraw":
+                # Closed, but NOT decided. status is "resolved" so every reader
+                # that already asks "is this still open?" keeps working
+                # unchanged; the `withdrawn` flag is what stops it ever being
+                # rendered as an answer the user never gave.
+                cur["status"] = "resolved"
+                cur["withdrawn"] = True
+                cur["resolved_at"] = rec.get("timestamp")
+                cur["resolved_cycle"] = rec.get("cycle")
+                cur["resolution_note"] = rec.get("note")
             elif action == "block":
                 cur["blocking"] = True
                 cur["blocked_at"] = rec.get("timestamp")
@@ -1355,6 +1372,67 @@ def _print_escalation(rec, prefix=""):
         print(prefix + "              " + c)
 
 
+def _print_ask(rec, prefix=""):
+    """One open ask in its end-of-turn form: what was asked, about what, what
+    change was proposed, when, whether it blocks, and the command that closes it.
+
+    Deliberately shorter than _print_escalation, which spells out the whole grant
+    recipe. This block prints at the end of EVERY user-facing turn, and a block
+    that outgrows a screen is a block that gets skipped \u2014 which is the defect it
+    exists to fix."""
+    print(prefix + str(rec.get("id"))
+          + ("  [BLOCKING]" if rec.get("blocking") else "")
+          + "  %s \u00b7 %s" % (rec.get("kind"), rec.get("subject")))
+    print(prefix + "   asked    : %s (cycle %s)" % (rec.get("timestamp"), rec.get("cycle")))
+    print(prefix + "   wrong    : " + _oneline(rec.get("reason"), 160))
+    print(prefix + "   proposed : " + _oneline(rec.get("proposed"), 160))
+    print(prefix + '   answer   : swarmloop.py escalate --resolve %s --note "<what you decided>"'
+          % rec.get("id"))
+
+
+def _escalate_open_asks(d):
+    """THE END-OF-TURN BLOCK \u2014 every open ask, newest first, blocking on top, and
+    NOTHING AT ALL (exit 0) when none are open.
+
+    Filing an escalation gives a question a durable home on disk and no path to
+    the eyes of the one person allowed to answer it. The non-blocking case is
+    where that bites: the loop is told to file it and keep going, so the ask is
+    recorded, hours of output scroll past, and the user never sees the thing the
+    run is waiting on. A mechanism that looks like it is doing its job with no
+    path by which it can fire is this project's recurring defect in a new hat.
+
+    The silence is therefore load-bearing, not a nicety. This can only be run
+    unconditionally at the end of every turn if the empty case costs the reader
+    nothing: a command that prints "no open escalations" two hundred times trains
+    the eye to skip the block, and the one turn carrying a real question scrolls
+    past with the rest of it.
+
+    It reads and prints. It writes nothing \u2014 not even the state directory.
+    """
+    open_recs = list(reversed(_open_escalations(d)))               # newest first
+    if not open_recs:
+        return                                                     # silence, exit 0
+    open_recs.sort(key=lambda r: 0 if r.get("blocking") else 1)    # stable: blocking on top
+    blocking = [r for r in open_recs if r.get("blocking")]
+    bar = "=" * 74
+    print(bar)
+    print("OPEN ASKS \u2014 %d awaiting YOUR decision%s"
+          % (len(open_recs), ", %d BLOCKING" % len(blocking) if blocking else ""))
+    print("Nothing here has been changed by the loop. Escalating is asking, never granting.")
+    for r in open_recs:
+        print("")
+        _print_ask(r, prefix="  ")
+    print("")
+    print("  full text, with the exact command that grants each: %s/%s"
+          % (STATE_DIR, ESCALATIONS_MD))
+    print(bar)
+    if blocking:
+        print("AWAITING USER DECISION \u2014 %s BLOCKING. The run is WAITING ON A HUMAN:"
+              % ", ".join(r["id"] for r in blocking))
+        print("neither done nor failed, and it must never be reported as either.")
+        sys.exit(2)
+
+
 def _rewrite_escalations_md(d, root, project):
     """Regenerate the human mirror. This file is for the USER to read first thing,
     so it is ordered the way a just-woken person reads: open items on top,
@@ -1411,16 +1489,25 @@ def _rewrite_escalations_md(d, root, project):
     if not done_recs:
         L += ["_None yet._", ""]
     for r in done_recs:
-        L.append("### %s \u00b7 %s \u00b7 `%s` \u2014 resolved %s"
-                 % (r.get("id"), r.get("kind"), r.get("subject"), r.get("resolved_at")))
+        L.append("### %s \u00b7 %s \u00b7 `%s` \u2014 %s %s"
+                 % (r.get("id"), r.get("kind"), r.get("subject"),
+                    "WITHDRAWN by the loop" if r.get("withdrawn") else "resolved",
+                    r.get("resolved_at")))
         L.append("")
         L.append("- filed %s (cycle %s)%s"
                  % (r.get("timestamp"), r.get("cycle"),
                     " \u00b7 was BLOCKING" if r.get("blocking") else ""))
         L.append("- **what was wrong**: " + str(r.get("reason", "")))
         L.append("- **proposed**: " + str(r.get("proposed", "")))
-        L.append("- **decision**: " + (str(r.get("resolution_note"))
-                                       if r.get("resolution_note") else "_(no note recorded)_"))
+        if r.get("withdrawn"):
+            # Said in the reading order the user actually uses: nobody answered
+            # this one, and a reader skimming RESOLVED must never mistake a
+            # retraction for a decision.
+            L.append("- **decision**: _NONE \u2014 NEVER ANSWERED. The loop withdrew the "
+                     "question_: " + str(r.get("resolution_note") or ""))
+        else:
+            L.append("- **decision**: " + (str(r.get("resolution_note"))
+                                           if r.get("resolution_note") else "_(no note recorded)_"))
         L.append("")
     path = os.path.join(d, ESCALATIONS_MD)
     tmp = path + ".tmp"
@@ -1451,8 +1538,10 @@ def _escalate_list(d, show_all=False):
         print("")
         print("%d RESOLVED escalation(s), newest first:" % len(done))
         for r in done:
-            print("  %s  %s \u00b7 %s \u2014 resolved %s: %s"
-                  % (r.get("id"), r.get("kind"), r.get("subject"), r.get("resolved_at"),
+            print("  %s  %s \u00b7 %s \u2014 %s %s: %s"
+                  % (r.get("id"), r.get("kind"), r.get("subject"),
+                     "WITHDRAWN, never answered," if r.get("withdrawn") else "resolved",
+                     r.get("resolved_at"),
                      _oneline(r.get("resolution_note")) or "(no note)"))
     print("")
     print("full text: %s/%s   (append-only log: %s/%s)"
@@ -1463,10 +1552,37 @@ def _escalate_list(d, show_all=False):
         sys.exit(2)
 
 
-def _escalate_resolve(args, d, root, state, project):
-    rid = _norm_esc_id(args.resolve)
+def _escalate_close(args, d, root, state, project, withdraw=False):
+    """Close an open ask. Two doors, and they are NOT the same door.
+
+    --resolve records what the USER decided. --withdraw records that the LOOP
+    retracted a question which became moot \u2014 the route pivoted, the ticket was
+    dropped \u2014 and it is written down as never answered, forever, because it was.
+    The asymmetry is the whole point: an agent may ask, only the user may grant,
+    and an ask closed with no recorded decision cannot be told apart from an agent
+    quietly retiring its own inconvenient question. Which is why both doors demand
+    a note, and why a BLOCKING ask has no withdraw door at all: it stopped the run
+    to wait for a person, so the loop does not get to answer it by closing it.
+
+    The withdraw door exists because the alternative is worse. An ask that can
+    never be closed reappears in every turn's block forever, a block that repeats
+    forever gets ignored, and an ignored block is the original defect with extra
+    steps \u2014 so a loop with no honest way out of a moot question has every
+    incentive to file a dishonest --resolve instead.
+    """
+    raw = args.withdraw if withdraw else args.resolve
+    rid = _norm_esc_id(raw)
     if rid is None:
-        die("'%s' is not an escalation id (expected e.g. ESC-003)" % args.resolve, 3)
+        die("'%s' is not an escalation id (expected e.g. ESC-003)" % raw, 3)
+    note = str(args.note or "").strip()
+    if not note:
+        if withdraw:
+            die("--withdraw needs --note \"<why this question no longer needs an answer>\": a "
+                "retraction with no stated reason is exactly how an unanswered ask disappears "
+                "quietly, which is the failure this ledger exists to prevent.", 3)
+        die("--resolve needs --note \"<what the user decided>\": an ask closed with no recorded "
+            "decision cannot be told apart from the loop retiring its own unanswered question. "
+            "Declining IS a decision \u2014 record it: --note \"declined \u2014 <why>\".", 3)
     recs = {r["id"]: r for r in _load_escalations(d)}
     rec = recs.get(rid)
     if rec is None:
@@ -1476,18 +1592,31 @@ def _escalate_resolve(args, d, root, state, project):
         # The log is append-only and a decision is not re-taken: silently
         # "re-resolving" would let a second answer overwrite the first with no
         # trace of which one the run actually proceeded under.
-        die("%s was already resolved at %s (%s). File a NEW escalation if the question is "
-            "open again." % (rid, rec.get("resolved_at"),
+        die("%s was already %s at %s (%s). File a NEW escalation if the question is "
+            "open again." % (rid, "withdrawn" if rec.get("withdrawn") else "resolved",
+                             rec.get("resolved_at"),
                              _oneline(rec.get("resolution_note")) or "no note"))
+    if withdraw and rec.get("blocking"):
+        die("%s is BLOCKING and the loop may not withdraw it. A blocking escalation stopped the "
+            "run to wait for a person; retracting it would be the loop answering its own "
+            "question. Only the user closes this one: "
+            "escalate --resolve %s --note \"<what you decided>\"." % (rid, rid))
     cycle = args.cycle if args.cycle is not None else int(state.get("current_cycle", 0) or 0)
     _append_escalation(d, {
-        "id": rid, "action": "resolve", "status": "resolved",
+        "id": rid, "action": "withdraw" if withdraw else "resolve", "status": "resolved",
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"), "cycle": cycle,
-        "note": args.note, "head": _git(root, "rev-parse", "HEAD").stdout.strip() or None,
+        "note": note, "head": _git(root, "rev-parse", "HEAD").stdout.strip() or None,
     })
     _rewrite_escalations_md(d, root, project)
-    print("%s resolved \u2014 %s \u00b7 %s" % (rid, rec.get("kind"), rec.get("subject")))
-    print("  decision: " + (args.note or "(no note recorded \u2014 say what was decided next time)"))
+    if withdraw:
+        print("%s WITHDRAWN by the loop \u2014 %s \u00b7 %s"
+              % (rid, rec.get("kind"), rec.get("subject")))
+        print("  reason: " + note)
+        print("  recorded as NEVER ANSWERED. Withdrawing is not a decision and grants nothing;")
+        print("  if the question still needs an answer, file it again.")
+    else:
+        print("%s resolved \u2014 %s \u00b7 %s" % (rid, rec.get("kind"), rec.get("subject")))
+        print("  decision: " + note)
     print("  moved to the RESOLVED section of %s/%s" % (STATE_DIR, ESCALATIONS_MD))
     still = _blocking_escalations(d)
     if still:
@@ -1507,6 +1636,11 @@ def cmd_escalate(args):
     """
     root = repo_root()
     d = sd(root)
+    # Answered before anything below can run: the end-of-turn block is a READ,
+    # it is the one form of this command that fires on EVERY turn, and it must
+    # not so much as create a directory to print what is already on file.
+    if args.open_asks:
+        return _escalate_open_asks(d)
     # Never die for want of an initialized run: an escalation filed from a
     # half-set-up repo is exactly the kind that most needs to reach the user.
     os.makedirs(d, exist_ok=True)
@@ -1522,8 +1656,14 @@ def cmd_escalate(args):
 
     if args.do_list:
         return _escalate_list(d, args.show_all)
+    if args.resolve is not None and args.withdraw is not None:
+        die("--resolve and --withdraw are not two names for the same thing: one records what "
+            "the USER decided, the other records that the LOOP retracted a question nobody "
+            "answered. Pass exactly one.", 3)
     if args.resolve is not None:
-        return _escalate_resolve(args, d, root, state, project)
+        return _escalate_close(args, d, root, state, project)
+    if args.withdraw is not None:
+        return _escalate_close(args, d, root, state, project, withdraw=True)
 
     missing = [name for name, v in (("--kind", args.kind), ("--subject", args.subject),
                                     ("--reason", args.reason), ("--proposed", args.proposed))
@@ -1531,7 +1671,8 @@ def cmd_escalate(args):
     if missing:
         die("escalate needs " + " ".join(missing) + " \u2014 an escalation the user cannot act on "
             "is worse than none. Name the thing, the evidence that it is wrong, and the exact "
-            "change you are asking for. (Or use --list / --resolve <ID>.)", 3)
+            "change you are asking for. (Or use --open-asks / --list / --resolve <ID> / "
+            "--withdraw <ID>.)", 3)
     subject = args.subject.strip()
     cycle = args.cycle if args.cycle is not None else int(state.get("current_cycle", 0) or 0)
     head = _git(root, "rev-parse", "HEAD").stdout.strip() or None
@@ -8021,12 +8162,27 @@ def main():
     s.add_argument("--cycle", type=int, default=None,
                    help="defaults to state.json's current_cycle")
     s.add_argument("--resolve", metavar="ID", default=None,
-                   help="mark an escalation resolved (the user decided); pair with --note")
+                   help="mark an escalation resolved because the USER decided it; --note is "
+                        "REQUIRED and records what they decided")
+    s.add_argument("--withdraw", metavar="ID", default=None,
+                   help="the LOOP retracting a question that became moot (the route pivoted, "
+                        "the ticket was dropped). --note is REQUIRED, the record says NEVER "
+                        "ANSWERED forever, and a BLOCKING escalation may not be withdrawn at "
+                        "all — that one stopped the run to wait for a person")
     s.add_argument("--note", default=None, metavar="TEXT",
-                   help="with --resolve: what the user decided")
+                   help="with --resolve: what the user decided. With --withdraw: why the "
+                        "question no longer needs an answer. Required by both — an ask closed "
+                        "with no recorded decision is indistinguishable from a loop retiring "
+                        "its own unanswered question")
+    s.add_argument("--open-asks", action="store_true", dest="open_asks",
+                   help="THE END-OF-TURN BLOCK: print every OPEN ask (newest first, blocking "
+                        "on top) and NOTHING AT ALL when none are open, so it can end every "
+                        "user-facing turn unconditionally. Exits 2 if any is blocking — the "
+                        "run is waiting on a human, which is neither done nor failed")
     s.add_argument("--list", action="store_true", dest="do_list",
                    help="print OPEN escalations (the only ones anything is waiting on); "
-                        "exits 2 if any of them is blocking")
+                        "exits 2 if any of them is blocking. Prints a line when there are "
+                        "none — use --open-asks for the silent, every-turn form")
     s.add_argument("--all", action="store_true", dest="show_all",
                    help="with --list: include resolved escalations too")
     s.set_defaults(func=cmd_escalate)
