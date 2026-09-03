@@ -368,6 +368,46 @@ GIT_VALUE_GLOBALS = {
     "--super-prefix", "--config-env",
 }
 
+class SelfHinted(str):
+    """A refusal that carries its OWN `WHY:` and its own fix, and must therefore
+    NOT have the generic footer stapled to it.
+
+    `block()` appends SAFE_HINT unconditionally, and SAFE_HINT is written for
+    ONE family: the working-tree destroyers (stash / reset --hard / checkout --
+    / restore / clean -f / worktree remove --force). Its claims — "reverts or
+    destroys EVERY parallel agent's uncommitted work", "refs/stash is one ref
+    shared by all worktrees" — and its alternatives — `git show HEAD:<file>`,
+    "run in your own worktree" — are true of that family and of nothing else.
+
+    On the ledger push gate they are all FALSE, and not harmlessly: a push
+    destroys no uncommitted work, `refs/stash` is irrelevant, and reading a file
+    is not an alternative to publishing a branch. The reader is an autonomous
+    orchestrator with no human in the loop, and this text is the whole basis for
+    what it does next. The specific half says "commit the ledger, re-run the
+    push"; the generic half says the operation is destructive and offers
+    read-only alternatives. Weighing the second, it declines to push at all —
+    which silently reproduces the exact defect the gate was built to prevent
+    (the epoch's only offsite copy never goes out) while the gate looks like it
+    is working.
+
+    HONEST SURVEY, because this class fixes ONE rule and the footer is
+    unconditional for all of them. Three families get text written for the
+    first: the REF/OBJECT destroyers (`push --force/--mirror/--delete`,
+    `branch -f`, `checkout -B`, `update-ref`, `reflog expire`, `gc --prune`,
+    `filter-branch`, forced `fetch`/`pull` refspecs) destroy history, not
+    uncommitted work; the LEDGER-WRITE rules (`sed -i`, `truncate`, `> ledger`,
+    `dd of=`, a file-tool write) are about one file, not a shared working tree;
+    and the `rm -r` path rules already append their own RM_HINT and then get
+    SAFE_HINT on top of it. Only the last of those is even partly apt (SAFE_HINT
+    ends with the worktree-teardown bullet). None was fixed here, deliberately:
+    rewording ~40 live refusals mid-run is a different change with a different
+    blast radius, and this one is the one measured to change a decision.
+
+    A `str` subclass rather than a second return type, so the `str | None`
+    contract every checker and `evaluate_git` share is untouched and the value
+    reaches `block()` through the existing path unwrapped."""
+
+
 SAFE_HINT = (
     "WHY: this git op is repo-global — in a shared working tree it reverts or "
     "destroys EVERY parallel agent's uncommitted work, not just yours "
@@ -396,8 +436,10 @@ def allow() -> None:
 
 
 def block(reason: str) -> None:
+    # A SelfHinted reason brings its own WHY and its own fix — see the class.
+    footer = "" if isinstance(reason, SelfHinted) else "\n\n" + SAFE_HINT
     print(
-        "BLOCKED (swarm-loop git-guard): " + reason + "\n\n" + SAFE_HINT,
+        "BLOCKED (swarm-loop git-guard): " + reason + footer,
         file=sys.stderr,
     )
     sys.exit(2)
@@ -1349,31 +1391,61 @@ def _ledger_refusal(tree: str, branch: str, status: str) -> str:
     about a phase it has never heard of — for it the dirty ledger is an anomaly,
     because nothing in the loop writes `.swarm-loop` from a worktree and this
     guard blocks such writes. Told apart by `_is_linked_worktree`, which is
-    already how this file distinguishes the two and costs no git call."""
+    already how this file distinguishes the two and costs no git call.
+
+    Returned as `SelfHinted` so `block()` does NOT staple SAFE_HINT on. That
+    footer is written for the working-tree destroyers and every clause of it is
+    false here; left attached, its "this op destroys every parallel agent's
+    uncommitted work / here are read-only alternatives" talks an unattended
+    orchestrator out of pushing at all, which is the defect this gate exists to
+    prevent. The footers below are the same shape — WHY, then what to do — and
+    are true of this rule."""
     head = ("`git push` of `" + branch + "` while the `.swarm-loop` ledger in the "
             "tree that holds that branch is DIRTY — uncommitted under `"
             + os.path.join(tree, SWARM_DIR) + "`:\n" + status + "\n"
             "A push ships COMMITS, so none of the above goes with it.\n")
     if _is_linked_worktree(tree):
-        return (head +
-                "That tree is a WORKER WORKTREE, and nothing in the loop writes `"
-                + SWARM_DIR + "` from one — this guard blocks such writes, and "
-                "Phase 7's push of `main` from the primary tree is the loop's only "
-                "push. So this is an anomaly to look at, not something to commit.\n"
-                "FIX — see what changed it, then put it back:\n"
-                "  git -C " + tree + " status --porcelain -- " + SWARM_DIR + "\n"
-                "  git -C " + tree + " checkout -- " + SWARM_DIR
-                + "   # unless you know why it differs")
-    return (head +
-            "That is Phase 7's last push condition, and it is not a style rule: "
-            "`history.csv`, `state.json` and `analysis/` are what `resume` reads, "
-            "and this push is the run's only offsite copy of them. Pushing now "
-            "ships a `" + branch + "` carrying none of this epoch's evidence.\n"
-            "FIX — commit the ledger first (Phase 8's epoch-boundary commit), "
-            "then push:\n"
-            "  git -C " + tree + " add " + SWARM_DIR + "\n"
-            "  git -C " + tree + " commit -m 'chore(swarm-loop): epoch evidence'\n"
-            "  <re-run your push>")
+        return SelfHinted(
+            head +
+            "That tree is a WORKER WORKTREE, and nothing in the loop writes `"
+            + SWARM_DIR + "` from one — this guard blocks such writes, and "
+            "Phase 7's push of `main` from the primary tree is the loop's only "
+            "push. So this is an anomaly to look at, not something to commit.\n"
+            "FIX — see what changed it, then put it back:\n"
+            "  git -C " + tree + " status --porcelain -- " + SWARM_DIR + "\n"
+            "  git -C " + tree + " checkout -- " + SWARM_DIR
+            + "   # unless you know why it differs\n\n"
+            "WHY: nothing here is destructive and nothing is being kept from "
+            "you — this is not a repo-global op and it takes no one's "
+            "uncommitted work. The only claim being made is that `" + SWARM_DIR
+            + "` in this worktree differs from HEAD, which it should not. Do "
+            "NOT commit it to a task branch: the run's ledger belongs to the "
+            "primary tree and Phase 8 commits it there. If you cannot explain "
+            "the difference, say so in your report rather than resolving it "
+            "yourself.")
+    return SelfHinted(
+        head +
+        "That is Phase 7's last push condition, and it is not a style rule: "
+        "`history.csv`, `state.json` and `analysis/` are what `resume` reads, "
+        "and this push is the run's only offsite copy of them. Pushing now "
+        "ships a `" + branch + "` carrying none of this epoch's evidence.\n"
+        "FIX — commit the ledger first (Phase 8's epoch-boundary commit), "
+        "then push:\n"
+        "  git -C " + tree + " add " + SWARM_DIR + "\n"
+        "  git -C " + tree + " commit -m 'chore(swarm-loop): epoch evidence'\n"
+        "  <re-run your push>\n\n"
+        "WHY: nothing here is destructive. A push takes no one's uncommitted "
+        "work, this is not a repo-global operation, and there is no safer "
+        "alternative to reach for — the push is the RIGHT next step and is "
+        "only missing its evidence.\n"
+        "DO NOT SKIP THE PUSH. Both commands above are allowed by this guard "
+        "(`git add` and `git commit` have no rule here at all); run them and "
+        "re-run the same push. Dropping the push instead is the failure this "
+        "gate exists to prevent — it leaves the epoch with no offsite copy at "
+        "all, which is strictly worse than pushing a `" + branch + "` whose "
+        "ledger was stale. If the push genuinely has to be carried to the next "
+        "epoch's gate, name it and why in the epoch report; never drop it "
+        "silently.")
 
 
 def check_branch(rest: list[str]) -> str | None:

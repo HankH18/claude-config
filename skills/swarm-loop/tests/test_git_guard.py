@@ -2152,6 +2152,83 @@ MALFORMED_PAYLOADS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# REFUSAL TEXT — the half of the contract an exit code cannot express
+# ---------------------------------------------------------------------------
+#
+# Every case above asserts a NUMBER. But the reader of a block is an autonomous
+# orchestrator with no human in the loop, and the stderr text is the entire
+# basis on which it decides what to do next — so a correct exit 2 carrying the
+# wrong prose is still a defect, and one this suite could not see.
+#
+# Measured: `block()` appended SAFE_HINT to EVERY refusal, and SAFE_HINT is
+# written for one family (stash / reset --hard / checkout -- / clean -f). On the
+# ledger push gate its claims are all false — a push destroys no uncommitted
+# work, `refs/stash` is irrelevant, and `git show HEAD:<file>` is not an
+# alternative to publishing a branch. The specific half said "commit the ledger,
+# re-run the push"; the generic half said the op was destructive and offered
+# read-only alternatives. An orchestrator weighing the second declines to push
+# at all — reproducing the exact defect the gate prevents, while the gate looks
+# like it is working.
+#
+# (name, payload, must-contain, must-NOT-contain). Every fragment is one cell.
+# THE PAIRING IS THE POINT: an absence assertion on its own is satisfied by a
+# guard that prints nothing at all, so each "must not contain SAFE_HINT" case is
+# paired with a case proving the stash family still gets exactly that text.
+_STASH_FOOTER = [
+    "WHY: this git op is repo-global",
+    "destroys EVERY parallel agent's uncommitted work",
+    "refs/stash is one ref shared by all worktrees",
+    "SAFE ALTERNATIVES:",
+    "`git show HEAD:<file>`",
+    "never stash",
+]
+
+TEXT_CASES = [
+    # The push gate: its own WHY, its own runnable FIX, and NONE of the
+    # stash-family footer.
+    ("text-push-dirty-ledger",
+     {"tool_name": "Bash", "cwd": "{DIRTYRUN}",
+      "tool_input": {"command": "git push origin main"}},
+     ["BLOCKED (swarm-loop git-guard):",
+      "ledger in the tree that holds that branch is DIRTY",
+      "?? .swarm-loop/analysis/",          # the actual dirt, named
+      "FIX — commit the ledger first",
+      "add .swarm-loop",                   # a command the reader can run
+      "commit -m 'chore(swarm-loop): epoch evidence'",
+      "<re-run your push>",
+      "WHY: nothing here is destructive",
+      "DO NOT SKIP THE PUSH"],
+     _STASH_FOOTER),
+    # The worker variant: same absence, and its own register — it must NOT be
+    # told to commit the ledger, which is the primary tree's job.
+    ("text-push-dirty-worker-worktree",
+     {"tool_name": "Bash", "cwd": "{WTDIRTYWT}",
+      "tool_input": {"command": "git push"}},
+     ["WORKER WORKTREE",
+      "FIX — see what changed it, then put it back",
+      "checkout -- .swarm-loop",
+      "WHY: nothing here is destructive"],
+     _STASH_FOOTER + ["FIX — commit the ledger first",
+                      "Phase 8's epoch-boundary commit"]),
+    # THE POSITIVE COUNTERPART. Without it the two cases above pass against a
+    # guard that prints nothing, or one whose footer was deleted outright.
+    ("text-stash-keeps-its-footer",
+     {"tool_name": "Bash", "cwd": "{REPO}",
+      "tool_input": {"command": "git stash"}},
+     _STASH_FOOTER + ["BLOCKED (swarm-loop git-guard):",
+                      "pushes/pops the SHARED refs/stash"],
+     ["DO NOT SKIP THE PUSH", "epoch-boundary commit"]),
+    # ...and a second family that still gets it, so the positive is not one
+    # verb's special case.
+    ("text-reset-hard-keeps-its-footer",
+     {"tool_name": "Bash", "cwd": "{REPO}",
+      "tool_input": {"command": "git reset --hard"}},
+     _STASH_FOOTER,
+     ["DO NOT SKIP THE PUSH"]),
+]
+
+
 def build_matrix(repo, root):
     """Every case, at every cwd, under every prefix. Returns (name, payload,
     want, kind) tuples. Three of the four axes derive their expectation instead
@@ -2288,7 +2365,8 @@ def main():
         declared = ([n for n, _ in MUST_BLOCK] + [n for n, _ in MUST_ALLOW]
                     + [n for n, _, _ in PAYLOAD_CASES]
                     + [n for n, _, _, _ in ENV_CASES]
-                    + [n for n, _, _ in MALFORMED_PAYLOADS])
+                    + [n for n, _, _ in MALFORMED_PAYLOADS]
+                    + [n for n, _, _, _ in TEXT_CASES])
         dupes = sorted({n for n in declared if declared.count(n) > 1})
         if dupes:
             print("TEST_GIT_GUARD: duplicate case names: %s" % ", ".join(dupes))
@@ -2339,7 +2417,12 @@ def main():
 
         passed, failures = 0, []
         for _sf in static_failures:
-            failures.append(("matcher-agreement", "(static check)", _sf))
+            # Six-tuple, because that is what the printer below unpacks. It used
+            # to be appended as a three-tuple, so the ONE code path that reports
+            # a matcher drift would have died with a ValueError instead of
+            # printing it — a failure path that has never been executed.
+            failures.append(("matcher-agreement", "(static check)", BLOCK, ALLOW,
+                             _sf, "static"))
         by_kind = {}
         for (name, payload, want, kind), (got, stderr) in zip(jobs, results):
             by_kind[kind] = by_kind.get(kind, 0) + 1
@@ -2351,13 +2434,40 @@ def main():
             else:
                 failures.append((name, payload, want, got, stderr, kind))
 
+        # Refusal TEXT. One cell per fragment, so a message that loses half its
+        # fix block is a partial failure and not a pass. Run after the pool
+        # because there are a handful of them, not thousands.
+        for tname, tpayload, must, must_not in TEXT_CASES:
+            payload = json.dumps(fill_paths(tpayload, repo, root))
+            got, stderr = run_payload(repo, env, payload)
+            text = stderr or ""
+            checks = ([(frag, True) for frag in must]
+                      + [(frag, False) for frag in must_not])
+            for frag, want_present in checks:
+                by_kind["text"] = by_kind.get("text", 0) + 1
+                if (frag in text) == want_present:
+                    passed += 1
+                    if verbose:
+                        print("  ok    %-40s %s %r"
+                              % (tname, "has" if want_present else "lacks", frag))
+                else:
+                    failures.append((
+                        "%s :: must %s %r" % (tname,
+                                              "CONTAIN" if want_present else "NOT contain",
+                                              frag),
+                        payload, BLOCK, got, text, "text"))
+
         label = {BLOCK: "BLOCK (exit 2)", ALLOW: "ALLOW (exit 0)"}
         for name, payload, want, got, stderr, kind in failures:
             kindlabel = "MISSED BLOCK" if want == BLOCK else "FALSE BLOCK"
+            if kind in ("text", "static"):
+                kindlabel = "WRONG REFUSAL TEXT" if kind == "text" else "STATIC CHECK"
             print("")
             print("FAIL [%s]  %s   (axis: %s)" % (kindlabel, name, kind))
-            print("  expected : %s" % label[want])
-            print("  actual   : exit %d" % got)
+            if kind not in ("text", "static"):
+                print("  expected : %s" % label[want])
+            if kind != "static":
+                print("  actual   : exit %d" % got)
             print("  payload  : %s" % payload)
             first = (stderr or "").strip().splitlines()
             if first:
@@ -2365,8 +2475,9 @@ def main():
 
         print("")
         print("  declared: %d block  %d allow  %d payload  %d env  %d malformed"
+              "  %d text"
               % (len(MUST_BLOCK), len(MUST_ALLOW), len(PAYLOAD_CASES),
-                 len(ENV_CASES), len(MALFORMED_PAYLOADS)))
+                 len(ENV_CASES), len(MALFORMED_PAYLOADS), len(TEXT_CASES)))
         print("  cells run: " + "  ".join(
             "%s=%d" % (k, by_kind[k]) for k in sorted(by_kind)))
         print("TEST_GIT_GUARD: PASS=%d FAIL=%d" % (passed, len(failures)))
