@@ -5803,6 +5803,16 @@ class Holder:
 
 
 __all__ = ["attr_called", "REGISTRY"]
+
+
+# Appended after __all__ on purpose — every assertion above pins a line in this
+# file, so it may only grow at the bottom.
+def alias_called(x):
+    return x
+
+
+def probe_only(x):
+    return x
 EOF
 cat > pkg/cli.py <<'EOF'
 from . import core
@@ -5857,6 +5867,24 @@ from pkg.core import fixture_called
 
 def use():
     return fixture_called(1)
+EOF
+# The two shapes an ast pass cannot see by default: a symbol consumed under a
+# LOCAL RENAME, and a symbol called from Python source that lives in a STRING.
+cat > pkg/alias_use.py <<'EOF'
+from pkg.core import alias_called as _alias
+
+PROBE = """
+from pkg import core
+core.probe_only()
+"""
+
+
+def go():
+    """Prose mentioning probe_only(1) and alias_called(2) — documentation."""
+    return _alias(1)
+
+
+RESULT = go()
 EOF
 echo "not python" > notes.txt
 
@@ -5965,6 +5993,42 @@ ck_has "...and only those two files were scanned" "against 2 python file(s)"
 sl reachable --symbol attr_called --path pkg --path does_not_exist_typo --json
 ck "json: the unresolved path is a field of its own" "['does_not_exist_typo']" \
    "$(jget "$OUT" "d['paths_unresolved']")"
+
+# --- a symbol consumed under a LOCAL RENAME is still consumed ------------
+# `from m import foo as _foo` then `_foo()` used to count as nothing, because
+# refs are keyed by the identifier at the reference site. Measured on a live
+# repo: one symbol's ONLY consumption path was that idiom, in four packages, and
+# it read NO CALL SITES — the verdict that says 'NOTHING references it'.
+sl reachable --symbol alias_called --path pkg
+ck_exit "a symbol called only under an import alias is wired" 0 "$RC"
+ck "...and reads WIRED, not NO CALL SITES" "WIRED" "$(verdict_of alias_called)"
+ck_has "...counted as a product caller" "callers    1 (1 product, 0 test)"
+ck_has "...with the rename shown, so the reader can follow it" \
+       "pkg/alias_use.py:11  in pkg.alias_use.go  [as _alias]"
+ck_has "...and the limits say a rename any OTHER way is not followed" \
+       "references are matched by the identifier AT THE REFERENCE SITE"
+# The caller LIST and the reachability CLOSURE are two different consumers of
+# that edge. Resolving the alias for one and not the other buys a symbol that is
+# WIRED with no --from and UNREACHED with one, for no reason a reader can see.
+sl reachable --symbol alias_called --path pkg --from pkg/alias_use.py
+ck_exit "the closure follows an alias too, not only the caller list" 0 "$RC"
+ck "...so a symbol reached only under a local rename is WIRED" \
+   "WIRED" "$(verdict_of alias_called)"
+ck_has "...with the reachability line saying YES" "reachable  YES from pkg/alias_use.py"
+
+# --- Python source inside a STRING is text, and the report says where ----
+# The limits block promised the string hint covered this; it only ever matched a
+# string whose WHOLE value was the name, so the subprocess-probe case — the one
+# it cites as measured — produced no hint at all.
+sl reachable --symbol probe_only --path pkg
+ck_exit "a symbol called only from source inside a string is still a finding" 1 "$RC"
+ck "...the verdict is NOT upgraded on the string" "NO CALL SITES" "$(verdict_of probe_only)"
+ck_has "...but the string is located, call-shaped" \
+       "embedded   the name appears CALL-SHAPED inside a longer string at pkg/alias_use.py:3"
+ck_has "...and says why a call can hide there" \
+       "is text to an ast pass, so a real call site can hide there"
+ck_hasnt "...while a name merely MENTIONED in a docstring raises nothing" \
+         "pkg/alias_use.py:10"
 
 # --- the tool FAILING must not be spelled like the tool FINDING ---------
 sl reachable --symbol ,, --path pkg

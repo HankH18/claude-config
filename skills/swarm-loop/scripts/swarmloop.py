@@ -8094,6 +8094,25 @@ REACH_INERT_DECORATORS = frozenset((
 # expression we could not read is not an expression we know to be inert.
 REACH_DEC_OPAQUE = "@<expression>"
 
+# Identifier scan used to find a wanted name INSIDE a longer string literal.
+REACH_WORD_RX = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _reach_body(node):
+    """A module/class/function body with its DOCSTRING dropped.
+
+    A docstring is documentation, not code, and this scanner reads string
+    literals looking for hidden call sites. Without this, every `Public
+    surface::` block that shows `accept_offer(auction=...)` as a usage example
+    raises a hint that a call site might be hiding in it — measured, that was two
+    thirds of the hints on a live repo, which is how a hint stops being read."""
+    body = node.body
+    if (body and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)):
+        return body[1:]
+    return body
+
 
 def _reach_dec_label(node):
     """A decorator expression -> '@router.post', or REACH_DEC_OPAQUE.
@@ -8177,6 +8196,39 @@ def _reach_scan(root, paths, wanted):
     res["files"] = len(files)
     wanted = set(wanted)
 
+    # PRE-PASS: `from m import foo as _foo` binds a wanted symbol under a name
+    # this scan would otherwise never look for, so `_foo()` counted as nothing.
+    # That failed in the FALSE-ALARM direction and it fired for real: measured on
+    # a live repo, one symbol's ONLY consumption path was that idiom — called
+    # from four packages' __init__ as `_bind_submodules` — and it reported NO
+    # CALL SITES, the verdict whose text is 'defined, and NOTHING references it'.
+    # The map is per-FILE, because an alias binds only in the module that spells
+    # it; a repo-wide map would let one file's rename over-count another's.
+    alias_by_file = {}
+    for path in files:
+        try:
+            with open(path) as f:
+                src = f.read()
+        except OSError:
+            continue
+        # An ImportFrom carrying an asname must contain both words. The guard is
+        # here so the second parse below is paid only by files that could
+        # possibly matter, not by every file in the tree.
+        if " as " not in src or "import" not in src:
+            continue
+        try:
+            tree = ast.parse(src)
+        except (SyntaxError, ValueError):
+            continue          # the main pass records it as unparsed
+        m = {}
+        for n in ast.walk(tree):
+            if isinstance(n, ast.ImportFrom):
+                for al in n.names:
+                    if al.asname and al.asname != al.name and al.name in wanted:
+                        m[al.asname] = al.name
+        if m:
+            alias_by_file[os.path.relpath(path, root)] = m
+
     for path in files:
         relf = os.path.relpath(path, root)
         try:
@@ -8203,11 +8255,21 @@ def _reach_scan(root, paths, wanted):
                                     for d in decs)})
             res["children"].setdefault(parent, []).append((qual, kind))
 
-        def add_ref(name, how, lineno, holder, _f=relf, _t=is_test):
+        aliases = alias_by_file.get(relf, {})
+
+        def add_ref(name, how, lineno, holder, _f=relf, _t=is_test, _al=aliases):
             res["edges"].setdefault(holder, set()).add(name)
-            if name in wanted:
-                res["refs"].setdefault(name, []).append(
-                    {"file": _f, "line": lineno, "how": how, "holder": holder, "test": _t})
+            real = _al.get(name)
+            if real is not None:
+                # The closure has to follow the alias too, or a symbol reached
+                # only under its local name reads UNREACHED for the same reason
+                # it used to read NO CALL SITES.
+                res["edges"][holder].add(real)
+            key = real if real is not None else name
+            if key in wanted:
+                res["refs"].setdefault(key, []).append(
+                    {"file": _f, "line": lineno, "how": how, "holder": holder,
+                     "test": _t, "alias": (name if real is not None else None)})
 
         def add_export(name, lineno, via, _f=relf):
             res["exports"].setdefault(name, []).append(
@@ -8257,7 +8319,7 @@ def _reach_scan(root, paths, wanted):
                         visit(dflt, holder)
                     if n.returns is not None:
                         visit(n.returns, holder)
-                for s in n.body:
+                for s in _reach_body(n):
                     visit(s, qual)
                 return
             if isinstance(n, ast.ImportFrom):
@@ -8304,12 +8366,35 @@ def _reach_scan(root, paths, wanted):
             if isinstance(n, ast.Constant) and isinstance(n.value, str):
                 if n.value in wanted:
                     res["strings"].setdefault(n.value, []).append(
-                        {"file": relf, "line": n.lineno, "test": is_test})
+                        {"file": relf, "line": n.lineno, "test": is_test,
+                         "inside": False})
+                else:
+                    # The limits block promised "where the bare name appears as a
+                    # STRING LITERAL it is listed above as a dynamic hint", and
+                    # the implementation only ever matched a string whose WHOLE
+                    # value was the name. So it missed the case it most needed:
+                    # Python source embedded in a string. Measured — a symbol
+                    # whose only reference in 343 files was `webhooks.
+                    # webhook_sink()` inside a textwrap.dedent subprocess probe
+                    # got ZERO hints under 'defined, and NOTHING references it'.
+                    # Only CALL-SHAPED occurrences count (`name(` or `.name`), so
+                    # a docstring that merely says the name stays quiet.
+                    for m in REACH_WORD_RX.finditer(n.value):
+                        w = m.group(0)
+                        if w not in wanted:
+                            continue
+                        head = n.value[m.start() - 1] if m.start() else ""
+                        tail = n.value[m.end():m.end() + 1]
+                        if tail != "(" and head != ".":
+                            continue
+                        res["strings"].setdefault(w, []).append(
+                            {"file": relf, "line": n.lineno, "test": is_test,
+                             "inside": True})
                 return
             for c in ast.iter_child_nodes(n):
                 visit(c, holder)
 
-        for stmt in tree.body:
+        for stmt in _reach_body(tree):
             visit(stmt, mod)
 
     return res
@@ -8496,7 +8581,22 @@ def _reach_limits(have_entries):
         "    * Python source that lives inside a STRING is text, not code, to an ast",
         "      pass — a subprocess probe built with textwrap.dedent, an exec(), a",
         "      generated module. Measured: one symbol on the live repo this was tuned",
-        "      against is called ONLY from such a probe and reads NO CALL SITES here.",
+        "      against is called ONLY from such a probe. A CALL-SHAPED occurrence",
+        "      (`name(` or `.name`) is reported above as an `embedded` hint and the",
+        "      verdict is not upgraded on it; a name merely MENTIONED in prose is not",
+        "      reported at all, so the absence of that line proves nothing.",
+        "    * references are matched by the identifier AT THE REFERENCE SITE. A",
+        "      `from m import foo as _foo` rename IS followed (the alias is resolved",
+        "      per file and the caller is shown `[as _foo]`), but a name rebound any",
+        "      other way — `g = foo` then `g()`, a dict of callables, a partial — is",
+        "      not, and reads as no caller at all.",
+        "    * a package whose public surface is a PEP 562 module __getattr__ / lazy",
+        "      table reads as exported NOWHERE: `exported` knows __all__ and a",
+        "      package __init__'s from-imports, and nothing else.",
+        "    * a file the RUNNING interpreter cannot parse contributes no call sites",
+        "      at all. It is named above per file, and the modern trigger is a version",
+        "      mismatch rather than broken code — measured, a `type X = ...` (PEP 695,",
+        "      3.12+) statement takes a whole module out of the answer under 3.11.",
         "    * a DECORATOR on the definition is reported and NOT followed. This scanner",
         "      sees that @router.post is there; it cannot see whether that router is",
         "      itself imported and mounted. DECORATOR-REGISTERED therefore means 'the",
@@ -8627,8 +8727,9 @@ def cmd_reachable(args):
                 print("      callers    %d (%d product, %d test)"
                       % (len(r["call_sites"]), r["product_call_sites"], r["test_call_sites"]))
                 for c in r["call_sites"][:REACH_LIST_CAP]:
-                    print("                 %s:%d  in %s%s"
+                    print("                 %s:%d  in %s%s%s"
                           % (c["file"], c["line"], c["holder"],
+                             ("  [as %s]" % c["alias"]) if c.get("alias") else "",
                              "  [TEST]" if c["test"] else ""))
                 if len(r["call_sites"]) > REACH_LIST_CAP:
                     print("                 ... and %d more"
@@ -8667,11 +8768,21 @@ def cmd_reachable(args):
                 print("      AMBIGUOUS  %d definitions share this name; references are "
                       "matched by name alone, so the layers above MERGE them and read "
                       "generously" % len(r["definitions"]))
-            if r["dynamic_hints"]:
+            bare = [h for h in r["dynamic_hints"] if not h.get("inside")]
+            inside = [h for h in r["dynamic_hints"] if h.get("inside")]
+            if bare:
                 print("      dynamic    the bare name appears as a STRING at %s — a getattr "
                       "or registry may reach it. The verdict above is NOT upgraded on this."
                       % ", ".join("%s:%d" % (h["file"], h["line"])
-                                  for h in r["dynamic_hints"][:REACH_LIST_CAP]))
+                                  for h in bare[:REACH_LIST_CAP]))
+            if inside:
+                print("      embedded   the name appears CALL-SHAPED inside a longer string "
+                      "at %s — Python source in a string (a subprocess probe, an exec, a "
+                      "generated module) is text to an ast pass, so a real call site can "
+                      "hide there. Read the string before believing the verdict above; it "
+                      "is NOT upgraded on this."
+                      % ", ".join("%s:%d" % (h["file"], h["line"])
+                                  for h in inside[:REACH_LIST_CAP]))
             print("      %s" % REACH_DIAGNOSIS[r["verdict"]])
         print("")
         counts = {}
