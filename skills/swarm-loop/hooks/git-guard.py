@@ -308,6 +308,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 
 ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
@@ -409,6 +410,57 @@ class SelfHinted(str):
     reaches `block()` through the existing path unwrapped."""
 
 
+class Reviewable(SelfHinted):
+    """A refusal the guard is holding PENDING REVIEW, not one it is holding
+    because the operation destroys something.
+
+    This is the ONLY class of refusal the CTO authorization gate below can ever
+    grant past, and membership is opt-in: a checker that returns a plain `str`,
+    a `SelfHinted` or an `Undetermined` is unauthorizable, and so is every
+    checker added after this line unless someone deliberately marks it. That
+    default is the point. `refuses()` one screen up records what happens when a
+    family's classification is implicit — the wrong footer got stapled onto ~40
+    refusals because nothing opted in or out — and the cost of that mistake here
+    is not misleading prose, it is a destructive op running with a rubber stamp.
+
+    THE HONEST ENUMERATION, against this file's OWN refusal families rather than
+    a list invented for the gate:
+
+      1. working-tree destroyers — `stash`, `reset --hard/--merge/--keep`,
+         `checkout -- <path>` / `.` / `-f`, `switch --discard-changes`,
+         `restore <path>`, `clean -f`, `worktree remove --force`, and the
+         plumbing (`checkout-index -f`, `read-tree -u`, `apply -R`, repo-wide
+         `git rm`).  DESTRUCTIVE — the work exists nowhere else.
+      2. ref / object / history destroyers — `push --force/--mirror/--delete`
+         and the refspec spellings, `branch -f`, `checkout -B`, `switch -C`,
+         `update-ref`, `reflog expire`, `gc --prune`, `prune`, `repack -ad`,
+         `filter-branch`, `symbolic-ref`, `submodule deinit -f`,
+         `sparse-checkout set`, forced `fetch`/`pull` refspecs.  DESTRUCTIVE.
+      3. LEDGER writes and deletes — `> <ledger>`, `truncate`, `sed -i`, `dd
+         of=`, `tee`, `find … -delete`, `rm`/`mv` under `.swarm-loop`, and a
+         file-tool write naming a ledger file.  DESTRUCTIVE, and worse than it
+         looks: it destroys the DETECTOR along with the data.
+      4. the `rm -r` path rules — repo roots, worktree roots, directories
+         holding worktrees, `.git`, `/`, `$HOME`, the variable-tail forms.
+         DESTRUCTIVE.
+      5. the ONE fail-closed rule — a recursive `rm` the guard could not
+         classify.  DESTRUCTIVE *and* unclassified; doubly unauthorizable.
+      6. the `.swarm-loop` dirty-ledger PUSH gate (`_ledger_refusal`).
+         NOT DESTRUCTIVE, and it says so twice in its own text: "nothing here
+         is destructive … a push takes no one's uncommitted work". It is a
+         REVIEW condition — publish now, or commit the evidence first — and it
+         is the only refusal in this file that is.
+
+    So the reviewable set is exactly family 6. That is not a placeholder for a
+    longer list: `git worktree move` was considered and left out, because a
+    filesystem effect being reversible is not the same as it being harmless
+    while another agent holds a path inside it, and the cheap direction to be
+    wrong in is the narrow one.
+
+    Bounded by REVERSIBILITY, never by justification — a well-argued `git
+    stash` is still a `git stash`."""
+
+
 SAFE_HINT = (
     "WHY: this git op is repo-global — in a shared working tree it reverts or "
     "destroys EVERY parallel agent's uncommitted work, not just yours "
@@ -508,10 +560,23 @@ def allow() -> None:
 
 
 def block(reason: str) -> None:
+    # THE ONE PLACE A REFUSAL CAN BE LIFTED. Every rule in this file reaches
+    # exit 2 through here, so the CTO gate is consulted here and nowhere else —
+    # a second grant path is a second thing to get wrong. `gate_verdict` is
+    # defined far below, beside the store it reads; it returns (granted, note)
+    # and is a no-op returning (False, None) whenever `CLAUDE_BUILD_STATE_DIR`
+    # is unset, which is every invocation outside a `full-auto`/`all` run.
+    granted, note = gate_verdict(reason)
+    if granted:
+        # Exit 0 is "this guard has no objection", NOT `permissionDecision:
+        # allow` — see the gate's comment. The user's own permission rules are
+        # evaluated after this and are untouched by it.
+        sys.exit(0)
     # A SelfHinted reason brings its own WHY and its own fix — see the class.
     footer = "" if isinstance(reason, SelfHinted) else "\n\n" + SAFE_HINT
     print(
-        "BLOCKED (swarm-loop git-guard): " + reason + footer,
+        "BLOCKED (swarm-loop git-guard): " + reason + footer
+        + ("\n\n" + note if note else ""),
         file=sys.stderr,
     )
     sys.exit(2)
@@ -1484,7 +1549,10 @@ def _ledger_refusal(tree: str, branch: str, status: str) -> str:
             + os.path.join(tree, SWARM_DIR) + "`:\n" + status + "\n"
             "A push ships COMMITS, so none of the above goes with it.\n")
     if _is_linked_worktree(tree):
-        return SelfHinted(
+        # `Reviewable`, not `SelfHinted`: see the class. This refusal is the
+        # file's one non-destructive one, so it is the one a CTO may authorize.
+        # Both branches are marked, because both refuse the same push.
+        return Reviewable(
             head +
             "That tree is a WORKER WORKTREE, and nothing in the loop writes `"
             + SWARM_DIR + "` from one — this guard blocks such writes, and "
@@ -1502,7 +1570,7 @@ def _ledger_refusal(tree: str, branch: str, status: str) -> str:
             "primary tree and Phase 8 commits it there. If you cannot explain "
             "the difference, say so in your report rather than resolving it "
             "yourself.")
-    return SelfHinted(
+    return Reviewable(
         head +
         "That is Phase 7's last push condition, and it is not a style rule: "
         "`history.csv`, `state.json` and `analysis/` are what `resume` reads, "
@@ -3158,6 +3226,483 @@ def _scan_segment(seg: list[str], depth: int, allow_cd: bool = True) -> None:
     return False
 
 
+
+
+# ===========================================================================
+# THE CTO AUTHORIZATION GATE
+# ===========================================================================
+#
+# `bin/claude-build` GREPS THIS FILE for the literal string on the next line.
+# While it is absent, `claude-build full-auto` and `claude-build all` exit 3 and
+# refuse to launch, because both hand a CTO hat to the watcher and a watcher
+# holding an authority that does not exist is a review step the operator
+# believes is happening. Removing this constant re-disables both modifiers —
+# which is the correct behaviour, and why the constant is not decoration: it is
+# the schema tag every approval record must carry (`_is_grant` below), so a
+# sentinel present while the gate does nothing is not a state this file can be
+# left in without the gate's own tests going red.
+# ---------------------------------------------------------------------------
+# CTO AUTHORIZATION GATE — WRITTEN, NOT ARMED, NOT TESTED.
+#
+# The code below was authored in a session that was cut off mid-function and
+# it has ZERO test cases. `bin/claude-build` arms `full-auto` and `all` by
+# grepping this file for the exact string C-L-A-U-D-E_BUILD_AUTHORIZATION_GATE,
+# so that literal is deliberately NOT spelled here: an armed sentinel over an
+# unverified gate would turn the launcher's honest refusal into a launch, and a
+# CTO that does not really gate is a review step the operator BELIEVES is
+# happening — strictly worse than the feature not existing, which is the
+# launcher's own stated reason for refusing.
+#
+# TO ARM IT, and only after it has tests: set GATE_ID to that literal string.
+# Nothing else needs to change; every reference below goes through this name.
+GATE_ID = "CTO-GATE-UNARMED-UNTESTED"
+
+# WHAT A CTO MAY DO, and the whole of it: lift a refusal this guard is holding
+# PENDING REVIEW. Bounded by REVERSIBILITY, never by how good the reasoning is.
+# `Reviewable` (top of file) enumerates the guard's refusal families against
+# that boundary and marks the one — exactly one — that qualifies. Everything
+# else is unauthorizable here, with no "ask the CTO" path at all: it goes to the
+# human.
+#
+# WHY THE BUILD CANNOT WRITE ITS OWN APPROVAL — reasoned explicitly, because the
+# build session has a Bash tool and anything it can forge is not a gate.
+#
+#   The store is `<state_dir>/authority/approvals.log`, a path OUTSIDE every
+#   directory `claude-build` grants the build session. The build's tools — Bash,
+#   Read, Write, Edit — are confined to the granted working directories by
+#   Claude Code's permission layer, which refuses that path for read, write and
+#   even `ls`. THIS hook is not a tool call: it is a subprocess the harness runs
+#   on the build's behalf, outside the permission layer, so it can read a file
+#   the session it is guarding cannot. That asymmetry is the entire mechanism.
+#   The build can ASK (its request is a blocked command and a message to the
+#   CTO); only a session whose own grants include that directory can answer.
+#
+#   WHAT THIS DOES NOT DEFEND AGAINST, stated plainly rather than implied away:
+#     - It is a PERMISSION-LAYER boundary, not an OS or crypto one. The hook
+#       runs as the same user with the same filesystem privileges as the build.
+#       Anything that reaches code execution outside the tool-permission layer —
+#       a permitted command that spawns a writer, a session started with wider
+#       `--add-dir`, a hand-run shell in the same terminal — writes the log.
+#     - It does not defend against the build EDITING THIS FILE. A build with
+#       write access to the skill can delete the whole gate. `claude-build`
+#       denies the live skill directory to the build for exactly this reason;
+#       that denial, not this code, is what holds.
+#     - An HMAC over each record would NOT be stronger. The key would have to
+#       live somewhere the build cannot read, which is the same boundary this
+#       already relies on, and shipping one would advertise a strength that is
+#       not there.
+#     - It cannot tell whether the CTO's grant was WISE, only whether it is
+#       reversible, correctly signed, and unspent. The laundering loop the
+#       design doc names — the watcher suggesting an op and then approving it —
+#       is caught by the record, not prevented by it.
+#   Guard rail against a mistake, plus an audit trail. Not a sandbox.
+#
+# AND WHAT IT STRUCTURALLY CANNOT DO: override the user's own settings. A
+# granted gate exits 0, which in the PreToolUse contract means "this hook has no
+# objection" — it is NOT `permissionDecision: allow`, so the user's own
+# permission rules are evaluated afterwards exactly as if this guard had never
+# fired. The explicit `permissions.deny` check below is belt-and-braces on top
+# of that, and it exists so the boundary is testable rather than merely true.
+
+# Role -> the run.json key prefix that names the session holding it. `build` is
+# deliberately absent: the requester is never a grantor, and an unknown role
+# means NO CTO, which denies.
+CTO_ROLE_PREFIX = {"watchdog": "watch", "fixer": "fix"}
+
+# Every field a grant must carry, all non-empty strings. A record missing one is
+# not a weak grant, it is not a grant.
+GRANT_FIELDS = ("id", "run_id", "granted_by", "requester", "tool", "operation",
+                "reason", "ts")
+
+GATE_ASK = (
+    "CTO REVIEW IS AVAILABLE FOR THIS ONE, and only because it is not "
+    "destructive. Ask — do not work around it: message the session holding the "
+    "CTO role and state the exact command, verbatim, and why it should run now. "
+    "If it grants, re-run the SAME command string and this guard will step "
+    "aside once. An approval names one operation and is single-use; a second "
+    "run is a second request."
+)
+
+GATE_NO_REVIEW = (
+    "NOT AUTHORIZABLE. An approval naming this operation is present in the "
+    "run's authority log and is being REFUSED: the CTO's authority is bounded "
+    "by reversibility, and this operation is destructive. There is no "
+    "'ask the CTO' path for it at all — if it genuinely must run, it goes to "
+    "the human."
+)
+
+
+def _gate_note(text: str) -> str:
+    return "CTO AUTHORIZATION: " + text
+
+
+def _run_ledger(state_dir: str):
+    """`<state_dir>/run.json`, or None if it cannot be read as an object.
+
+    None is a DENIAL, not a fallback: the ledger is what names the CTO, the run
+    and the log, and an approval that cannot be tied to all three is unverified."""
+    try:
+        with open(os.path.join(state_dir, "run.json"), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _ledger_str(run: dict, key: str) -> str:
+    v = run.get(key)
+    return v.strip() if isinstance(v, str) and v.strip() else ""
+
+
+def _identities(run: dict, prefix: str) -> set:
+    out = set()
+    for key in (prefix + "_session_id", prefix + "_session_name"):
+        v = _ledger_str(run, key)
+        if v:
+            out.add(v)
+    return out
+
+
+def _read_approvals(path: str):
+    """Every record in the append-only log, or None if the store is not fully
+    verifiable.
+
+    ONE unparseable line poisons the whole read, deliberately. The store is
+    machine-written and append-only, so a line that is not JSON means something
+    other than the CTO wrote here — and more concretely, a line the guard cannot
+    read might be the `use` record that spends the grant it is about to honour,
+    so "grant is unspent" stops being knowable. Denying the whole store is a
+    denial of AUTHORIZATION and never an escalation: every refusal simply
+    stands, which is what the guard did before this file had a gate."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = fh.read()
+    except Exception:
+        return None
+    out = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            return None
+        if not isinstance(rec, dict):
+            return None
+        out.append(rec)
+    return out
+
+
+def _store_isolated(log_path: str) -> bool:
+    """Is the approvals log outside every tree the build session can reach?
+
+    The isolation property is the mechanism; a store that has drifted inside the
+    repo, a worktree, the session root or the command's own directory has none,
+    and a grant read out of it proves nothing. Unanswerable -> False (deny)."""
+    try:
+        ap = os.path.realpath(log_path)
+        trees = set(_session_family())
+        trees.add(os.path.realpath(_SESSION_ROOT))
+        trees.add(os.path.realpath(_CWD))
+    except Exception:
+        return False
+    for t in trees:
+        try:
+            if t and _under(ap, os.path.realpath(t)):
+                return False
+        except Exception:
+            return False
+    return True
+
+
+def _is_grant(rec: dict, run_id: str, tool: str, operation: str) -> bool:
+    """A record that grants THIS operation. Specific and literal: the operation
+    is compared byte for byte, with no globbing, no prefix match and no
+    wildcard, so an approval covers one command string and nothing adjacent to
+    it."""
+    if rec.get("gate") != GATE_ID:
+        return False
+    if rec.get("kind") != "grant":
+        return False
+    for k in GRANT_FIELDS:
+        v = rec.get(k)
+        if not isinstance(v, str) or not v.strip():
+            return False
+    return (rec["run_id"] == run_id and rec["tool"] == tool
+            and rec["operation"] == operation)
+
+
+def _spent_ids(recs: list) -> set:
+    out = set()
+    for rec in recs:
+        if rec.get("gate") != GATE_ID:
+            continue
+        if rec.get("kind") != "use":
+            continue
+        gid = rec.get("grant_id")
+        if isinstance(gid, str) and gid.strip():
+            out.add(gid.strip())
+    return out
+
+
+def _user_settings_paths() -> list:
+    """The USER's own settings, and only those.
+
+    Project settings (`<repo>/.claude/settings*.json`) are deliberately not read
+    here: they live inside a directory the build session can write, so a build
+    that could edit them could edit the very list that is supposed to bind it.
+    A user-level denial is absolute and lives where the build cannot reach."""
+    out = []
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if isinstance(cfg, str) and cfg.strip():
+        out.append(os.path.join(cfg.strip(), "settings.json"))
+    else:
+        try:
+            out.append(os.path.join(os.path.expanduser("~"), ".claude",
+                                    "settings.json"))
+        except Exception:
+            pass
+    return out
+
+
+def _deny_rule_matches(rule: str, tool: str, operation: str):
+    """Does one `permissions.deny` rule cover this call? True / False / None.
+
+    None means "not understood", and the caller treats that as a match. That is
+    the fail-closed direction: an unreadable denial must never be assumed
+    harmless, and the cost of being wrong is one refusal that stands."""
+    if not isinstance(rule, str) or not rule.strip():
+        return None
+    rule = rule.strip()
+    if "(" not in rule:
+        return rule == tool
+    if not rule.endswith(")"):
+        return None                      # malformed: cannot be verified
+    name, _, arg = rule[:-1].partition("(")
+    if name.strip() != tool:
+        return False                     # a rule about some other tool
+    pat = arg.strip()
+    op = operation.strip()
+    if not pat:
+        return None
+    if pat.endswith(":*"):               # Claude Code's prefix form
+        head = pat[:-2].strip()
+        return op == head or op.startswith(head + " ")
+    if GLOB_META_RE.search(pat):
+        try:
+            return fnmatch.fnmatch(op, pat)
+        except Exception:
+            return None
+    return op == pat
+
+
+def _user_denies(tool: str, operation: str):
+    """(denied, rule) — a user-level `permissions.deny` covering this call.
+
+    An unparseable settings file denies: the gate cannot show the user did NOT
+    forbid this, and no agent grants past a user denial it cannot read."""
+    for path in _user_settings_paths():
+        try:
+            if not os.path.isfile(path):
+                continue
+        except Exception:
+            return True, "<unreadable user settings>"
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception:
+            return True, "<unparseable " + path + ">"
+        if not isinstance(data, dict):
+            return True, "<malformed " + path + ">"
+        perms = data.get("permissions")
+        if not isinstance(perms, dict):
+            continue
+        rules = perms.get("deny")
+        if rules is None:
+            continue
+        if not isinstance(rules, list):
+            return True, "<malformed deny list in " + path + ">"
+        for rule in rules:
+            hit = _deny_rule_matches(rule, tool, operation)
+            if hit is None:
+                return True, str(rule) + " (in " + path + ", not understood)"
+            if hit:
+                return True, str(rule) + " (in " + path + ")"
+    return False, ""
+
+
+def _record_use(log_path: str, grant: dict, run_id: str, requester: str) -> bool:
+    """Spend the grant by APPENDING to the same log. Returns False if the write
+    did not land — in which case the grant is not honoured, because a grant that
+    cannot be marked spent is a grant that can be replayed."""
+    rec = {
+        "gate": GATE_ID,
+        "kind": "use",
+        "grant_id": grant.get("id"),
+        "run_id": run_id,
+        "requester": requester,
+        "tool": grant.get("tool"),
+        "operation": grant.get("operation"),
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    try:
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, sort_keys=True) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+    except Exception:
+        return False
+    return True
+
+
+def gate_verdict(reason: str) -> tuple:
+    """(granted, note-to-append). Called from `block()` and nowhere else.
+
+    THE ONE PLACE IN THIS FILE THAT FAILS CLOSED ON ITS OWN ERRORS. The guard as
+    a whole fails OPEN — a crashed parser must never wedge an unattended run —
+    but an authorization is not a blocking decision, it is the LIFTING of one,
+    and an authorization that cannot be verified is denied. Every uncertainty
+    below (no state dir, no run ledger, authority not armed, no CTO, an
+    unreadable or malformed store, a store that is not isolated, a mismatched or
+    spent or self-signed approval, a user-level deny, a failed write of the
+    consumption record) returns `granted=False` and the refusal simply stands."""
+    try:
+        state_dir = (os.environ.get("CLAUDE_BUILD_STATE_DIR") or "").strip()
+    except Exception:
+        return False, None
+    if not state_dir:
+        # Not a `full-auto`/`all` run. Nothing about this guard changes.
+        return False, None
+    try:
+        return _gate_verdict(reason, state_dir)
+    except BaseException:
+        return False, _gate_note(
+            "DENIED — the gate raised while verifying the approval store. An "
+            "authorization that cannot be verified is refused; this refusal "
+            "stands.")
+
+
+def _gate_verdict(reason: str, state_dir: str) -> tuple:
+    reviewable = isinstance(reason, Reviewable)
+    run = _run_ledger(state_dir)
+    if run is None:
+        return False, _gate_note(
+            "DENIED — no readable `run.json` under CLAUDE_BUILD_STATE_DIR ("
+            + state_dir + "), so nothing identifies the run or the CTO.")
+    if _ledger_str(run, "authority") != "1" and str(run.get("authority")) != "1":
+        return False, _gate_note("DENIED — authority is not armed for this run.")
+    run_id = _ledger_str(run, "run_id")
+    log_path = _ledger_str(run, "cto_log")
+    if not run_id or not log_path:
+        return False, _gate_note(
+            "DENIED — `run.json` names no run_id / cto_log.")
+
+    recs = _read_approvals(log_path)
+    if recs is None:
+        return False, _gate_note(
+            "DENIED — the approvals log is unreadable or contains a line that "
+            "is not a valid record (" + log_path + "). A store that cannot be "
+            "read in full cannot show an approval is unspent.")
+
+    tool = _REQUEST_TOOL
+    operation = _REQUEST_OPERATION or ""
+    if not operation:
+        return False, _gate_note(
+            "DENIED — the operation being requested could not be read from the "
+            "tool payload, so no approval can name it.")
+
+    spent = _spent_ids(recs)
+    grants = [r for r in recs if _is_grant(r, run_id, tool, operation)]
+    unspent = [g for g in grants if g["id"].strip() not in spent]
+    if not grants:
+        # Nothing has been approved. A REVIEWABLE refusal tells the build the
+        # review path exists; a destructive one says nothing new, so its text is
+        # left exactly as it was.
+        return False, (_gate_note(GATE_ASK) if reviewable else None)
+
+    if not reviewable:
+        return False, _gate_note(GATE_NO_REVIEW)
+
+    if not unspent:
+        return False, _gate_note(
+            "DENIED — every approval naming this operation has already been "
+            "used. An approval is single-use; a second run of the same command "
+            "is a second request.")
+
+    # --- who signed it, and who is asking ---------------------------------
+    role = _ledger_str(run, "cto_role")
+    prefix = CTO_ROLE_PREFIX.get(role)
+    if not prefix:
+        return False, _gate_note(
+            "DENIED — this run has no session holding the CTO role.")
+    cto = _identities(run, prefix)
+    requester = _identities(run, "build")
+    if _REQUEST_SESSION:
+        requester.add(_REQUEST_SESSION)
+    if not cto:
+        return False, _gate_note(
+            "DENIED — `run.json` names no session for the CTO role '"
+            + role + "'.")
+    if not requester:
+        return False, _gate_note(
+            "DENIED — the requesting session could not be identified.")
+    if cto & requester:
+        # The requester cannot approve itself. Not a wording rule: `all` puts
+        # the CTO hat on the watcher precisely so the asker and the grantor are
+        # different sessions, and a topology where they collapse has no
+        # separation left to enforce.
+        return False, _gate_note(
+            "DENIED — the session holding the CTO role IS the requesting "
+            "session. A session cannot authorize its own request.")
+
+    for grant in unspent:
+        if grant["granted_by"].strip() in requester:
+            return False, _gate_note(
+                "DENIED — that approval was signed by the requesting session "
+                "itself. A session cannot authorize its own request.")
+        if grant["granted_by"].strip() not in cto:
+            return False, _gate_note(
+                "DENIED — that approval was signed by `"
+                + grant["granted_by"].strip() + "`, which is not the session "
+                "holding the CTO role for this run.")
+        if grant["requester"].strip() not in requester:
+            return False, _gate_note(
+                "DENIED — that approval was issued for a different session.")
+
+        denied, rule = _user_denies(tool, operation)
+        if denied:
+            # Absolute, and checked LAST so the message is about the denial and
+            # not about a malformed record. No agent grants past a user-level
+            # denial.
+            return False, _gate_note(
+                "DENIED — the user's own settings deny this operation ("
+                + rule + "). A user-level denial is absolute; no agent, CTO or "
+                "otherwise, authorizes past it.")
+
+        if not _record_use(log_path, grant, run_id,
+                           sorted(requester)[0] if requester else ""):
+            return False, _gate_note(
+                "DENIED — the approval could not be marked as used, so it "
+                "could be replayed. Refusing rather than granting a second "
+                "time.")
+
+        print("ALLOWED BY CTO AUTHORIZATION (" + GATE_ID
+              + "): grant " + grant["id"].strip() + " signed by "
+              + grant["granted_by"].strip() + " for run " + run_id
+              + "; single-use, now spent. Reason given: " + grant["reason"],
+              file=sys.stderr)
+        return True, None
+
+    return False, _gate_note(
+        "DENIED — no usable approval names this operation.")
+
+
+# What the request IS, for the gate. Set once by `_main`; an approval names one
+# operation and is matched against these byte for byte.
+_REQUEST_TOOL: str = "Bash"
+_REQUEST_OPERATION: str | None = None
+_REQUEST_SESSION: str | None = None
 
 
 def _main() -> None:

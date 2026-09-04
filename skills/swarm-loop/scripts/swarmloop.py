@@ -245,6 +245,12 @@ PROGRESS_EPS = 1e-9
 # and analyze went on asserting the harness was intact. No forgery required.
 MANDATORY_PROTECTED = (f"{STATE_DIR}/acceptance", f"{STATE_DIR}/{GOALS_FILE}")
 
+# The `verify` a finding-mint writes. It is DELIBERATELY a gate that cannot go
+# red, so red-check refuses to DISPATCH the ticket until someone writes a real
+# one. Named once, because two copies of it drift and the merge gate below has
+# to recognise the exact bytes the mint wrote.
+FINDING_VERIFY_PLACEHOLDER = "false  # NO GATE YET — write one that fails on this finding first"
+
 # The keys freeze STAMPS INTO goals.json. They move on every freeze even when
 # nothing about the goals moves, which is why a raw digest of the file cannot
 # answer "did a target move?" — see _goals_canon.
@@ -3267,6 +3273,47 @@ def _redcheck_gate(root, d, tid, base, branch, fork):
                 "before you merge:")
         print(cmd)
         return False
+    # THE PLACEHOLDER BLOCKS DISPATCH, NOT MERGE. A finding-mint writes a
+    # `verify` that cannot go red on purpose, so red-check refuses to dispatch
+    # the ticket until a real gate exists — that is the check working. But the
+    # same stamp then reached HERE and vetoed the MERGE of a branch whose work
+    # was finished, which the placeholder was never meant to do: measured on a
+    # live run, 49 of 72 tickets carried these exact bytes and a completed
+    # ticket with its own measured-red positive control could not land, which
+    # was the single thing blocking that run's metric and its push.
+    #
+    # So: say it loudly and let it merge. The gate that matters is unchanged —
+    # nothing dispatches on a placeholder. Fail CLOSED if the graph cannot be
+    # read: an unreadable graph must not become a way to make this veto go away.
+    try:
+        _st = load_json(os.path.join(d, STATE_FILE), "state")
+    except SystemExit:
+        _st = {}
+    _verify_now = None
+    try:
+        _gp, _tk = _load_graph(root, _st, None, required=False)
+        if _tk:
+            for _t in _tk:
+                if isinstance(_t, dict) and str(_t.get("id")) == tid:
+                    _verify_now = str(_t.get("verify") or "")
+                    break
+    except (Exception, SystemExit):
+        # SystemExit too: _load_graph dies through die() on an unreadable graph,
+        # and an uncaught exit here would skip the veto below entirely — turning
+        # a corrupt tickets.json into a way past the gate. Fail CLOSED: if the
+        # graph cannot be read we do not know the verify, so the veto stands.
+        _verify_now = None
+    if _verify_now is not None and _verify_now.strip() == FINDING_VERIFY_PLACEHOLDER.strip():
+        print(f"ADVISORY (not a veto) — {tid}'s `verify` is STILL the findings placeholder, "
+              "so its stamp could never have been `red`. That refusal belongs at DISPATCH, "
+              "and red-check still makes it there; it is not a reason to strand a branch "
+              "whose work is done.")
+        print("  What this does NOT tell you: whether the work is correct. Nothing has "
+              "graded it, because no gate exists to grade it with. Write the gate that "
+              "fails on the finding, run it against this branch's merge parent, and record "
+              "the verdict — before you call the ticket closed, not before you merge it:")
+        print(cmd)
+        return False
     print(f"VETO: {tid} has no red-check verdict of `red` at an ancestor of this branch's "
           f"merge parent, and it is not a ticket this ledger predates.")
     if mine:
@@ -3490,8 +3537,43 @@ def cmd_check_branch(args):
               f"{STATE_DIR}/{DISPATCH_FILE}")
         sys.exit(1)
     if protected_hits:
-        print("VETO: branch modifies the frozen goal harness — do not merge; return task to backlog")
-        sys.exit(1)
+        # THE MANIFEST ALONE IS THE AUTHORITY, and the asymmetry is the whole
+        # point. `freeze` reads the same signal to REFUSE an action, so its risk
+        # is a false negative and it treats either signal as "frozen". This gate
+        # reads it to APPLY a veto, so a CONJUNCTION here would be an off
+        # switch: a worker writing `"frozen": false` into goals.json — one field
+        # of the very file this veto protects — would disarm the post-freeze
+        # veto entirely. So: veto whenever the manifest EXISTS, whatever
+        # goals.json says about itself; advise when it does not.
+        #
+        # Why advise at all. Pre-freeze there is nothing hashed and nothing to
+        # tamper with, and layer-2 harness repair is the ORCHESTRATOR's job in
+        # that window (SKILL.md orders freeze AFTER the plan checkpoint). The
+        # veto nevertheless fired and printed "modifies the frozen goal harness"
+        # — asserting a state that did not exist — and was correctly overridden
+        # twice on one run. That is the damage: a gate which is always wrong in
+        # a known, machine-checkable state teaches override-by-default during
+        # exactly the window when overriding is always right, and the identical
+        # override is available afterwards, when it never is. It also flattens
+        # the audit trail, since the tool emitted the same text in both cases.
+        _mf = os.path.join(d, MANIFEST_FILE)
+        if os.path.exists(_mf):
+            print("VETO: branch modifies the frozen goal harness — do not merge; "
+                  "return task to backlog")
+            for _p in protected_hits:
+                print(f"    {_p}")
+            sys.exit(1)
+        print("ADVISORY: this branch touches a protected path, and NOTHING IS FROZEN YET "
+              f"— {STATE_DIR}/{MANIFEST_FILE} does not exist.")
+        for _p in protected_hits:
+            print(f"    {_p}")
+        print("  Not a veto, and deliberately not one: pre-freeze there is nothing hashed "
+              "to tamper with, and layer-2 harness repair is the orchestrator's job in this "
+              "window — SKILL.md orders freeze AFTER the plan checkpoint. A veto here would "
+              "be asserting a frozen harness that does not exist, and overriding it would "
+              "teach the override that must NEVER be taken once the manifest lands.")
+        print("  Read the diff anyway: these bytes become the locked baseline at freeze, so "
+              "a mistake made now is the thing every later score is measured against.")
     if swarm_hits:
         print(f"VETO: branch writes orchestrator-owned state under {STATE_DIR}/ — do not merge")
         sys.exit(1)
@@ -6638,7 +6720,7 @@ def cmd_findings(args):
             # vacuously and let an ungated ticket dispatch; this exits non-zero
             # with zero tests selected, which red-check scores WEAK and refuses.
             # The ticket is not dispatchable until someone writes a real gate.
-            "verify": "false  # NO GATE YET — write one that fails on this finding first",
+            "verify": FINDING_VERIFY_PLACEHOLDER,
             "scope": [scope] if scope else [],
             "depends_on": [],
             "source": "finding",
@@ -8170,9 +8252,10 @@ def cmd_reads(args):
         out["unparsed"] = [{"file": a, "error": b} for a, b in res["unparsed"]]
         print(json.dumps(out, indent=2, sort_keys=True))
     else:
-        print("reads: %d frozen test file(s), %d test(s) scanned, %d marked ticket(s) with "
-              "read edges  (graph %s)"
-              % (res["test_files"], res["tests_scanned"], len(res["reads"]),
+        marked = res["tests_scanned"] - res["unmarked_tests"]
+        print("reads: %d frozen test file(s), %d of %d test(s) scanned carry a ticket "
+              "marker, %d marked ticket(s) with read edges  (graph %s)"
+              % (res["test_files"], marked, res["tests_scanned"], len(res["reads"]),
                  os.path.relpath(path, root)))
         if not res["test_files"]:
             print("  no frozen test files under the protected paths — pass --tests <dir> if "
@@ -8186,7 +8269,18 @@ def cmd_reads(args):
             for owner, mods in sorted(res["reads"][tid].items()):
                 print("    %-9s reads %-9s %s" % (tid, owner, ", ".join(mods)))
         if not res["reads"]:
-            print("    (none — every frozen test imports only what its own ticket owns)")
+            # "(none)" is a finding of fact; an extractor that recognised
+            # NOTHING renders the identical string. Measured: a suite whose
+            # markers use a dialect this parser misses printed "(none)" in both
+            # directions, exited 0, and that green was consumed as a closure
+            # gate result. Say which of the two it is.
+            if res["tests_scanned"] and not res["marked_tests"]:
+                print("    NOTHING WAS RECOGNISED — 0 of %d test(s) scanned carry a marker "
+                      "this parser understands, so no edge could be derived either way. "
+                      "This is NOT the finding 'there are no cross-ticket reads'."
+                      % res["tests_scanned"])
+            else:
+                print("    (none — every frozen test imports only what its own ticket owns)")
         print("")
         # The half of H-10 that packets actually need. The inbound view tells a
         # worker what to import; only the OUTBOUND view tells T-030 that it is
@@ -8201,7 +8295,10 @@ def cmd_reads(args):
             for tid, mods in sorted(outbound[owner].items()):
                 print("    %-9s must satisfy %-9s via %s" % (owner, tid, ", ".join(mods)))
         if not outbound:
-            print("    (none)")
+            if res["tests_scanned"] and not res["marked_tests"]:
+                print("    (nothing was recognised — see above; this is NOT 'no obligations')")
+            else:
+                print("    (none)")
         for line in _read_edge_report(res, idx):
             print(line)
         print("")

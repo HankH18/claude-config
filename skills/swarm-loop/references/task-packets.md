@@ -196,6 +196,24 @@ permission to change its own route has misread this packet.
   comment at the assertion and in the commit body. The orchestrator reads the
   REMOVED lines of every test diff; an unjustified assertion change gets the
   branch rejected even when every metric is green.
+- A TEST YOU WRITE MAY NOT GRADE AGAINST A FILE YOU OWN. Whatever an assertion
+  compares against — a fixture, a golden file, a snapshot, a recorded response,
+  a manifest, the source text of a module — must be something you CANNOT write:
+  orchestrator-owned, or frozen under .swarm-loop/acceptance/. If you can write
+  the answer key, the metric measures nothing. This needs no bad intent and
+  that is exactly why it keeps happening: you implement, you run it, you paste
+  the output into the fixture because that is what the output is, and it is
+  green forever. Measured five times across two runs — four epics of one run
+  compared a function's output field-by-field against a fixture directory
+  sitting in the graded ticket's own scope, and two of them tried to close it
+  with an approval digest computable by whoever writes the manifest.
+  So: before you commit any test, name the thing it compares against and check
+  it against YOUR OWN FILES list above. A hit is not something to work around.
+  Say so in NEEDS — "this criterion has no fixture outside my ownership; I need
+  an orchestrator-owned or frozen one" — and the orchestrator supplies it or
+  re-scopes the ticket. Writing the key yourself and grading against it is the
+  one failure that survives every other check in this loop, because every
+  number it produces is well-formed.
 
 ## Context you need
 <codebase-map excerpt relevant to this task: the modules you'll touch, the
@@ -442,6 +460,21 @@ is what makes `..` the correct operator here; it has been verified twice, do not
   stub-blindness question). Green proves the code behaves as the test calls it,
   not that the wired product works; a suite can be green while the product is
   still fully broken.
+- **For every green metric and every green frozen test in this batch, find its
+  answer key and ask who owns it.** Name the thing the assertion compares
+  against — fixture, golden file, snapshot, recorded response, manifest, the
+  source text of a module — and check that path against the graded ticket's
+  ownership map. A metric may never be graded against a file inside the graded
+  ticket's own scope: the thing compared against must be orchestrator-owned or
+  frozen alongside the test, because **if the gradee can write the answer key the
+  metric measures nothing**. A hit is a measurement-credibility finding at full
+  severity whether or not the code beneath it is correct, and it is invisible to
+  every other rung — `check-branch` sees a diff, `verify` sees frozen bytes, and
+  the number itself is well-formed. Measured five times; the most recent was an
+  acceptance test grading the SOURCE TEXT of a file in the gradee's own write
+  scope, under which a four-line module containing one unconditional
+  `pytest.skip()` scored green while validating nothing. If the frozen test
+  itself is what is inadequate, say so in the report — you may never touch it.
 - Hunt cross-branch interactions: shared registries, schemas, route tables, global
   assumptions. These collisions exist only after integration — no per-branch check
   (rung 1) can see them, which is exactly why this packet exists.
@@ -475,6 +508,15 @@ is what makes `..` the correct operator here; it has been verified twice, do not
 - Audit every doer claim against the diff: a CHANGED list that omits a changed
   file, an ACCEPTANCE claim the suite contradicts, a DECISIONS entry the code does
   not reflect — each one is a finding.
+- **Ask of every green metric in this batch: could the gradee have written the
+  answer key?** If the fixture, golden file, snapshot or source text an assertion
+  compares against sits inside the graded ticket's own scope, the metric measures
+  nothing — a worker implements, runs, pastes the output into the fixture, and
+  scores green, and it needs no bad intent at all. Five instances are on record;
+  the most recent graded the SOURCE TEXT of a file in the gradee's own write
+  scope, so a four-line module whose whole body was one unconditional
+  `pytest.skip()` scored green. The fixture must be orchestrator-owned or frozen
+  alongside the test.
 - Re-read the batch's DELETIONS over the COMBINED integrated range — the same
   two-dot `<pre-batch-main>..main` range as the diff above, and never
   `main...integration/<epoch>-<batch>`: the batch has already landed, so the
@@ -628,10 +670,21 @@ place twice.
 
 The framing is adversarial: the job is to find what is wrong, not to confirm the
 work. Ask of every green thing what the green is evidence OF. Hunt false claims,
-stubs wearing green suites, mechanisms with zero production callers (for each one,
+answer keys the gradee could write — for any green metric, ask whether the fixture,
+golden file, snapshot or source text its assertion compares against sits inside the
+graded ticket's own scope; if the gradee can write the answer key the metric measures
+nothing, and five instances are on record — stubs wearing green suites, mechanisms with zero production callers (for each one,
 answer and REPORT the discriminator: does a frozen acceptance test currently pass
 because of it? yes ⇒ a measurement-credibility defect regardless of callers; no ⇒
-unfinished work, name the consumer that is missing), and the drift
+unfinished work, name the consumer that is missing). **For every green metric,
+ask where its answer key lives:** name the fixture, golden file, snapshot,
+manifest or source file the assertion grades against, and check whether that path
+sits inside the graded ticket's own scope — if the gradee could write it, the
+metric measures nothing however green it reads, and the fix is an
+orchestrator-owned or frozen fixture. Recorded five times in this skill's
+history, and the shape that hides best is the one wearing a seal: two epics
+closed the hole with an approval digest that was a plain `sha256` over the
+manifest, computable by whoever writes the manifest. Hunt too the drift
 no frozen metric can see — duplication, architecture erosion, dead code,
 convention violations, hotspot files accumulating unrelated responsibilities, test
 smells outside the frozen suite. Audit against the codebase map AND the spec: what
