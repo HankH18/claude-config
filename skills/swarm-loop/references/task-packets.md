@@ -660,6 +660,28 @@ deltas:
   free to regress silently.
 - **Documentation is never the repair.** Updating a comment or a README —
   including deleting a caveat — closes nothing; the defect has to stop happening.
+- **A CORRECT fix can turn the gate red several times before it turns green, and
+  the first red is the one that will talk you out of a working change.** Measured
+  end to end on one ticket: the fix landed, and then
+  (1) a `@pytest.mark.xfail(strict=True)` test that had been RECORDING the defect
+  started PASSING — and a strict xfail scores an unexpected pass as a FAILURE, so
+  the gate went red *because the fix worked*;
+  (2) deleting that marker, which its own `reason` string instructed
+  ("remove this marker with the fix"), orphaned the file's `import pytest` — a
+  lint error, red again;
+  (3) the formatter rejected the fix's own line wrapping — red a third time.
+  The aggregate gate checks all three, so a functionally perfect change returned
+  non-zero twice before it returned zero.
+  **So: read a red AFTER your fix for what it says, not as a verdict on the fix.**
+  An XPASS is evidence the defect is gone. A newly-unused import is arithmetic.
+  A formatter complaint is whitespace. None of them means revert. Before undoing
+  anything, run the gate's stages separately and name which one failed and why —
+  a lane that reverts on the first red destroys a correct fix and reports the
+  ticket as harder than it was. And when you remove a strict-xfail marker, that
+  IS a test edit: record the `justify-test-edit` justification in the diff and
+  the commit body, and answer the discriminating question — reverting the fix
+  must put the test back to red, which is what proves the marker was describing
+  behaviour that is genuinely gone rather than a marker you found inconvenient.
 
 ## Audit packet variant (audit-fix loops)
 
