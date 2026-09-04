@@ -3824,6 +3824,42 @@ ck_hasnt "(x2) CONTROL: no complaint" "discards its own failure output"
 #   (3) one branch name closed two tickets (false-closed).
 #   (4) closure derived from git is erased by `retire`.
 # ===========================================================================
+# `frontier` sorts by `unblocks` then depth and reads no analysis, while
+# SKILL.md Phase 3 says priority follows the LATEST ANALYSIS — regressing first,
+# then stalled, then off-track, largest error contribution first — three
+# paragraphs after "none of which may be done by eye". Measured on a live run:
+# thirteen cycles of unblocks-ranking left the largest single block of graded
+# error NEVER dispatched, zero records across 114 dispatch entries. It is not
+# silently re-sorted (no metric->ticket mapping exists to sort BY); it states
+# what its order is and hands over the analysis to rank by.
+section "(f) frontier does not pass a structural order off as Phase 3's  [repo: fana]"
+mk_repo fana
+cat > tickets.json <<'EOF'
+{"version": 1, "project": "fana", "tickets": [
+ {"id": "T-000", "title": "scaffold", "verify": "true",
+  "scope": ["**"], "depends_on": []},
+ {"id": "T-001", "title": "alpha", "verify": "false",
+  "scope": ["a/**"], "depends_on": ["T-000"]}
+]}
+EOF
+gq add -A; gq commit -qm graph
+sl frontier --closed T-000
+ck_has "(f) with no analysis yet, it still says the order is STRUCTURAL" \
+       "which is STRUCTURAL and is NOT Phase 3"
+ck_hasnt "(f) ...and invents no priority claim it cannot support" "PHASE 3 SAYS RANK BY THIS"
+
+ck_exit "(f) and it is advisory — frontier still exits 0" 0 "$RC"
+# NOT COVERED HERE, and said out loud rather than left as a silent hole: the
+# branch that fires once an analysis EXISTS. This fixture's graph carries no
+# ticket-marked frozen tests, so `freeze` refuses on its coverage gate and no
+# analysis/cycle-N.json is ever written — the note has nothing to read. It was
+# verified end to end by hand instead: a two-metric run measured and analyzed
+# over three cycles printed "PHASE 3 SAYS RANK BY THIS ... analysis cycle 2
+# wants, in order — pass_rate stalled error 60.0 / lint stalled error 9.0" above
+# a READY list, and "the list below is dependency shape only" beneath it. A
+# fixture that earns that branch needs marked acceptance tests per ticket; worth
+# adding, and better than a case that silently asserts nothing.
+
 section "W48 frontier closure derivation  [repo: rclose]"
 mk_repo rclose
 cat > tickets.json <<'EOF'

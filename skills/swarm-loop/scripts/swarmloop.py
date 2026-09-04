@@ -6220,6 +6220,50 @@ def _closed_from_args(root, args):
     return closed, {"sources": sources, "notes": notes}
 
 
+def _frontier_analysis_note(d):
+    """Lines naming what the latest analysis says to prioritise, or [] when none.
+
+    `frontier` cannot rank by error contribution — see the call site — but it CAN
+    stop pretending its order is the one Phase 3 asks for, and hand over the
+    numbers the operator has to rank by. Reading the analysis and saying nothing
+    would be the same silence this whole command is a catalogue of.
+    """
+    adir = os.path.join(d, ANALYSIS_DIR)
+    if not os.path.isdir(adir):
+        return []
+    best, best_n = None, -1
+    try:
+        for fn in os.listdir(adir):
+            m = re.match(r"^cycle-(\d+)\.json$", fn)
+            if m and int(m.group(1)) > best_n:
+                best_n, best = int(m.group(1)), os.path.join(adir, fn)
+    except OSError:
+        return []
+    if not best:
+        return []
+    try:
+        with open(best) as f:
+            an = json.load(f)
+    except (OSError, ValueError):
+        return []
+    mets = [m for m in (an.get("metrics") or []) if isinstance(m, dict)]
+    rank = {"regressing": 0, "stalled": 1, "converging_off_track": 2}
+    steer = [m for m in mets if m.get("verdict") in rank]
+    if not steer:
+        return ["  (analysis cycle %d: no metric is regressing, stalled or "
+                "off-track, so this structural order is not contradicted)" % best_n]
+    steer.sort(key=lambda m: (rank[m["verdict"]], -abs(float(m.get("latest_error") or 0))))
+    out = ["  PHASE 3 SAYS RANK BY THIS, and this command cannot: analysis cycle "
+           "%d wants, in order —" % best_n]
+    for m in steer[:5]:
+        out.append("    %-22s %-22s error %s"
+                   % (str(m.get("id"))[:22], m.get("verdict"),
+                      m.get("latest_error")))
+    out.append("  Dispatch the tickets that move THOSE first; the list below is "
+               "dependency shape only.")
+    return out
+
+
 def cmd_frontier(args):
     """The ready set, with depth and transitive-unblocks. Replaces the ad-hoc
     Python heredoc the live orchestrator hand-wrote twice in one evening."""
@@ -6275,7 +6319,30 @@ def cmd_frontier(args):
         for e in errors:
             print(f"  GRAPH ERROR: {e}")
         print("")
-        print("  READY (dispatchable now — ordered by what each one unblocks):")
+        # THIS ORDER IS STRUCTURAL, AND SKILL.md PHASE 3 ASKS FOR A DIFFERENT ONE.
+        # Phase 3: "Priority within the frontier follows the latest analysis —
+        # tickets touching regressing metrics first, then stalled, then
+        # converging-off-track; among those, the largest error contributions
+        # first", three paragraphs after "Three computations, none of which may
+        # be done by eye". This sorts by `unblocks` then depth and reads no
+        # analysis at all, so the tool prints one order while the prose demands
+        # another. Measured: thirteen cycles of unblocks-ranking left the largest
+        # single block of graded error NEVER dispatched — zero records across 114
+        # dispatch entries — while adjacent defect tickets were polished.
+        #
+        # It is NOT silently re-sorted here, deliberately. Ranking by error
+        # contribution needs a metric -> ticket mapping, and the graph carries
+        # none: metrics have ids and commands, tickets have scope globs, and
+        # nothing joins them. Inventing that join would produce a confident
+        # ordering derived from a guess, which is worse than an honest
+        # structural one. So the order stands, says what it is, and hands over
+        # the analysis the operator must rank BY.
+        _an = _frontier_analysis_note(d)
+        print("  READY (dispatchable now — ordered by what each one unblocks,")
+        print("         which is STRUCTURAL and is NOT Phase 3's priority rule):")
+        if _an:
+            for _ln in _an:
+                print("  %s" % _ln)
         for tid, _ in ready:
             own, src = _ticket_owns(idx[tid])
             print("    %-9s depth %-3d unblocks %-3d  %s" %
