@@ -4091,6 +4091,7 @@ def cmd_analyze(args):
 
     results = []
     pre_amendment_metrics, recomputed, selection_regressions = [], [], []
+    selection_inert = []
     for m in goals["metrics"]:
         # Keep the LAST measurement per cycle in FILE order -- history.csv is
         # append-only, so file order is recency. (Sorting the tuples first, as
@@ -4164,6 +4165,27 @@ def cmd_analyze(args):
                           None)
         selection_regressed = (desel_now is not None and base_desel is not None
                                and desel_now > base_desel)
+        # SAY WHEN THIS CHECK IS INERT. `measure` records the selection columns
+        # only when the metric command's own stdout is PYTEST-SHAPED, and the
+        # frozen-wrapper prescription requires a metric to print a BARE NUMBER
+        # as its last stdout line — so a correctly-authored wrapper hides the
+        # pytest tokens and both columns are written empty, forever. Measured on
+        # a real frozen cycle-0 baseline: all 12 metrics carried selected='' and
+        # deselected='', so `desel_now` is permanently None and the comparison
+        # above can never be True, for any metric, for the life of the run.
+        #
+        # That is the opposite of the `0` branch this was designed around: a
+        # missing token means zero deselected and IS a usable baseline, while an
+        # un-parseable output means UNKNOWN and is not. goal-setting.md calls
+        # this backstop "the only one of the three that can see the attack" and
+        # says it takes all three — so a run whose wrappers are correct believes
+        # it has three enforcement points and has two. Silence is the whole
+        # defect: nothing said the guard was off. This does not turn it back on
+        # (that needs an out-of-band channel from the wrapper), it stops the
+        # absence reading as an all-clear.
+        selection_unavailable = desel_now is None and pts[-1][5] is None
+        if selection_unavailable:
+            selection_inert.append(m["id"])
         if selection_regressed:
             selection_regressions.append({
                 "metric": m["id"], "baseline_deselected": base_desel,
@@ -4183,6 +4205,7 @@ def cmd_analyze(args):
             "latest_selected": pts[-1][5],
             "latest_deselected": desel_now,
             "selection_regressed": selection_regressed,
+            "selection_tracking": "unavailable" if selection_unavailable else "ok",
             "pre_amendment": pre_amend,
             "n_points": len(pts),
             "error_slope_per_cycle": slope,
@@ -4306,6 +4329,25 @@ def cmd_analyze(args):
                      "deliberate house rule — say so at the checkpoint and re-freeze the "
                      "metric with `freeze --amend --allow-deselection`, which records the "
                      "decision in the append-only freeze log where a reader can find it.")
+    if selection_inert:
+        lines.append("")
+        lines.append("> **SELECTION TRACKING IS UNAVAILABLE for %d metric(s): %s.** Read every "
+                     "'no selection regression' above as NOT MEASURED, never as clean."
+                     % (len(selection_inert), ", ".join("`%s`" % i for i in selection_inert)))
+        lines.append("> `measure` records the selected/deselected columns only when the metric "
+                     "command's own stdout is PYTEST-SHAPED, and a correctly-authored frozen "
+                     "wrapper prints a BARE NUMBER as its last stdout line — so the tokens are "
+                     "hidden and both columns are written empty. Measured on a real frozen "
+                     "cycle-0 baseline: all 12 metrics blank, so the regression comparison can "
+                     "never fire for them at any cycle.")
+        lines.append("> This is not the same as `0 deselected`: a missing token means zero and "
+                     "IS a baseline; an un-parseable output means UNKNOWN and is not. The "
+                     "deselection backstop is the only one of the three enforcement points that "
+                     "can see a filter added after the freeze — this run has two. Restore it by "
+                     "having the wrapper report selection out of band (a sidecar beside its "
+                     "metric log, or stderr) rather than by printing raw pytest output to "
+                     "stdout, which would break the bare-number contract every metric depends "
+                     "on.")
     if int(goals.get("amendments", 0)):
         lines.append("")
         lines.append(f"> **GOALPOSTS MOVED {goals['amendments']}x — this trend is not against a "
