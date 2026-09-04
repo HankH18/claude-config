@@ -541,7 +541,15 @@ launches and is removed within ~6s of it dying. Nothing here mutates anything,
 and nothing here interrupts a peer.
 
   peers          one line per session in this run, straight from the registry
-  wait-build     block until the build session next goes idle / dies / times out
+  wait-build     block until the build advances / goes idle / dies / times out.
+                 Verdicts: BUILD-IDLE, BUILD-GONE, BUILD-ADVANCED,
+                 BUILD-ADVANCED-REGISTRY-STALE, BUILD-REGISTRY-STALE,
+                 BUILD-WAIT-TIMEOUT, BUILD-NOT-STARTED. It watches transcript
+                 GROWTH as well as `status`, because a build session's registry
+                 entry stops being written minutes after launch and then reads
+                 `busy` forever — measured on two runs the same evening, 57 and
+                 61 minutes stale while both builds were alive and committing.
+                 A poll of that field alone ran 42 minutes and emitted nothing.
   wait-harness   block until the harness observation document changes
 """
 import json
@@ -600,13 +608,54 @@ def cmd_peers(_argv):
     return 0
 
 
+def _transcript_lines():
+    """Lines in the build's transcript, or None when it cannot be read.
+
+    None is NOT zero. A transcript that cannot be read is a question, and the
+    caller must not answer it with a number.
+    """
+    t = RUN.get("build_transcript")
+    if not t:
+        return None
+    try:
+        with open(t, "rb") as f:
+            return sum(1 for _ in f)
+    except OSError:
+        return None
+
+
 def cmd_wait_build(argv):
     """Blocks. Prints exactly one verdict word, so a caller cannot mistake
-    'still running' for 'finished'."""
+    'still running' for 'finished'.
+
+    DO NOT TRUST `status` AS A LIVENESS OR TURN SIGNAL. Measured on two
+    independent runs the same evening: a BUILD session's registry entry stops
+    being written minutes after launch and keeps reading `busy` forever —
+    proxyshop's froze 57 minutes before it was sampled, arrivalengine's 61,
+    while both builds were demonstrably alive (one grew its transcript 182 ->
+    841 lines and landed three commits AFTER its registry stopped). Both
+    watcher sessions updated normally throughout, so this is specific to build
+    sessions and its cause is not established.
+
+    The consequence is the worst shape a watcher has: this loop polled a field
+    frozen at `busy` for 42 minutes and emitted NOTHING, so a watchdog could
+    follow its brief exactly, hold this mechanism, and be watching nothing
+    while looking armed.
+
+    So `idle` is still believed when it appears — a status that TRANSITIONS is
+    real information — but it is no longer the only thing watched. Transcript
+    growth is work that actually advanced, and a registry that has stopped
+    moving while the transcript grows is reported as STALE rather than
+    silently trusted. (cmd_wait_harness is structurally immune: it stats the
+    observation document and never reads the registry at all.)
+    """
     sid = RUN.get("build_session_id")
     limit = float(argv[0]) if argv else 1800.0
     deadline = time.time() + limit
     seen = False
+    base_lines = _transcript_lines()
+    last_stamp = None
+    stamp_frozen_since = None
     while time.time() < deadline:
         r = find(sid)
         if r is None:
@@ -618,7 +667,28 @@ def cmd_wait_build(argv):
             if r.get("status") == "idle":
                 print("BUILD-IDLE")
                 return 0
+            st = r.get("statusUpdatedAt")
+            if st != last_stamp:
+                last_stamp, stamp_frozen_since = st, time.time()
+            elif stamp_frozen_since is None:
+                stamp_frozen_since = time.time()
+        # Work that actually advanced. A build whose transcript has grown has
+        # taken a turn whatever the registry says, and that is the signal the
+        # frozen field was standing in for.
+        now_lines = _transcript_lines()
+        if base_lines is not None and now_lines is not None and now_lines > base_lines:
+            frozen_for = (time.time() - stamp_frozen_since) if stamp_frozen_since else 0
+            if frozen_for > 300:
+                print("BUILD-ADVANCED-REGISTRY-STALE")
+            else:
+                print("BUILD-ADVANCED")
+            return 0
         time.sleep(10)
+    if seen and stamp_frozen_since and (time.time() - stamp_frozen_since) > 300:
+        # Never print WAIT-TIMEOUT over a registry that stopped writing: that
+        # reads as "the build did nothing", and the two are not the same claim.
+        print("BUILD-REGISTRY-STALE")
+        return 0
     print("BUILD-WAIT-TIMEOUT" if seen else "BUILD-NOT-STARTED")
     return 0
 
