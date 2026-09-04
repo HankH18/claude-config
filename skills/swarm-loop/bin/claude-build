@@ -51,6 +51,7 @@ GATE_SENTINEL="CLAUDE_BUILD_AUTHORIZATION_GATE"
 # beside its first use, because `--sessions` reads it long before the install
 # flow that used to define it.
 RUNS="$HOME/claude-build/runs"            # per-run scaffolding, not a document
+OBS="$HOME/claude-build/observations"     # documents a person reads
 
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 ok()   { [ "$QUIET" = 1 ] || printf '  \033[32m✓\033[0m %s\n' "$*"; }
@@ -673,6 +674,7 @@ USAGE
   claude-build [DIR] --uninstall
   claude-build --uninstall-self
   claude-build --sessions
+  claude-build --issues
 
 ARGUMENTS
   DIR                  Project directory. Default: current directory.
@@ -746,6 +748,11 @@ UNINSTALL
                        uncommitted work, or if git cannot say whether it does.
   --uninstall-self     Delete the claude-build script itself. Does not touch
                        any project; run --uninstall in each project first.
+  --issues             Print every OPEN harness issue, from the ONE machine-level
+                       document every run files into. START HERE. That is the
+                       whole list; there is no second place to look. Per-project
+                       BUILD documents are listed separately, because they are
+                       defects in a project's own code and not in the harness.
   --sessions           List every recorded run and the tmux attach command for
         (--status)     each watcher it started, marking each LIVE or gone.
                        Takes no DIR and starts nothing.
@@ -802,6 +809,7 @@ while [ $# -gt 0 ]; do
     --uninstall-self) MODE=uninstall-self; LAUNCH=0; shift ;;
     --sessions|--status)
                       MODE=sessions; LAUNCH=0; shift ;;
+    --issues)         MODE=issues; LAUNCH=0; shift ;;
     -q|--quiet)       QUIET=1; shift ;;
     # Session-topology modifiers. These MUST sit above the `-*)` arm (so the
     # --flag spellings are not swallowed as unknown options) and above the `*)`
@@ -906,6 +914,66 @@ if [ "$WATCH" = full-auto ] || [ "$WATCH" = all ]; then
 GATE_EOF
     exit 3
   fi
+fi
+
+# ------------------------------------------------------------------ issues
+# THE one entry point for "what is wrong with the harness right now". There is
+# exactly one machine-level harness document and it is deliberately NOT under
+# ~/.claude: re-probed on 2.1.260, `~/.claude/**` is a SENSITIVE path and a
+# --restricted session cannot write there, and the watchdog and fixer are both
+# --restricted, so an issue store under ~/.claude could never be filed into by
+# the sessions that find the issues. The store therefore lives where its writers
+# can reach it, and THIS command plus the pointer in ~/.claude/CLAUDE.md are how
+# a reader finds it without being told.
+if [ "$MODE" = issues ]; then
+  step "swarm-loop — open HARNESS issues"
+  HDOC="$OBS/swarm-loop-HARNESS-OPEN.md"
+  if [ ! -f "$HDOC" ]; then
+    warn "no harness document yet at $HDOC"
+    warn "it is created by the first watcher run; nothing has filed an issue."
+    exit 0
+  fi
+  echo "  $HDOC"
+  python3 - "$HDOC" <<'PY'
+import re, sys
+txt = open(sys.argv[1], encoding="utf-8").read().splitlines()
+ents, cur = [], None
+for ln in txt:
+    m = re.match(r'^##\s+([A-Z]?\d{8,}[a-z]?-\d+)\s+\u00b7\s*(.*)$', ln)
+    if m:
+        cur = {"id": m.group(1), "title": m.group(2).strip(), "body": []}
+        ents.append(cur)
+    elif cur is not None:
+        cur["body"].append(ln)
+closed = ("[RESOLVED]", "[RETRACTED]")
+open_, done = [], 0
+for e in ents:
+    blob = e["title"] + " " + "\n".join(e["body"])
+    if any(k in blob for k in closed):
+        done += 1
+    else:
+        open_.append(e)
+if not open_:
+    print("\n  no OPEN issues - %d recorded, all resolved or retracted" % done)
+else:
+    print("\n  %d OPEN | %d resolved/retracted | %d recorded\n" % (len(open_), done, len(ents)))
+    for e in open_:
+        t = e["title"]
+        print("  %-16s %s" % (e["id"], t if len(t) <= 96 else t[:93] + "..."))
+PY
+  echo
+  echo "  Per-project BUILD documents (defects in a project's own code, not the harness):"
+  FOUND_B=0
+  for B in "$OBS"/swarm-loop-BUILD-*-OPEN.md; do
+    [ -f "$B" ] || continue
+    FOUND_B=1
+    printf '    %s\n' "$B"
+  done
+  [ "$FOUND_B" = 0 ] && echo "    (none)"
+  echo
+  echo "  Unverified suspicions live in each run's own watchdog-notebook.md and"
+  echo "  are NOT issues until reproduced:  claude-build --sessions"
+  exit 0
 fi
 
 # ---------------------------------------------------------------- sessions
@@ -1323,7 +1391,6 @@ fi
 #     work there at all.
 #  2. Documents a human reads and scaffolding a machine writes have different
 #     lifetimes and different owners, so they get different directories.
-OBS="$HOME/claude-build/observations"     # documents a person reads
 STATE_DIR="" ; BUILD_SESSION_NAME="" ; BUILD_SID=""
 WATCH_SESSION_NAME="" ; FIX_SESSION_NAME=""
 
