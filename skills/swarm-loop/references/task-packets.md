@@ -545,6 +545,12 @@ FINDINGS: numbered — each with a reproduction; a finding without a repro is an
   opinion, and an opinion mints nothing
 COVERAGE: what was examined, at what depth, and what was NOT reached — named gaps
   become tickets (or trigger per-ticket deep verification, rung 3)
+PREMISES-FALSIFIED: every factual claim in THIS BRIEF that measurement disproved —
+  a diff range that was empty, a pinned SHA the branch has moved past, a doer's
+  report the orchestrator forwarded as fact, a metric value that had changed by
+  the time you read it. You were handed the batch's packets, its reports and its
+  numbers as GIVENS, and you are the only agent standing where they can be
+  checked. Quote the claim and give what you measured. "none" if none
 PER-TICKET: verdict per ticket WITH the evidence that earned it; "looks good" is
   not evidence
 ```
@@ -620,6 +626,12 @@ FINDINGS: numbered — each with location, what's wrong, why it matters, and a
 COVERAGE: the auditor's coverage map — what was examined, at what depth, and what
   was NOT reached; named gaps become mandatory targets (ideally tickets), never
   silent holes
+PREMISES-FALSIFIED: every factual claim in THIS BRIEF that measurement disproved —
+  a codebase-map section the tree contradicts, a spec claim the code does not
+  match, a convention the packet asserted and the repo does not keep, a partition
+  boundary that does not exist where the brief drew it. The map and the spec you
+  were handed are snapshots and the orchestrator has been correcting them since
+  it dispatched you. Quote the claim and give what you measured. "none" if none
 METRIC-LINKED: findings that plausibly explain a regressing/stalled metric, with
   the metric named
 HAZARDS: structural facts the codebase map should record

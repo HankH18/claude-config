@@ -8062,6 +8062,302 @@ ck "S1 goal-setting.md states the blocked recovery as a RULE over the whole list
 
 
 # ===========================================================================
+# R1-R12 the RESOLUTION GUARD  (freeze --product-namespace)
+#
+# The failure it closes, measured before one dispatch: a git worktree has no
+# Python interpreter of its own, so every parallel agent runs the PRIMARY
+# checkout's, and a virtualenv records the ABSOLUTE paths of the checkout it was
+# built in. From ONE worktree, 1 package resolved to that worktree and 12
+# resolved to the primary checkout — including the exact module the
+# highest-severity agent was assigned to change. Each of those agents would have
+# edited its own tree and then graded shared source, and nothing in the output
+# would have said so: a correct cwd does not fix it, clearing VIRTUAL_ENV /
+# PYTHONPATH does not fix it, and check-branch reads a DIFF, not a resolution
+# path.
+#
+# The guard is installed into the FROZEN acceptance conftest.py, at freeze time,
+# BEFORE hashing — conftest.py is imported as CODE by every pytest run, so
+# unlike config it cannot be skipped (`-o addopts=` defeats every ini form and
+# not this).
+#
+# The conftest is exercised with plain python3 (`runpy.run_path` under `-c`, so
+# sys.path[0] is the cwd exactly as under `python -m pytest` from the repo root)
+# — this suite may not depend on pytest being installed.
+# ===========================================================================
+section "R1 no --product-namespace changes NOT ONE BYTE  [repo: rguard0]"
+
+run_conftest() {   # run_conftest <PYTHONPATH> — guard verdict; output in $OUT
+  PYTHONPATH="$1" python3 -c \
+    "import runpy; runpy.run_path('.swarm-loop/acceptance/conftest.py')" > "$OUT" 2>&1
+  RC=$?
+  return 0
+}
+GUARD_BEGIN_MARK="# --- BEGIN swarm-loop resolution guard ---"
+GUARD_END_MARK="# --- END swarm-loop resolution guard ---"
+# The guard prints RESOLVED paths, and $TMP on macOS is /var/... -> /private/var/...
+# Assertions on what it printed must use the physical spelling or they compare
+# two different names for the same directory.
+TMP_REAL="$(cd "$TMP" && pwd -P)"
+
+mk_repo rguard0
+# A project that already ships its own frozen conftest: the no-flag path must
+# leave it alone, byte for byte.
+cat > .swarm-loop/acceptance/conftest.py <<'EOF'
+# the project's own conftest
+MY_OWN_MARKER = "keep me"
+EOF
+R0_BEFORE="$(sha_of .swarm-loop/acceptance/conftest.py)"
+sl freeze
+ck_exit "R1 freeze with no --product-namespace" 0 "$RC"
+ck "R1 an existing conftest is untouched" "$R0_BEFORE" \
+   "$(sha_of .swarm-loop/acceptance/conftest.py)"
+ck "R1 ...and carries no guard block" "0" \
+   "$(grep -c -F -- "$GUARD_BEGIN_MARK" .swarm-loop/acceptance/conftest.py | tr -d ' ')"
+ck_hasnt "R1 freeze says nothing about a guard" "resolution guard"
+ck "R1 the frozen hash is the pre-freeze hash" "$R0_BEFORE" \
+   "$(jget .swarm-loop/manifest.json 'd["files"][".swarm-loop/acceptance/conftest.py"]')"
+
+# ...and on a project with NO conftest at all, none is invented.
+mk_repo rguard0b
+sl freeze
+ck_exit "R1 freeze with no flag, no conftest present" 0 "$RC"
+ck_nofile "R1 no conftest is invented" ".swarm-loop/acceptance/conftest.py"
+
+# ===========================================================================
+section "R2 the flag installs the guard and FREEZES it  [repo: rguard1]"
+
+mk_repo rguard1
+# src-layout product: the shape an editable install actually has, and the shape
+# in which cwd does NOT shadow the recorded absolute path.
+mkdir -p prodsrc/prodpkg
+echo "VALUE = 1" > prodsrc/prodpkg/__init__.py
+mkdir -p "$TMP/outside/prodsrc/prodpkg"
+echo "VALUE = 1" > "$TMP/outside/prodsrc/prodpkg/__init__.py"
+
+sl freeze --product-namespace prodpkg
+ck_exit "R2 first freeze with --product-namespace" 0 "$RC"
+ck_file "R2 the conftest is created" ".swarm-loop/acceptance/conftest.py"
+ck_has "R2 freeze says LOUDLY that it moved the bytes it is about to hash" \
+       "FREEZE MODIFIED THE BYTES IT IS ABOUT TO HASH"
+ck_has "R2 ...naming the file and the action" ".swarm-loop/acceptance/conftest.py  (created)"
+ck_has "R2 ...and the namespaces guarded" "namespaces guarded: prodpkg"
+ck "R2 the block is delimited by both markers" "1 1" \
+   "$(grep -c -F -- "$GUARD_BEGIN_MARK" .swarm-loop/acceptance/conftest.py | tr -d ' ') $(grep -c -F -- "$GUARD_END_MARK" .swarm-loop/acceptance/conftest.py | tr -d ' ')"
+ck "R2 the guard is IN the manifest — a lane that deletes it is caught" \
+   "$(sha_of .swarm-loop/acceptance/conftest.py)" \
+   "$(jget .swarm-loop/manifest.json 'd["files"][".swarm-loop/acceptance/conftest.py"]')"
+sl verify
+ck_exit "R2 verify is green over the installed guard" 0 "$RC"
+# The guard is stdlib-only by construction: the frozen-conftest rule (one bad
+# __init__.py at conftest scope takes every metric to "could not measure" at
+# once) is not weakened by installing it, so the product is never EXECUTED.
+ck "R2 the guard imports stdlib ONLY — the product is never executed" \
+   "import importlib.util as _swarmloop_ilu import pathlib as _swarmloop_pathlib import sys as _swarmloop_sys" \
+   "$(sed -n "/$GUARD_BEGIN_MARK/,/$GUARD_END_MARK/p" .swarm-loop/acceptance/conftest.py \
+      | grep -E '^(import|from) ' | tr '\n' ' ' | sed 's/ $//')"
+
+# --- the predicate itself, run as code -------------------------------------
+run_conftest "$PWD/prodsrc"
+ck_exit "R3 GREEN: the namespace resolves INSIDE the cwd" 0 "$RC"
+ck "R3 ...silently" "" "$(cat "$OUT")"
+
+run_conftest "$TMP/outside/prodsrc"
+ck_exit "R3 RED: the namespace resolves OUTSIDE the cwd" 1 "$RC"
+ck_has "R3 ...and says which tree is being graded" \
+       "THIS SUITE IS GRADING ANOTHER TREE'S SOURCE"
+ck_has "R3 ...printing the namespace and its resolved module path" \
+       "product namespace 'prodpkg' resolves to: $TMP_REAL/outside/prodsrc/prodpkg/__init__.py"
+ck_has "R3 ...and the resolved cwd" "resolved cwd (the tree being graded): $TMP_REAL/rguard1"
+ck_has "R3 ...and it is a RuntimeError, not a skip" "RuntimeError"
+
+# An unresolvable namespace is a FAILURE, never a quiet pass: a guard that
+# cannot answer is not a guard that said yes.
+run_conftest "$TMP/nowhere-at-all"
+ck_exit "R4 an unimportable namespace fails the guard" 1 "$RC"
+ck_has "R4 ...saying so by name" "could not be resolved at all"
+ck_has "R4 ...and refusing to treat it as a skip" "never a skip"
+
+# --- canonicalization, and it is not style ---------------------------------
+# Measured incident: this exact comparison failed silently because a package
+# imported through a symlink farm and the raw strings never matched. Unresolved,
+# this reads OUTSIDE and false-fails; resolved, it is the same directory.
+ln -s "$PWD/prodsrc" "$TMP/link-prodsrc"
+run_conftest "$TMP/link-prodsrc"
+ck_exit "R5 a module reached through a SYMLINK into the cwd still passes" 0 "$RC"
+ck "R5 ...and the unresolved compare would have false-failed" "OUTSIDE" \
+   "$(python3 -c '
+import pathlib, sys
+cwd = pathlib.Path.cwd()
+mod = pathlib.Path(sys.argv[1]) / "prodpkg" / "__init__.py"
+print("inside" if cwd in mod.parents else "OUTSIDE")' "$TMP/link-prodsrc")"
+
+# ===========================================================================
+section "R6 idempotency: a re-freeze must not move the hash  [repo: rguard1]"
+
+R1_H1="$(sha_of .swarm-loop/acceptance/conftest.py)"
+sl freeze --amend "re-run the guard install, unchanged" --product-namespace prodpkg
+ck_exit "R6 re-freeze --amend with the same namespace" 0 "$RC"
+ck_has "R6 ...reports the guard as already present and identical" \
+       "resolution guard already present and identical"
+ck_hasnt "R6 ...and does NOT claim it moved bytes" "FREEZE MODIFIED THE BYTES"
+ck "R6 the conftest bytes are unchanged" "$R1_H1" \
+   "$(sha_of .swarm-loop/acceptance/conftest.py)"
+ck "R6 the FROZEN hash is unchanged — verify cannot go red for free" "$R1_H1" \
+   "$(jget .swarm-loop/manifest.json 'd["files"][".swarm-loop/acceptance/conftest.py"]')"
+ck_has "R6 the amendment records no protected-file change" \
+       "(no protected file changed — only frozen_at moves)"
+sl verify
+ck_exit "R6 verify stays green across the re-freeze" 0 "$RC"
+# Flag order must not move the hash either: the namespaces are sorted+deduped.
+sl freeze --amend "same set, different order" --product-namespace prodpkg --product-namespace prodpkg
+ck_exit "R6 a repeated/reordered namespace list" 0 "$RC"
+ck "R6 ...still does not move the hash" "$R1_H1" \
+   "$(sha_of .swarm-loop/acceptance/conftest.py)"
+
+# ===========================================================================
+section "R7 an EXISTING conftest keeps its own content  [repo: rguard2]"
+
+mk_repo rguard2
+cat > .swarm-loop/acceptance/conftest.py <<'EOF'
+# the project's own conftest — this must survive untouched
+import os
+
+MY_OWN_MARKER = "keep me"
+
+
+def pytest_report_header(config):
+    return "project header"
+EOF
+R2_OWN="$(grep -c . .swarm-loop/acceptance/conftest.py | tr -d ' ')"
+mkdir -p pkgsrc/alpha pkgsrc/beta pkgsrc/gamma
+for p in alpha beta gamma; do echo "V = 1" > "pkgsrc/$p/__init__.py"; done
+sl freeze --product-namespace alpha --product-namespace beta --product-namespace gamma
+ck_exit "R7 freeze over an existing conftest" 0 "$RC"
+ck_has "R7 ...reports it APPENDED rather than created" \
+       ".swarm-loop/acceptance/conftest.py  (appended)"
+ck "R7 the project's own marker survives" "1" \
+   "$(grep -c 'MY_OWN_MARKER = "keep me"' .swarm-loop/acceptance/conftest.py | tr -d ' ')"
+ck "R7 ...and its own hook survives" "1" \
+   "$(grep -c 'def pytest_report_header' .swarm-loop/acceptance/conftest.py | tr -d ' ')"
+ck "R7 ...and the block was added, not substituted" "1" \
+   "$(grep -c -F -- "$GUARD_BEGIN_MARK" .swarm-loop/acceptance/conftest.py | tr -d ' ')"
+ck "R7 the original lines are all still there" "$R2_OWN" \
+   "$(sed -n "1,/$GUARD_BEGIN_MARK/p" .swarm-loop/acceptance/conftest.py \
+      | grep -v -F -- "$GUARD_BEGIN_MARK" | grep -c . | tr -d ' ')"
+R2_H1="$(sha_of .swarm-loop/acceptance/conftest.py)"
+sl freeze --amend "re-freeze over the appended block" --product-namespace gamma \
+   --product-namespace beta --product-namespace alpha
+ck "R7 re-freezing an APPENDED block is idempotent too" "$R2_H1" \
+   "$(sha_of .swarm-loop/acceptance/conftest.py)"
+sl verify
+ck_exit "R7 verify green over an appended guard" 0 "$RC"
+
+# --- EVERY namespace is checked; a spot-check is what 12-of-13 defeats ------
+run_conftest "$PWD/pkgsrc"
+ck_exit "R8 all three namespaces resolve inside the cwd" 0 "$RC"
+mkdir -p "$TMP/outside2"
+mv pkgsrc/gamma "$TMP/outside2/gamma"
+run_conftest "$PWD/pkgsrc:$TMP/outside2"
+ck_exit "R8 the LAST-named namespace resolving outside still fails" 1 "$RC"
+ck_has "R8 ...naming gamma" "product namespace 'gamma' resolves to: $TMP_REAL/outside2/gamma/__init__.py"
+ck_hasnt "R8 ...and not blaming alpha, which was fine" "namespace 'alpha' resolves"
+mv "$TMP/outside2/gamma" pkgsrc/gamma
+
+# ===========================================================================
+section "R9 the guard cannot be installed into a LOCKED harness  [repo: rguard3]"
+
+mk_repo rguard3
+mkdir -p prodsrc/prodpkg
+echo "V = 1" > prodsrc/prodpkg/__init__.py
+sl freeze
+ck_exit "R9 freeze with no flag" 0 "$RC"
+R3_BEFORE="$(sha_of .swarm-loop/manifest.json)"
+sl freeze --product-namespace prodpkg
+ck_exit "R9 the same freeze WITH the flag is refused" 1 "$RC"
+ck_has "R9 ...saying nothing was written" "Nothing was written"
+ck_nofile "R9 ...and NOTHING was written — a refused freeze leaves no red verify behind" \
+          ".swarm-loop/acceptance/conftest.py"
+ck "R9 the manifest is untouched" "$R3_BEFORE" "$(sha_of .swarm-loop/manifest.json)"
+ck_has "R9 ...and it prints the amend command with the flag carried over" \
+       "--product-namespace prodpkg"
+sl verify
+ck_exit "R9 verify is still green after the refusal" 0 "$RC"
+sl freeze --amend "user approved the resolution guard" --product-namespace prodpkg
+ck_exit "R9 the amendment installs it" 0 "$RC"
+ck_file "R9 ...and the conftest now exists" ".swarm-loop/acceptance/conftest.py"
+ck_has "R9 ...recorded as a goalpost move" "GOALPOSTS MOVED"
+
+# ===========================================================================
+section "R10 refusals that keep the frozen block machine-owned  [repo: rguard4]"
+
+mk_repo rguard4
+sl freeze --product-namespace "prodpkg; import os"
+ck_exit "R10 a namespace that is not an importable dotted name is refused" 1 "$RC"
+ck_has "R10 ...because it is interpolated into frozen source" "interpolated into frozen source"
+ck_nofile "R10 ...and nothing was written" ".swarm-loop/acceptance/conftest.py"
+
+sl freeze --product-namespace ""
+ck_exit "R10 an empty namespace list installs nothing and freezes clean" 0 "$RC"
+ck_nofile "R10 ...no conftest invented" ".swarm-loop/acceptance/conftest.py"
+
+mk_repo rguard5
+printf '%s\n# mangled: no END marker\n' "$GUARD_BEGIN_MARK" > .swarm-loop/acceptance/conftest.py
+sl freeze --product-namespace prodpkg
+ck_exit "R10 a BEGIN with no END is refused, never guessed at" 1 "$RC"
+ck_has "R10 ...as an unterminated marker pair" "unterminated marker pair"
+
+mk_repo rguard6
+{ printf '%s\n%s\n' "$GUARD_BEGIN_MARK" "$GUARD_END_MARK"
+  printf '%s\n%s\n' "$GUARD_BEGIN_MARK" "$GUARD_END_MARK"; } > .swarm-loop/acceptance/conftest.py
+sl freeze --product-namespace prodpkg
+ck_exit "R10 two guard blocks are refused rather than half-rewritten" 1 "$RC"
+ck_has "R10 ...as a duplicate marker pair" "duplicate marker pair"
+
+# ===========================================================================
+section "R11 the guard survives a re-freeze that does NOT re-pass the flag  [repo: rguard7]"
+
+# Once installed the block is ordinary frozen bytes. A later amendment that
+# forgets the flag must not silently strip it — the honest reading of "naming
+# none installs NOTHING and changes no byte".
+mk_repo rguard7
+mkdir -p prodsrc/prodpkg
+echo "V = 1" > prodsrc/prodpkg/__init__.py
+sl freeze --product-namespace prodpkg
+R7_H="$(sha_of .swarm-loop/acceptance/conftest.py)"
+echo 41 > score.txt
+sl freeze --amend "unrelated amendment, flag not repeated"
+ck_exit "R11 an amendment without the flag" 0 "$RC"
+ck "R11 leaves the installed guard exactly as it was" "$R7_H" \
+   "$(sha_of .swarm-loop/acceptance/conftest.py)"
+ck "R11 ...still frozen at that hash" "$R7_H" \
+   "$(jget .swarm-loop/manifest.json 'd["files"][".swarm-loop/acceptance/conftest.py"]')"
+sl verify
+ck_exit "R11 verify green" 0 "$RC"
+
+# ===========================================================================
+section "R12 the generated block is valid, compilable Python  [repo: rguard1]"
+
+ck "R12 the frozen conftest compiles on this interpreter" "OK" \
+   "$(cd "$TMP/rguard1" && python3 -c '
+import py_compile, sys, tempfile
+try:
+    py_compile.compile(".swarm-loop/acceptance/conftest.py",
+                       cfile=tempfile.mktemp(), doraise=True)
+    print("OK")
+except Exception as e:
+    print(e)')"
+# A guard whose own failure path crashes is a guard that never reports anything.
+ck "R12 the failure path builds its message without raising anything else" "RuntimeError" \
+   "$(cd "$TMP/rguard1" && PYTHONPATH="$TMP/outside/prodsrc" python3 -c '
+import runpy
+try:
+    runpy.run_path(".swarm-loop/acceptance/conftest.py")
+except Exception as e:
+    print(type(e).__name__)
+else:
+    print("NOTHING RAISED")')"
+
+# ===========================================================================
 # claude-build — the session-topology modifiers.
 #
 # Everything below runs against a FAKE skill tree inside $TMP with stub `claude`

@@ -2046,6 +2046,239 @@ def cmd_escalate(args):
         sys.exit(2)
 
 
+# -------------------------------------------------- the resolution guard
+
+# The guard freeze writes into .swarm-loop/acceptance/conftest.py when (and only
+# when) `--product-namespace` names at least one package.
+#
+# THE FAILURE, measured. A git worktree has no Python interpreter of its own, so
+# every parallel agent runs the PRIMARY checkout's interpreter, and a virtualenv
+# records the ABSOLUTE paths of the checkout it was built in. So any package
+# reached through a recorded entry — an editable install, a .pth, anything in
+# site-packages — resolves to the PRIMARY checkout rather than the agent's own
+# tree. Measured before one dispatch: from a single worktree ONE package
+# resolved to that worktree and TWELVE resolved to the primary checkout,
+# including the exact module the highest-severity agent was assigned to change.
+# Every one of those agents would have edited its own tree and then graded
+# shared source; several would have graded each other's edits; every green would
+# have been meaningless with nothing in the output saying so.
+#
+# It survives every obvious defence: a correct cwd does not fix it, clearing
+# VIRTUAL_ENV/PYTHONPATH does not fix it, and placing the worktree beside the
+# repo does not fix it (that makes Node's resolver loud but leaves this route
+# silent). check-branch cannot see it either: it inspects a DIFF, not a
+# resolution path.
+#
+# WHY conftest.py AND NOT THE METRIC WRAPPER. conftest.py is imported as CODE by
+# every pytest run, so the neutralization that defeats config — `-o addopts=`,
+# an ini edit, a marker filter — leaves it standing (goal-setting.md records the
+# measurement). The metric wrapper is the wrong home for the opposite reason: it
+# is not the LANE's done-condition. A worker's own `pytest` run is what tells it
+# it is finished, and that run never goes near the wrapper — so a check there is
+# a tautology where it runs (the orchestrator's own checkout, where resolution is
+# correct by construction) and absent exactly where the failure happens.
+GUARD_BEGIN = "# --- BEGIN swarm-loop resolution guard ---"
+GUARD_END = "# --- END swarm-loop resolution guard ---"
+GUARD_CONFTEST = "conftest.py"
+NAMESPACE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")
+
+
+def _guard_namespaces(raw):
+    """Validate/normalize --product-namespace. Sorted + deduped so the generated
+    bytes are order-insensitive: an orchestrator that reorders its own flags
+    between freezes must not move the frozen hash."""
+    names = []
+    for item in raw or []:
+        for part in str(item).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if not NAMESPACE_RE.match(part):
+                die("--product-namespace %r is not an importable dotted name. It is "
+                    "interpolated into frozen source; only [A-Za-z_][A-Za-z0-9_]* "
+                    "segments joined by '.' are accepted." % part)
+            names.append(part)
+    return sorted(set(names))
+
+
+def _resolution_guard_block(namespaces):
+    """The exact bytes of the guard, deterministic for a given namespace list."""
+    listing = "".join('    "%s",\n' % n for n in namespaces)
+    # .replace, never %-formatting: the block below is full of literal %-format
+    # expressions of its own, and a %-substitution here would rewrite them.
+    body = '''
+# Written by `swarmloop.py freeze --product-namespace`. DO NOT EDIT BY HAND:
+# these are FROZEN BYTES — hashed into .swarm-loop/manifest.json, `verify` goes
+# red if they move, and `check-branch` vetoes any worker branch that touches
+# them. To change the list, re-run freeze with the flags you want (an already
+# locked harness needs the user's own `freeze --amend "<reason>"`).
+#
+# WHAT IT CATCHES. A git worktree has no Python interpreter of its own, so every
+# parallel agent runs the PRIMARY checkout's interpreter, and a virtualenv
+# records the ABSOLUTE paths of the checkout it was built in. Any package
+# reached through a recorded entry — an editable install, a .pth, anything in
+# site-packages — therefore resolves to the PRIMARY checkout no matter which
+# worktree is the cwd. Measured before one dispatch: from a single worktree ONE
+# package resolved to that worktree and TWELVE resolved to the primary checkout,
+# including the exact module the highest-severity agent was assigned to change.
+# Without this guard each of those agents edits its own tree, grades shared
+# source, and reports a green that means nothing.
+#
+# WHY IT LIVES HERE. conftest.py is imported as CODE by every pytest run, so it
+# cannot be skipped the way config can (`-o addopts=` defeats every ini form and
+# does NOT defeat a conftest). A check in the metric wrapper would be a
+# tautology where it runs and absent where the failure happens.
+#
+# STDLIB ONLY, AND THE PRODUCT IS NEVER EXECUTED. The frozen-conftest rule (one
+# bad __init__.py at conftest scope takes every metric to "could not measure" at
+# once) is not weakened here: the guard asks the import system where the module
+# WOULD come from — the same `__file__` an import would set, taken from the
+# spec — and never runs it.
+import importlib.util as _swarmloop_ilu
+import pathlib as _swarmloop_pathlib
+import sys as _swarmloop_sys
+
+_SWARMLOOP_PRODUCT_NAMESPACES = (
+@@SWARMLOOP_NAMESPACES@@)
+
+
+def _swarmloop_resolved_paths(_name):
+    """[resolved Path] the import system would give `_name`'s __file__.
+
+    A regular module/package yields one path (its __file__ / __init__.py); a
+    PEP 420 namespace package has no __file__ and yields each of its portion
+    directories. Both sides of every later comparison are .resolve()d: this
+    repo has a measured incident of exactly this comparison failing silently
+    because a package imported through a symlink farm and the raw strings never
+    matched, and on macOS the same unresolved compare turns /tmp vs /private/tmp
+    into a false failure."""
+    _mod = _swarmloop_sys.modules.get(_name)
+    if _mod is not None and getattr(_mod, "__file__", None):
+        return [_swarmloop_pathlib.Path(_mod.__file__).resolve()]
+    _spec = _swarmloop_ilu.find_spec(_name)
+    if _spec is None:
+        raise ImportError("no module named %r on this interpreter's path" % _name)
+    if _spec.origin and _spec.origin not in ("namespace", "built-in", "frozen"):
+        return [_swarmloop_pathlib.Path(_spec.origin).resolve()]
+    _locs = list(getattr(_spec, "submodule_search_locations", None) or [])
+    if not _locs:
+        raise ImportError(
+            "%r resolves to %r, which has no file on disk to check"
+            % (_name, _spec.origin))
+    return [_swarmloop_pathlib.Path(p).resolve() for p in _locs]
+
+
+def _swarmloop_check_resolution():
+    _cwd = _swarmloop_pathlib.Path.cwd().resolve()
+    _bad, _unresolvable = [], []
+    for _name in _SWARMLOOP_PRODUCT_NAMESPACES:
+        try:
+            _paths = _swarmloop_resolved_paths(_name)
+        except Exception as _exc:              # noqa: BLE001 - report, never skip
+            _unresolvable.append((_name, "%s: %s" % (type(_exc).__name__, _exc)))
+            continue
+        for _p in _paths:
+            if _p != _cwd and _cwd not in _p.parents:
+                _bad.append((_name, _p))
+    if not _bad and not _unresolvable:
+        return
+    _msg = [
+        "",
+        "swarm-loop resolution guard: THIS SUITE IS GRADING ANOTHER TREE'S SOURCE.",
+        "  resolved cwd (the tree being graded): %s" % _cwd,
+    ]
+    for _name, _p in _bad:
+        _msg.append("  product namespace %r resolves to: %s" % (_name, _p))
+        _msg.append("      ^ OUTSIDE the cwd above — the tests below import code this "
+                    "working tree does not contain.")
+    for _name, _why in _unresolvable:
+        _msg.append("  product namespace %r could not be resolved at all: %s"
+                    % (_name, _why))
+        _msg.append("      ^ an unanswerable resolution is a failure, never a skip.")
+    _msg += [
+        "",
+        "  A git worktree has no interpreter of its own, so it runs the PRIMARY",
+        "  checkout's; a virtualenv records ABSOLUTE paths, so an editable install /",
+        "  .pth / site-packages entry points back at that checkout from every",
+        "  worktree. A correct cwd does not fix it, and clearing VIRTUAL_ENV or",
+        "  PYTHONPATH does not fix it.",
+        "  Give this tree its own environment (e.g. `python -m venv .venv` inside it,",
+        "  then install the product into that venv) and re-run, or run the suite from",
+        "  the checkout the interpreter actually belongs to. Do NOT delete this guard:",
+        "  it is frozen, `verify` will go red, and every green it removes is fake.",
+        "",
+    ]
+    raise RuntimeError("\\n".join(_msg))
+
+
+_swarmloop_check_resolution()
+'''
+    return (GUARD_BEGIN + body.replace("@@SWARMLOOP_NAMESPACES@@", listing)
+            + GUARD_END + "\n")
+
+
+def _guard_splice(text, block):
+    """(new_text, action) — install `block` into `text` idempotently.
+
+    Re-running freeze over an unchanged run must NOT move the hash, so a file
+    that already carries the markers has ONLY the region between them rewritten,
+    byte-for-byte identically when the namespace list has not changed. A guard
+    that rewrote the whole file (or appended a second copy) would turn `verify`
+    red on every re-freeze for no reason at all."""
+    if not text:
+        return block, "created"
+    n = text.count(GUARD_BEGIN)
+    if n > 1:
+        return None, "duplicate"
+    if n == 0:
+        if GUARD_END in text:
+            return None, "orphan-end"
+        sep = "\n" if text.endswith("\n") else "\n\n"
+        return text + sep + block, "appended"
+    b = text.index(GUARD_BEGIN)
+    e = text.find(GUARD_END, b)
+    if e == -1:
+        return None, "unterminated"
+    e += len(GUARD_END)
+    return text[:b] + block.rstrip("\n") + text[e:], "rewritten"
+
+
+def _install_resolution_guard(d, namespaces):
+    """(action, relpath) — write the guard into the frozen acceptance conftest.
+
+    action is one of created / appended / rewritten / unchanged. The caller
+    decides what a byte-moving action means; here it is only ever a write."""
+    path = os.path.join(d, "acceptance", GUARD_CONFTEST)
+    rel = f"{STATE_DIR}/acceptance/{GUARD_CONFTEST}"
+    block = _resolution_guard_block(namespaces)
+    old = None
+    if os.path.exists(path):
+        if os.path.islink(path):
+            die(f"refusing to install the resolution guard: {rel} is a SYMLINK. freeze "
+                "hashes what it walks and iter_files refuses symlinks outright, so a "
+                "guard written through one would be unhashed and unprotected.")
+        # newline="" on both sides: an existing conftest with CRLF endings must
+        # round-trip byte-exact, or the "unchanged" comparison below is a lie and
+        # every re-freeze moves the frozen hash.
+        with open(path, "r", encoding="utf-8", errors="surrogateescape",
+                  newline="") as f:
+            old = f.read()
+    new, action = _guard_splice(old, block)
+    if new is None:
+        die(f"refusing to install the resolution guard: {rel} carries a "
+            f"{action.replace('-', ' ')} marker pair. The block between "
+            f"{GUARD_BEGIN!r} and {GUARD_END!r} is machine-owned; repair the markers by "
+            "hand (or delete the block entirely) and freeze again — freeze will not "
+            "guess which copy is authoritative.")
+    if old is not None and new == old:
+        return "unchanged", rel
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", errors="surrogateescape",
+              newline="") as f:
+        f.write(new)
+    return action, rel
+
+
 # ------------------------------------------------------------------ freeze
 
 def cmd_freeze(args):
@@ -2264,6 +2497,62 @@ def cmd_freeze(args):
     amending = locked_before and (frozen_before or bool(args.amend))
     added = removed = changed = None
     pre_bytes = {}
+
+    # --- the resolution guard, installed BEFORE anything is hashed -----------
+    # OPT-IN and nothing else: no --product-namespace means not one byte moves,
+    # so every existing run freezes exactly as it did. Deliberately not
+    # auto-detected — a guessed namespace fails a metric command, and by then it
+    # is frozen bytes that need a user-awake `freeze --amend` to correct.
+    #
+    # Placed here, before `pre` is hashed, for two reasons. (1) The manifest must
+    # record the guard, or a worker could delete it and `verify` would shrug.
+    # (2) Installing it after `pre` would trip A6's own tripwire — the smoke run
+    # re-hashes and hard-fails on any protected byte that moved — which is the
+    # correct alarm for a metric command editing the harness and the wrong one
+    # for freeze editing it deliberately and saying so.
+    #
+    # The refusal below is the same P-9 lesson as everywhere else: a freeze that
+    # is going to be REFUSED must not leave modified bytes behind it. Writing the
+    # guard and then hitting the goalpost gate would leave a locked run whose
+    # `verify` is red over an edit freeze itself made.
+    guard_ns = _guard_namespaces(getattr(args, "product_namespace", None))
+    if guard_ns:
+        gconf = os.path.join(d, "acceptance", GUARD_CONFTEST)
+        would = _resolution_guard_block(guard_ns)
+        cur = None
+        if os.path.exists(gconf) and not os.path.islink(gconf):
+            with open(gconf, "r", encoding="utf-8", errors="surrogateescape",
+                      newline="") as f:
+                cur = f.read()
+        planned, _act = _guard_splice(cur, would)
+        if planned is not None and planned != cur and locked_before and not args.amend:
+            print("freeze: REFUSED — --product-namespace would rewrite "
+                  f"{STATE_DIR}/acceptance/{GUARD_CONFTEST}, which this run has already "
+                  "FROZEN. Nothing was written.")
+            print("  Installing the guard into a locked harness is a goalpost move like any")
+            print("  other: it changes the bytes every lane is graded by. With the user's")
+            print("  approval:")
+            print('    swarmloop.py freeze --amend "<reason>" '
+                  + " ".join("--product-namespace " + n for n in guard_ns))
+            sys.exit(1)
+        action, grel_guard = _install_resolution_guard(d, guard_ns)
+        if action == "unchanged":
+            print(f"note: resolution guard already present and identical in {grel_guard} "
+                  f"({len(guard_ns)} namespace(s): {', '.join(guard_ns)}) — no bytes moved, "
+                  "so the frozen hash does not move either")
+        else:
+            bar = "!" * 74
+            print(bar)
+            print("!!! FREEZE MODIFIED THE BYTES IT IS ABOUT TO HASH")
+            print(f"!!!   {grel_guard}  ({action})")
+            print(f"!!!   namespaces guarded: {', '.join(guard_ns)}")
+            print("!!! The block between the swarm-loop resolution-guard markers now fails")
+            print("!!! COLLECTION whenever one of those namespaces resolves outside the cwd —")
+            print("!!! the signature of a worktree running the primary checkout's venv and")
+            print("!!! grading the primary checkout's source. It is frozen from here: a lane")
+            print("!!! that deletes it is caught by 'verify' and vetoed by 'check-branch'.")
+            print(bar)
+
     # Hashed BEFORE the smoke run, for two jobs: the goalpost delta below, and
     # A6's tripwire on what the smoke run itself does to protected bytes.
     pre, missing_protected = _protected_hashes(root, state)
@@ -10600,6 +10889,16 @@ def main():
                         "partly a statement about the filter, and the filter lives in files no "
                         "protected path covers. Record at the cycle-0 checkpoint which tests it "
                         "will never run.")
+    s.add_argument("--product-namespace", action="append", default=None, metavar="NAME",
+                   help="repeatable. Install a RESOLUTION GUARD into the frozen "
+                        f"{STATE_DIR}/acceptance/{GUARD_CONFTEST} that fails collection when "
+                        "NAME resolves outside the cwd — the signature of a worktree running "
+                        "the primary checkout's venv and grading the primary checkout's "
+                        "source (measured: 12 of 13 packages did exactly that from one "
+                        "worktree). Name every product package; a one-namespace spot-check is "
+                        "what that measurement defeats. Naming none installs NOTHING and "
+                        "changes no byte. Not auto-detected on purpose: a guessed namespace "
+                        "fails a metric command from inside frozen bytes.")
     s.set_defaults(func=cmd_freeze)
 
     s = sub.add_parser("verify", help="check the frozen harness is intact")
