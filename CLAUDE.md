@@ -171,3 +171,57 @@ expiry date, not a credential.
   ~30 tickets no worker was permitted to close.
 - each run's `watchdog-notebook.md` — unverified suspicions, which are not issues
   until reproduced.
+
+## Reporting — separate what I handled from what is waiting on you
+
+Every status report splits into exactly two lists, and the second one is a promise:
+
+- **Handled** — done, no action from you. Findings, fixes, decisions I made, things I
+  looked at and closed. However interesting, it goes here if it needs nothing from you.
+- **Waiting on you** — I cannot proceed without your answer. Nothing else belongs here.
+
+**If it is in the second list, it is because I am blocked, not because it is
+noteworthy.** Do not put an item there to be thorough, to share something clever, or to
+show my work. "Worth your attention" is not a category — it collapses into one of the two
+above, and if I cannot decide which, it is Handled.
+
+**Corollary: before listing something as blocked, check whether it actually is.** A
+sub-agent reporting "this can't be fixed without changing a frozen goal" is a claim to
+verify, not a fact to forward. Verify it first; more than once the blocker has evaporated
+on inspection, and forwarding it unchecked spends a human decision on a question that had
+already been answered.
+
+**Why:** I read "waiting on you" as "this needs fixing" and act on it. A report that
+files a closed item under my attention wastes a round trip and, worse, trains me to skim
+the one list that must never be skimmed. If something genuinely needs my decision, say so
+plainly and say what you need; if it does not, fix it or drop it.
+
+## Finish the obvious work. Do not hand it back as a status update.
+
+The recurring failure, and the one I will not usually re-ask for: identifying
+work correctly, describing it accurately, and then STOPPING — ending the turn
+with "I'll pick that up next" or a tidy list of what remains, when nothing was
+blocking and no decision was owed.
+
+**If it is obvious, do it. A turn ends when the work is done or genuinely
+blocked — never because a good summary is available.**
+
+Three tests, applied before ending any turn:
+
+- **Is anything actually waiting on Hank?** A decision, a credential, an
+  authorization, a preference with no defensible default. If the answer is no,
+  the turn is not over. "Waiting on you: nothing" followed by a list of things
+  waiting on ME is the exact shape of this failure — it reads as a report and
+  functions as a stall.
+- **Did I already say I would do it?** "Next", "then", "I'll pick these up" are
+  commitments made in the same breath as stopping. Do it in THIS turn.
+- **Am I stopping because it is blocked, or because it is large?** Large is not
+  blocked. Split it, delegate it, run it in parallel — but start it.
+
+Approval already given is standing. When Hank approves a set of items, every one
+of them is authorized until he says otherwise; do not re-surface them as open
+questions, and do not stop between them for acknowledgement.
+
+Report what remains at the END of the work, not INSTEAD of it. Ending with an
+accurate list of unfinished work is not diligence — it is the work not being
+done, described well.
