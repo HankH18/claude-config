@@ -4671,6 +4671,40 @@ ck_has "(y3) --json names the unanswered rung for a machine reader" '"tracked-fi
 # is not "intact" is not a pass — which is reachable, and a file predating the
 # key is UNANSWERABLE rather than a silent pass.
 # ===========================================================================
+# An ABSENT dispatch ledger cannot answer the verifier rung, and answering it
+# anyway is the false green this gate refuses everywhere else. `_open_dispatches`
+# returns [] for a missing file, so the rung used to report PASS with "no open
+# dispatch of kind 'verifier'" over a question it never asked — a run that
+# dispatched verifiers without recording them read identically to one that
+# dispatched none.
+section "(y3b) push-gate: an ABSENT dispatch ledger is UNANSWERABLE, not PASS  [repo: pgledg]"
+mk_repo pgledg
+sl freeze
+gq add -A; gq commit -qm freeze
+sl measure --cycle 1 --timeout 60
+sl analyze --cycle 1
+sl checkpoint --cycle 1
+gq add .swarm-loop; gq commit -qm "epoch 1 ledger"
+rm -f .swarm-loop/dispatch.jsonl
+sl push-gate --cycle 1
+ck_has "(y3b) the rung states it was answered from an ABSENT ledger" "is missing"
+ck_has "(y3b) ...and says what that does NOT mean" "never 'every verifier returned'"
+ck_hasnt "(y3b) ...so it never claims the ledger showed nothing open" "no open dispatch of kind 'verifier' in"
+ck_exit "(y3b) but it does NOT wedge the push — an early run holds no ledger" 0 "$RC"
+
+: > .swarm-loop/dispatch.jsonl
+gq add -A; gq commit -qm "empty ledger"   # else the clean-tree rung fails instead
+sl push-gate --cycle 1
+ck_has "(y3b) an EMPTY ledger says so too" "is empty"
+ck_exit "(y3b) ...and still does not wedge" 0 "$RC"
+
+# CONTROL: a real ledger with nothing open is a genuine PASS, and must stay one.
+sl dispatch --agent probe --kind recon --subject x --files a.txt
+sl dispatch --close probe
+sl push-gate --cycle 1
+ck_has "(y3b) CONTROL: a PRESENT ledger reports the real answer" "no open dispatch of kind 'verifier' in"
+ck_hasnt "(y3b) CONTROL: ...and carries no absent-ledger caveat" "never 'every verifier returned'"
+
 section "(y4) push-gate: the analysis integrity rung, positively  [repo: pgunans]"
 cd "$TMP/pgunans" || exit 1
 python3 - <<'PY'

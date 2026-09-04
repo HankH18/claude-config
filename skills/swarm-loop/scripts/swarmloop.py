@@ -5633,8 +5633,31 @@ def _ticket_owns(t):
     return [_norm_pat(x) for x in _graph_strs(t, "scope")], "scope"
 
 
+def _dispatch_ledger_state(d):
+    """'missing' | 'empty' | 'present' for the dispatch ledger.
+
+    "No open dispatches" and "no ledger at all" are different facts, and reading
+    them alike is how a gate reports PASS over a question it never asked: the
+    push gate's verifier rung answered "no open dispatch of kind 'verifier'"
+    from an ABSENT file, which is the same false-green shape that gate refuses
+    everywhere else ("an unanswered rung is not a met one").
+    """
+    path = os.path.join(d, DISPATCH_FILE)
+    if not os.path.exists(path):
+        return "missing"
+    try:
+        return "present" if os.path.getsize(path) > 0 else "empty"
+    except OSError:
+        return "missing"
+
+
 def _open_dispatches(d):
-    """Unclosed dispatch records, oldest first. Missing file = none (H-17)."""
+    """Unclosed dispatch records, oldest first. Missing file = none (H-17).
+
+    Callers that GATE on the result must ask _dispatch_ledger_state first — an
+    empty list from this function does not distinguish "nothing is open" from
+    "nothing was ever recorded".
+    """
     path = os.path.join(d, DISPATCH_FILE)
     if not os.path.exists(path):
         return []
@@ -9254,6 +9277,7 @@ def cmd_push_gate(args):
     # TICKET dispatch is the normal state of a wide swarm, not a push blocker.
     # That would have re-created D-1 in a new place.
     open_recs = _open_dispatches(d)
+    _ledger = _dispatch_ledger_state(d)
     verifiers = [r for r in open_recs if (r.get("kind") or "") == "verifier"]
     others = [r for r in open_recs if (r.get("kind") or "") != "verifier"]
     if verifiers:
@@ -9265,10 +9289,27 @@ def cmd_push_gate(args):
             % (len(verifiers), STATE_DIR, DISPATCH_FILE,
                ", ".join(str(r.get("agent_ref")) for r in verifiers)))
     else:
+        # WHAT THE PASS IS ANSWERED FROM. An absent or empty ledger yields the
+        # same empty list as a ledger that genuinely holds nothing open, and
+        # reading them alike is a pass over a question never asked. It is NOT
+        # made UNANSWERABLE, deliberately: an unanswerable rung blocks like a
+        # FAIL, most runs legitimately hold no ledger for their first epochs,
+        # and a gate that refuses every early push would be the unsatisfiable
+        # gate this rung's own comment was written to avoid — measured, that
+        # change failed six existing cases covering the ordinary case. So the
+        # PASS stands and states its own basis instead, which is what the
+        # operator checklist below exists for.
+        _basis = ("no open dispatch of kind 'verifier' in %s/%s" % (STATE_DIR, DISPATCH_FILE)
+                  if _ledger == "present" else
+                  "%s/%s is %s — this rung is answered from an ABSENT ledger, so it means "
+                  "'nothing was RECORDED as open', never 'every verifier returned'. "
+                  "`dispatch --agent … --kind verifier` is what makes it answerable; until "
+                  "a run records them, confirm by hand that this epoch's verifiers have "
+                  "returned" % (STATE_DIR, DISPATCH_FILE, _ledger))
         add("rung2-returned", "every rung-2 verifier dispatched for this epoch has returned",
             "PASS",
-            "no open dispatch of kind 'verifier' in %s/%s%s"
-            % (STATE_DIR, DISPATCH_FILE,
+            "%s%s"
+            % (_basis,
                "" if not others else
                " (%d other dispatch(es) open — rolling dispatch, not a push blocker: %s)"
                % (len(others), ", ".join(str(r.get("agent_ref")) for r in others))))
