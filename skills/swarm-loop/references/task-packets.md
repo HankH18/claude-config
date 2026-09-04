@@ -500,7 +500,26 @@ is what makes `..` the correct operator here; it has been verified twice, do not
   subdirectory of the run's scratch root (`<scratch-root>/<verifier-id>/`): the
   root is shared with the other verifiers in this fan-out, a same-named script
   there can be executed by a sibling, and you have no worktree of your own to
-  fall back on. Introduce the plausible wrong fix a reasonable person would actually
+  fall back on.
+  **PROVE THE COPY IS WHAT RUNS, BEFORE ANY OTHER SABOTAGE STEP.** Copying a
+  tree does not make it the tree under test, and the way that fails is silent
+  and reassuring. Measured: a venv's `.pth` hardcoded the ABSOLUTE path of the
+  primary checkout, so a tree copied to scratch and run with that venv imported
+  the REAL modules — the first sabotage run reported "30 passed" with every
+  resolved path under the primary checkout, i.e. it had sabotaged one tree and
+  measured another, and the sabotage read as NOT CAUGHT. Run the copy with
+  `PYTHONPATH=<copy>:<copy>/<pkgroot>` (or provision the copy its own
+  environment), name the interpreter explicitly rather than letting `python`
+  resolve off PATH — a bare `python` found an unrelated Anaconda install on the
+  same box — and then, before believing ANY sabotage result, print the resolved
+  path of the module you sabotaged and assert it sits inside the copy,
+  canonicalizing BOTH sides. A sabotage whose resolved path is outside the copy
+  is not a result at all. **The positive control below does NOT cover this**: a
+  witness can fire perfectly in the real module while your copy sits untouched.
+  You are the one agent whose whole job is to prove a guard can fail, and the
+  only one given no worktree — so this step is yours to run, not the
+  dispatcher's.
+  Introduce the plausible wrong fix a reasonable person would actually
   commit ("check the limit AFTER doing the work"), not mere deletion; purge caches
   between variants; and prove each sabotage actually reached the code path before
   believing any result — a sabotage that changed nothing produces the same green
