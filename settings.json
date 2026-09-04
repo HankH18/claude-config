@@ -1,119 +1,194 @@
 {
+  "permissions": {
+    "allow": [
+      "mcp__codegraph__*"
+    ],
+    "defaultMode": "auto"
+  },
+  "model": "opus[1m]",
   "hooks": {
     "Notification": [
       {
+        "matcher": "",
         "hooks": [
           {
-            "command": "/Users/hankholcomb/.csm/csm-hook.sh Notification",
-            "type": "command"
+            "type": "command",
+            "command": "/Users/hankholcomb/.csm/csm-hook.sh Notification"
           }
-        ],
-        "matcher": ""
+        ]
       }
     ],
     "PostToolUse": [
       {
+        "matcher": "",
         "hooks": [
           {
-            "command": "/Users/hankholcomb/.csm/csm-hook.sh PostToolUse",
-            "type": "command"
+            "type": "command",
+            "command": "/Users/hankholcomb/.csm/csm-hook.sh PostToolUse"
           }
-        ],
-        "matcher": ""
+        ]
       }
     ],
     "PreCompact": [
       {
+        "matcher": "",
         "hooks": [
           {
-            "command": "/Users/hankholcomb/.csm/csm-hook.sh PreCompact",
-            "type": "command"
+            "type": "command",
+            "command": "/Users/hankholcomb/.csm/csm-hook.sh PreCompact"
           }
-        ],
-        "matcher": ""
+        ]
       }
     ],
     "PreToolUse": [
       {
+        "matcher": "",
         "hooks": [
           {
-            "command": "/Users/hankholcomb/.csm/csm-hook.sh PreToolUse",
-            "type": "command"
+            "type": "command",
+            "command": "/Users/hankholcomb/.csm/csm-hook.sh PreToolUse"
           }
-        ],
-        "matcher": ""
+        ]
       }
     ],
     "SessionEnd": [
       {
+        "matcher": "",
         "hooks": [
           {
-            "command": "/Users/hankholcomb/.csm/csm-hook.sh SessionEnd",
-            "type": "command"
+            "type": "command",
+            "command": "/Users/hankholcomb/.csm/csm-hook.sh SessionEnd"
           }
-        ],
-        "matcher": ""
+        ]
       }
     ],
     "SessionStart": [
       {
+        "matcher": "",
         "hooks": [
           {
-            "command": "/Users/hankholcomb/.csm/csm-hook.sh SessionStart",
-            "type": "command"
+            "type": "command",
+            "command": "/Users/hankholcomb/.csm/csm-hook.sh SessionStart"
           }
-        ],
-        "matcher": ""
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/hankholcomb/.claude/scripts/recurring-mistakes-hook.sh"
+          }
+        ]
       }
     ],
     "Setup": [
       {
+        "matcher": "",
         "hooks": [
           {
-            "command": "/Users/hankholcomb/.csm/csm-hook.sh Setup",
-            "type": "command"
+            "type": "command",
+            "command": "/Users/hankholcomb/.csm/csm-hook.sh Setup"
           }
-        ],
-        "matcher": ""
+        ]
       }
     ],
     "Stop": [
       {
+        "matcher": "",
         "hooks": [
           {
-            "command": "/Users/hankholcomb/.csm/csm-hook.sh Stop",
-            "type": "command"
+            "type": "command",
+            "command": "/Users/hankholcomb/.csm/csm-hook.sh Stop"
           }
-        ],
-        "matcher": ""
+        ]
       }
     ],
     "SubagentStop": [
       {
+        "matcher": "",
         "hooks": [
           {
-            "command": "/Users/hankholcomb/.csm/csm-hook.sh SubagentStop",
-            "type": "command"
+            "type": "command",
+            "command": "/Users/hankholcomb/.csm/csm-hook.sh SubagentStop"
           }
-        ],
-        "matcher": ""
+        ]
       }
     ],
     "UserPromptSubmit": [
       {
+        "matcher": "",
         "hooks": [
           {
-            "command": "/Users/hankholcomb/.csm/csm-hook.sh UserPromptSubmit",
-            "type": "command"
+            "type": "command",
+            "command": "/Users/hankholcomb/.csm/csm-hook.sh UserPromptSubmit"
           }
-        ],
-        "matcher": ""
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "codegraph prompt-hook"
+          }
+        ]
       }
     ]
   },
-  "theme": "auto",
   "statusLine": {
     "type": "command",
     "command": "/Users/hankholcomb/.claude/statusline.sh"
+  },
+  "enabledPlugins": {
+    "runpod@runpod": true
+  },
+  "extraKnownMarketplaces": {
+    "runpod": {
+      "source": {
+        "source": "github",
+        "repo": "runpod/runpod-plugins-official"
+      }
+    }
+  },
+  "effortLevel": "xhigh",
+  "modelSettings": {
+    "claude-sonnet-5": {
+      "effortLevel": "xhigh"
+    },
+    "claude-opus-5": {
+      "effortLevel": "xhigh"
+    }
+  },
+  "tui": "fullscreen",
+  "skipWorkflowUsageWarning": true,
+  "theme": "auto",
+  "preferredNotifChannel": "auto",
+  "skipAutoPermissionPrompt": true,
+  "autoMode": {
+    "environment": [
+      "### Org-wide",
+      "**Organization**: None configured",
+      "**Cloud provider(s)**: None configured",
+      "**Repository visibility**: assume private unless the remote host and repo name indicate otherwise, or a visibility check in the transcript shows public \u2014 not queryable here (no remotes configured in this repo)",
+      "**Internal sharing / snippet hosting**: None configured \u2014 treat public paste/gist services as outside the trust boundary",
+      "**Secrets management**: None configured",
+      "**Default / protected branches**: unknown \u2014 origin/HEAD unset, no remotes configured",
+      "**CI/CD deploy targets**: None configured",
+      "**Network posture**: None configured",
+      "**Source control**: The trusted repo only \u2014 no remotes are currently configured for this checkout",
+      "**Trusted internal domains**: None configured",
+      "**Trusted cloud buckets**: None configured",
+      "**Key internal services**: None configured",
+      "**Internal package registry**: None configured",
+      "**Sensitive data locations & audiences**: any file or store holding personal data, confidential business data, credentials, regulated data, or similarly sensitive material; preserve exact handles when known and share only with audiences cleared at the [named+specifics] bar",
+      "**Data retention / declassification**: None configured",
+      "**Sensitive remote targets**: any namespace, host, or container whose name carries `prod` or `production` as a whole word or name segment (hyphen/underscore/dot-delimited \u2014 e.g. matches `prod-db`, not `producer`)",
+      "**Protected deployment namespaces / environments**: None configured \u2014 fall back to the Sensitive remote targets heuristic",
+      "**Protected IaC scopes**: IAM, RBAC, networking, quota, and node-pool resources; anything whose name or tag carries `prod` or `production` as a whole word or name segment",
+      "### User-specific",
+      "**Primary use of Claude Code**: software development",
+      "**Trusted repo**: This repo (/Users/hankholcomb/Documents/code_parent_folders/gauntlet_repos) \u2014 currently has no remotes configured; visibility and submission target unknown until a remote is added. Global instructions reference a self-hosted GitLab at labs.gauntletai.com (user hankholcomb) as the Gauntlet AI submission target, with GitHub (HankH18) as a personal backup only \u2014 treat these as candidate targets for this repo only once an actual remote confirms it, not as blanket trust",
+      "**Org-specific CLIs**: None configured (codegraph seen 1\u00d7 in this project's transcripts and 11\u00d7 in shell history \u2014 a local tooling CLI, not an org-specific service CLI)",
+      "routine under hankholcomb/ prefix on labs.gauntletai.com (per global CLAUDE.md, unverified by this repo's own remotes)"
+    ]
   }
 }

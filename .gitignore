@@ -19,6 +19,14 @@
 # directed by hand again. Instructions only — no tokens, no transcripts.
 !/CLAUDE.md
 
+# The standing-correction machinery, versioned together because it only works
+# as a pair: settings.json wires a SessionStart hook to the script, and the
+# script reads the log. Any one of the three missing on a new machine and the
+# corrections stop being surfaced — which is exactly how they went unread for
+# seven recurrences. Instructions and self-critique only; no transcripts.
+!/scripts/
+!/mistakes/
+
 # If you start versioning custom agents/commands/hooks, uncomment:
 # !/agents/
 # !/commands/
