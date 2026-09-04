@@ -145,7 +145,24 @@ printf '  %-14s %s\n' "contract"   "$CONTRACT_LINE"
 echo ""
 
 if [ "$GUARD_RC" -eq 0 ] && [ "$HARNESS_RC" -eq 0 ] && [ "$CONTRACT_RC" -eq 0 ]; then
-  echo "  ALL GREEN — the skill is safe to edit against."
+  # A skipped battery is RC=0 too — the initialisers above see to that — so the
+  # RCs alone cannot separate "all three passed" from "one passed and two never
+  # ran". Measured: `run.sh --guard --harness` printed ALL GREEN with `contract
+  # (skipped)` on the SUMMARY line above it, which is the false all-clear this
+  # suite exists to prevent. Exit stays 0 — a battery you did not select did not
+  # regress — but only a full run may say the skill is safe to edit against.
+  if [ "$RUN_GUARD" -eq 1 ] && [ "$RUN_HARNESS" -eq 1 ] && [ "$RUN_CONTRACT" -eq 1 ]; then
+    echo "  ALL GREEN — the skill is safe to edit against."
+  else
+    ran=""
+    [ "$RUN_GUARD" -eq 1 ]    && ran="$ran guard"
+    [ "$RUN_HARNESS" -eq 1 ]  && ran="$ran harness"
+    [ "$RUN_CONTRACT" -eq 1 ] && ran="$ran contract"
+    echo "  PARTIAL GREEN — only$ran ran, and only$ran passed."
+    echo "  A skipped battery is not a green one: this says NOTHING about the"
+    echo "  ones you did not select, and it is not the gate. Run tests/run.sh"
+    echo "  with no selector before declaring the skill safe to edit against."
+  fi
   exit 0
 fi
 
