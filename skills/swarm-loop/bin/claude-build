@@ -47,6 +47,11 @@ WATCH="" ; AUTHORITY=0 ; CTO_ROLE=""
 # REFUSES; see the full-auto block below and references/watch-sessions.md.
 GATE_SENTINEL="CLAUDE_BUILD_AUTHORIZATION_GATE"
 
+# Where per-run scaffolding lives. Defined with the other constants rather than
+# beside its first use, because `--sessions` reads it long before the install
+# flow that used to define it.
+RUNS="$HOME/claude-build/runs"            # per-run scaffolding, not a document
+
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 ok()   { [ "$QUIET" = 1 ] || printf '  \033[32m✓\033[0m %s\n' "$*"; }
 warn() { printf '  \033[33m!\033[0m %s\n' "$*" >&2; }
@@ -667,6 +672,7 @@ USAGE
   claude-build [DIR] watch|watch-fix|full-auto|all [options]
   claude-build [DIR] --uninstall
   claude-build --uninstall-self
+  claude-build --sessions
 
 ARGUMENTS
   DIR                  Project directory. Default: current directory.
@@ -740,6 +746,17 @@ UNINSTALL
                        uncommitted work, or if git cannot say whether it does.
   --uninstall-self     Delete the claude-build script itself. Does not touch
                        any project; run --uninstall in each project first.
+  --sessions           List every recorded run and the tmux attach command for
+        (--status)     each watcher it started, marking each LIVE or gone.
+                       Takes no DIR and starts nothing.
+                       READ THIS IF YOU THINK ONLY ONE SESSION OPENED. In every
+                       watcher topology exactly one window appears: the BUILD is
+                       exec'd into the terminal you launched from, while the
+                       watchers are DETACHED tmux sessions. claude-build prints
+                       their attach commands immediately before that exec — and
+                       Claude Code clears the screen as it starts, so those lines
+                       are gone before they can be read. This is how you get them
+                       back.
 
 WHAT INSTALL DOES
   1. Creates / git-initializes the project directory.
@@ -783,6 +800,8 @@ while [ $# -gt 0 ]; do
     --uninstall)      MODE=uninstall; LAUNCH=0; shift ;;
     --purge)          PURGE=1; shift ;;
     --uninstall-self) MODE=uninstall-self; LAUNCH=0; shift ;;
+    --sessions|--status)
+                      MODE=sessions; LAUNCH=0; shift ;;
     -q|--quiet)       QUIET=1; shift ;;
     # Session-topology modifiers. These MUST sit above the `-*)` arm (so the
     # --flag spellings are not swallowed as unknown options) and above the `*)`
@@ -887,6 +906,47 @@ if [ "$WATCH" = full-auto ] || [ "$WATCH" = all ]; then
 GATE_EOF
     exit 3
   fi
+fi
+
+# ---------------------------------------------------------------- sessions
+# Why this exists. In every watcher topology the build is exec'd into THIS
+# terminal while the watchers go to DETACHED tmux sessions, so a correct run
+# shows the operator exactly one window. The attach commands are printed just
+# before the exec — and Claude Code clears the screen on startup, so they are
+# gone before they can be read. Measured: a watch-fix run started all three
+# sessions correctly and was reported as "it only opened one", because after
+# the exec nothing on the machine will tell you the other two names again.
+# A launcher whose only record of what it started is destroyed by its own last
+# instruction has not told you anything.
+if [ "$MODE" = sessions ]; then
+  step "claude-build — sessions"
+  command -v tmux >/dev/null || warn "tmux is not on PATH; liveness cannot be checked"
+  FOUND=0
+  for J in "$RUNS"/*/run.json; do
+    [ -f "$J" ] || continue
+    FOUND=1
+    RID=$(basename "$(dirname "$J")")
+    py() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2],"") or "")' "$J" "$1"; }
+    TOPO=$(py topology); PROJ=$(py project); SDIR=$(py state_dir)
+    WN=$(py watch_session_name); FN=$(py fix_session_name); BN=$(py build_session_name)
+    echo
+    echo "  $RID   project=$PROJ  topology=${TOPO:-?}"
+    for pair in "watchdog:$WN" "fixer:$FN"; do
+      ROLE=${pair%%:*}; NAME=${pair#*:}
+      [ -n "$NAME" ] || continue
+      if tmux has-session -t "$NAME" 2>/dev/null; then
+        printf '    %-9s LIVE   tmux attach -t %s\n' "$ROLE" "$NAME"
+      else
+        printf '    %-9s gone   %s\n' "$ROLE" "$NAME"
+      fi
+    done
+    [ -n "$BN" ] && printf '    %-9s %s   (exec\x27d into the terminal you launched from, never tmux)\n' "build" "$BN"
+    [ -f "$SDIR/teardown.sh" ] && printf '    %-9s bash %s\n' "teardown" "$SDIR/teardown.sh"
+  done
+  [ "$FOUND" = 0 ] && warn "no runs recorded under $RUNS"
+  echo
+  echo "  Detach from an attached session with: ctrl-b d"
+  exit 0
 fi
 
 # ------------------------------------------------------------ uninstall-self
@@ -1264,7 +1324,6 @@ fi
 #  2. Documents a human reads and scaffolding a machine writes have different
 #     lifetimes and different owners, so they get different directories.
 OBS="$HOME/claude-build/observations"     # documents a person reads
-RUNS="$HOME/claude-build/runs"            # per-run scaffolding a person does not
 STATE_DIR="" ; BUILD_SESSION_NAME="" ; BUILD_SID=""
 WATCH_SESSION_NAME="" ; FIX_SESSION_NAME=""
 
@@ -1551,6 +1610,14 @@ PROMPT="$PROMPT Worktrees for this run go in $WT — Phase 0 is already provisio
 if [ -n "$WATCH" ]; then
   PROMPT="$PROMPT A WATCHDOG session (name: $WATCH_SESSION_NAME) is observing this run from its own terminal; it is read-only with respect to this repository and files what it sees under $OBS. It is not part of your swarm and you do not manage it. Note that its name says 'watch' and NOT 'audit-fix' on purpose: --audit-loops is your act two, running inside THIS session, and is a different mechanism from these watcher sessions."
   [ "$WATCH" = watch-fix ] && PROMPT="$PROMPT A FIXER session (name: $FIX_SESSION_NAME) may repair the skill in a copy at $WORK_DIR; it never touches this repository. The run ledger is $STATE_DIR/run.json."
+  # The ONE channel that survives the exec. Everything claude-build printed
+  # about the watchers is wiped when Claude Code clears the screen, and the
+  # operator is then looking at a single window with no way to learn that two
+  # more sessions exist. Your first message is the first thing they will see,
+  # so it carries the attach commands.
+  PROMPT="$PROMPT BEFORE you begin, your FIRST message must tell the user, verbatim and on their own lines, how to reach the other sessions this run started — they are DETACHED tmux sessions, so the user is looking at one window and cannot otherwise discover them: 'watchdog:  tmux attach -t $WATCH_SESSION_NAME'"
+  [ "$WATCH" = watch-fix ] && PROMPT="$PROMPT and 'fixer:     tmux attach -t $FIX_SESSION_NAME'"
+  PROMPT="$PROMPT and 'detach with ctrl-b d; list them again any time with claude-build --sessions'. Say it once, at the top, then continue with the build."
 fi
 
 # ONE array, used both by the --no-launch instructions and by the exec below.
