@@ -6464,26 +6464,76 @@ def cmd_findings(args):
     _protected = [str(p).strip() for p in
                   (_state.get("protected_paths") or MANDATORY_PROTECTED)
                   if str(p).strip()]
-    harness, mintable = [], []
-    for out in stamped:
-        _sc = _finding_scope(out.get("location"))
-        # Normalised, because a location is FREE TEXT from a checker subagent while
-        # check-branch reads `git diff --name-only`, already canonical. A leading
-        # "./" was enough to smuggle a harness finding into the ticket ledger.
-        # (normpath alone drops "./" and collapses "//" and ".."; never lstrip("./"),
-        # which takes a CHARACTER SET and silently disarms the whole partition.)
-        if _sc:
-            _sc = os.path.normpath(_sc)
+    def _harness_owned(location):
+        """True when a finding's location names something no worker may fix.
+
+        A location is FREE TEXT written by a checker subagent, while check-branch
+        reads `git diff --name-only`, already canonical. Comparing the two
+        naively fails in three measured ways, and every one of them fails OPEN —
+        the finding mints a ticket at a worker whom the branch veto rejects from
+        that path every time, which is the whole defect this partition exists to
+        prevent. So each spelling is normalised into a CANDIDATE and every
+        candidate is tested:
+
+          * a leading "./" — './.swarm-loop/acceptance/x.py'. normpath drops it.
+            (Never lstrip("./"): it takes a CHARACTER SET, turns '.swarm-loop/x'
+            into 'swarm-loop/x', and silently disarms the whole partition.)
+          * an ABSOLUTE path. Measured on a real run: 30 of 43 harness findings
+            were recorded as '/Users/.../<repo>/.swarm-loop/acceptance/...' and
+            every one of them minted, because the raw string was compared against
+            RELATIVE prefixes and nothing relativised it. At the default
+            threshold that run would have minted 19 unclosable tickets.
+          * a protected FILE carrying an annotation — '.swarm-loop/acceptance/
+            test_x.py (metric foo)'. A protected DIRECTORY survives this because
+            the '/' is already inside the string, but a protected FILE does not:
+            the next character is a space, so neither equality nor the '<p>/'
+            prefix matches. The first whitespace-delimited token is therefore a
+            candidate in its own right.
+        """
+        sc = _finding_scope(location)
+        if not sc:
+            return False
+        # Three spellings, because the annotation and the line range compose:
+        # '/repo/scripts/verify.sh:105 (T-117)' defeats the whole-string form
+        # (trailing prose, so _finding_scope strips no range) AND the bare first
+        # token (which still carries ':105'). Re-running _finding_scope over the
+        # token is what strips it.
+        _tok = sc.split()[0] if sc.split() else ""
+        cands = []
+        for raw in (sc, _tok, _finding_scope(_tok) or ""):
+            if not raw:
+                continue
+            p = os.path.normpath(raw)
+            if os.path.isabs(p):
+                # CANONICALIZE BOTH SIDES, which is this skill's own standing
+                # rule and the thing that made the first version of this fix
+                # useless: on macOS a recorded location reads /var/folders/...
+                # while the repo root resolves to /private/var/folders/..., so
+                # relpath returned '../../../..' and every absolute harness
+                # finding was waved through as product work.
+                try:
+                    rel = os.path.relpath(os.path.realpath(p), os.path.realpath(root))
+                except ValueError:          # different drive on Windows
+                    continue
+                if rel.startswith(".."):    # genuinely outside the repo
+                    continue
+                p = rel
+            cands.append(p.replace(os.sep, "/"))
         # BOTH of check-branch's vetoes, or this asks a NARROWER question than the
         # surface it protects: protected_paths ("modifies the frozen goal harness")
         # AND all of STATE_DIR/ ("orchestrator-owned state"). A finding at
         # .swarm-loop/worker-preamble.md is exactly as unclosable as one in the
         # acceptance suite.
-        if _sc and (any(_sc == p or _sc.startswith(p.rstrip("/") + "/") for p in _protected)
-                    or _sc == STATE_DIR or _sc.startswith(STATE_DIR + "/")):
-            harness.append(out)
-        else:
-            mintable.append(out)
+        for c in cands:
+            if any(c == p or c.startswith(p.rstrip("/") + "/") for p in _protected):
+                return True
+            if c == STATE_DIR or c.startswith(STATE_DIR + "/"):
+                return True
+        return False
+
+    harness, mintable = [], []
+    for out in stamped:
+        (harness if _harness_owned(out.get("location")) else mintable).append(out)
     if harness:
         _rec = "recorded" if not args.dry_run else "NOT recorded — this is a --dry-run"
         print(f"\n{len(harness)} finding(s) name a path NO WORKER MAY TOUCH — {_rec}, "

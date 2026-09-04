@@ -3436,6 +3436,39 @@ ck "(s) ...and does not touch the ticket graph's bytes" "$GRAPH_BEFORE_H" "$(sha
 ck_has "(s) ...and still reconciles every recorded finding" \
        "0 minted + 0 below threshold + 0 already ticketed + 1 harness-owned = 1 recorded"
 
+# THE THREE SPELLINGS THAT DEFEATED THE PARTITION, each measured on a real run.
+# A `location` is free text from a checker subagent; check-branch reads
+# `git diff --name-only`, already canonical. Every one of these failed OPEN —
+# the finding minted a ticket at a worker the branch veto rejects every time.
+#   * ABSOLUTE: 30 of 43 harness findings on one run were recorded as
+#     /Users/.../<repo>/.swarm-loop/acceptance/... and every one minted, because
+#     the raw string was compared against RELATIVE prefixes.
+#   * protected FILE + annotation: a protected DIRECTORY survives (the "/" is
+#     already in the string); a protected FILE does not — the next char is a
+#     space, so neither equality nor the "<p>/" prefix matches.
+#   * both at once, where the line range also has to be stripped off the token.
+GRAPH_BEFORE_S="$(sha_of tickets.json)"
+cat > spellings.json <<EOF
+[
+ {"severity":"HIGH","location":"$(pwd)/.swarm-loop/acceptance/test_abs.py:9","defect":"absolute path"},
+ {"severity":"HIGH","location":"$(pwd)/.swarm-loop/acceptance/test_rng.py:228-251","defect":"absolute plus line range"},
+ {"severity":"HIGH","location":".swarm-loop/goals.json (metric build_succeeds)","defect":"protected FILE plus annotation"},
+ {"severity":"HIGH","location":"$(pwd)/.swarm-loop/goals.json:105 (T-117)","defect":"absolute, range AND annotation"},
+ {"severity":"HIGH","location":"/elsewhere/.swarm-loop/acceptance/x.py:1","defect":"same shape, OUTSIDE this repo"},
+ {"severity":"HIGH","location":"src/goals.json.bak:3","defect":"prefix lookalike, must still mint"}
+]
+EOF
+sl findings --file spellings.json --min-severity MEDIUM
+ck_exit "(s) the spelling battery exits 0" 0 "$RC"
+ck_has "(s) an ABSOLUTE protected path is refused, not minted" \
+       "+ 4 harness-owned = 6 recorded"
+ck "(s) ...and none of the four reached the graph" "0" \
+   "$(jget tickets.json "len([t for t in d['tickets'] if 'test_abs' in str(t.get('location')) or 'test_rng' in str(t.get('location')) or 'build_succeeds' in str(t.get('location')) or 'T-117' in str(t.get('location'))])")"
+ck "(s) a path OUTSIDE the repo is product work and still mints" "1" \
+   "$(jget tickets.json "len([t for t in d['tickets'] if '/elsewhere/' in str(t.get('location'))])")"
+ck "(s) a PREFIX lookalike is not swept up by the partition" "1" \
+   "$(jget tickets.json "len([t for t in d['tickets'] if 'goals.json.bak' in str(t.get('location'))])")"
+
 
 # ===========================================================================
 # (t) check-wave and reads must REFUSE a graph that does not parse as one.
