@@ -8763,6 +8763,52 @@ print('Edit(//p/runs/r1/skill/**)' in d['permissions']['allow']
 ck "...and the watchdog keeps its notebook" "True" \
    "$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print('Edit(//p/runs/r1/**)' in d['permissions']['allow'])" "$CBGEN/watchdog.json")"
 
+# W09031940f-01's second half. The workspace now carries the contract battery's
+# PRODUCER leg at <state>/build-docs/references/templates.md, because without it
+# run.sh aborts at exit 3 and the fixer's green-suite gate can never be met. But
+# Edit(<state>/**) is granted to BOTH roles for their notebooks, so copying the
+# leg in without a matching deny would hand the fixer write access to the very
+# document its own gate compares the skill to — it could turn run-tests.sh green
+# by editing the producer rather than the skill, and no reader of the diff would
+# see it. Deny beats allow; both roles are shut out, both directions pinned.
+ck "the FIXER is denied the copied contract producer leg" "True" \
+   "$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print('Edit(//p/runs/r1/build-docs/**)' in d['permissions']['deny'])" "$CBGEN/fixer.json")"
+ck "...and so is the watchdog, whose notebook grant also covers it" "True" \
+   "$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print('Edit(//p/runs/r1/build-docs/**)' in d['permissions']['deny'])" "$CBGEN/watchdog.json")"
+ck "...and neither role is granted it back anywhere in allow" "True" \
+   "$(python3 -c "
+import json,sys
+print(all('Edit(//p/runs/r1/build-docs/**)' not in json.load(open(p))['permissions']['allow']
+          for p in sys.argv[1:]))" "$CBGEN/watchdog.json" "$CBGEN/fixer.json")"
+# READ is deliberately NOT revoked: the battery has to read the leg to run at
+# all, and a deny that broke the gate would be the original defect with a
+# different message.
+ck "...while the run directory stays READABLE, so the battery can still run" "True" \
+   "$(python3 -c "
+import json,sys
+d=json.load(open(sys.argv[1]))
+print('Read(//p/runs/r1/**)' in d['permissions']['allow']
+      and not [r for r in d['permissions']['deny'] if r.startswith('Read(')])" "$CBGEN/fixer.json")"
+# Containment, not string equality: the deny is only real if the path
+# claude-build actually writes falls under the glob it emits. Both come from
+# the launcher's own source.
+ck "the destination claude-build writes is INSIDE the denied glob" "covered" \
+   "$(python3 - "$CB_SRC" "$CBGEN/fixer.json" <<'PYLEG'
+import json, re, sys
+src, prof = sys.argv[1], sys.argv[2]
+text = open(src).read()
+m = re.search(r'BD_DST="([^"]+)"', text)
+if not m:
+    print("no BD_DST in the launcher"); raise SystemExit
+dst = m.group(1).replace("$STATE_DIR", "/p/runs/r1")
+deny = json.load(open(prof))["permissions"]["deny"]
+pref = [r[len("Edit(//"):-len("/**)")] for r in deny
+        if r.startswith("Edit(//") and r.endswith("/**)")]
+print("covered" if any(dst.lstrip("/").startswith(p + "/") for p in pref)
+      else "NOT COVERED: " + dst)
+PYLEG
+)"
+
 # Under `all` the watcher issues approvals into a store the BUILD cannot reach.
 # The property that makes "read-only observer" and "can grant" compatible is
 # that nobody else can write it either — a fixer that could append to the log
@@ -8978,6 +9024,401 @@ for fn in sorted(os.listdir(tpl)):
 print(", ".join(sorted(missing)))
 PYP
 )"
+
+# ===========================================================================
+section "claude-build: the fixer's workspace can run its own gate"
+
+# W09031940f-01. `watch-fix` builds the fixer's workspace with `cp -R $SKILL`,
+# and the comment justifying that said the suite "locates itself by relative
+# path ... so the copy is fully testable". Measurably false: tests/run.sh
+# preflights the contract battery's PRODUCER leg at
+# "$SKILL_DIR/../build-docs/references/templates.md" — a SIBLING skill — and
+# exits 3 with MISSING contract leg when it is absent, BEFORE the guard and
+# harness batteries (which have no build-docs dependency) ever start. The
+# fixer's brief requires a green run-tests.sh before it may touch anything, so
+# in the mandated workspace its gate could never be satisfied at all.
+#
+# Both halves are exercised end to end against a real copy, because the claim
+# is about what run.sh does in a copied tree and nothing short of running it
+# there settles that.
+CBWS="$TMP/cbworkspace"; mkdir -p "$CBWS"
+CB_SKILL_REAL="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+cp -R "$CB_SKILL_REAL" "$CBWS/skill"
+( cd "$CBWS" && bash skill/tests/run.sh ) > "$OUT" 2>&1
+RC=$?
+ck_exit "a skill copied ALONE cannot run a single battery" 3 "$RC"
+ck_has  "...it dies on the sibling leg" "MISSING contract leg"
+ck_hasnt "...before the guard battery, which does not need that leg, ever starts" \
+         "git-guard battery"
+ck_hasnt "...and before the harness battery too" "harness end-to-end suite"
+
+# The destination is not a choice: run.sh computes SKILL_DIR from its own
+# location and test_contract.py computes SKILLS_ROOT as <skill>/.., and neither
+# takes an override. So the leg has to land beside the copy, under its parent.
+ck "run.sh really resolves the leg through the copy's PARENT" "1" \
+   "$(grep -c 'SKILL_DIR/\.\./build-docs/references/templates\.md' "$SCRIPT_DIR/run.sh")"
+ck "...and test_contract.py resolves it the same way, with no env override" "1" \
+   "$(grep -c 'SKILLS_ROOT = os.path.join(SKILL, os.pardir)' "$SCRIPT_DIR/test_contract.py")"
+ck "the launcher copies the leg to exactly that place" "1" \
+   "$(grep -c 'BD_DST="\$STATE_DIR/build-docs/references/templates\.md"' "$CB_SRC")"
+ck "...and takes it from the SIBLING skill, not from inside swarm-loop" "1" \
+   "$(grep -c 'BD_SRC="\$SKILL/\.\./build-docs/references/templates\.md"' "$CB_SRC")"
+ck "...and says so loudly rather than silently when the sibling is absent" "1" \
+   "$(grep -c 'the contract battery.s producer leg is therefore absent from the' "$CB_SRC")"
+# The comment that justified the broken copy is gone. It is the reason the
+# defect survived review, so its absence is pinned.
+ck "the false 'fully testable' justification is gone from the launcher" "0" \
+   "$(grep -c 'so the copy is fully testable' "$CB_SRC")"
+
+# And with the leg where claude-build now puts it, the same copy runs.
+# --contract only: this suite must not run itself recursively.
+CB_LEG="$CB_SKILL_REAL/../build-docs/references/templates.md"
+if [ -f "$CB_LEG" ]; then
+  mkdir -p "$CBWS/build-docs/references"
+  cp "$CB_LEG" "$CBWS/build-docs/references/templates.md"
+  ( cd "$CBWS" && bash skill/tests/run.sh --contract ) > "$OUT" 2>&1
+  RC=$?
+  ck_exit "the same copy, with the leg beside it, runs the contract battery" 0 "$RC"
+  ck_has  "...and it is green inside the copy" "TEST_CONTRACT: PASS="
+  ck_hasnt "...with no preflight abort left" "MISSING contract leg"
+  # That is the whole proof, and it is deliberately where it stops. The leg
+  # preflight in run.sh fires for ANY selection that includes --contract, a
+  # bare run included, so a contract battery that RAN is a preflight that
+  # passed. Running `--guard --contract` here to watch the guard battery start
+  # would prove the same thing while making THIS battery's colour depend on
+  # hooks/git-guard.py — a red belonging to another suite, reported here.
+else
+  # No sibling on this machine: the functional half cannot be run, and saying
+  # so beats a green that measured nothing.
+  ck "the build-docs sibling is absent, so the functional half was not run" \
+     "absent" "absent"
+fi
+rm -rf "$CBWS"
+
+# ===========================================================================
+section "claude-build: attach adopts a running build  [fake skill tree]"
+
+# W09031949-01/-02. The topology modifiers were legal only on a launch
+# ("watch only means anything on a build run"), so the only way to observe a
+# build already running was to hand-start a session — which forfeits the entire
+# --restricted profile. Measured live: an unrestricted observer ended up in a
+# build repo holding write access AND an Agent tool, both of which its own brief
+# calls impossible.
+#
+# The discovery half is exercised by running the launcher's OWN embedded
+# resolver against a synthetic registry, so these assertions are about what
+# ships rather than a paraphrase of it.
+CBAT="$TMP/cbattach"; mkdir -p "$CBAT/reg" "$CBAT/runs"
+python3 - "$CB_SRC" "$CBAT" <<'PYAT' > /dev/null
+import os, sys
+src, out = sys.argv[1], sys.argv[2]
+body, grab = [], False
+for line in open(src):
+    if line.startswith("read -r -d '' PY_ATTACH "):
+        grab = True; continue
+    if grab and line.startswith("PY_ATTACH_EOF"):
+        break
+    if grab:
+        body.append(line)
+open(os.path.join(out, "attach.py"), "w").write("".join(body))
+PYAT
+ck "the attach resolver was extracted from the launcher" "True" \
+   "$([ -s "$CBAT/attach.py" ] && echo True || echo False)"
+
+# A fake HOME whose registry is the only thing that says what is running.
+CBATH="$CBAT/home"; mkdir -p "$CBATH/.claude/sessions"
+at_reg() {  # at_reg <pid> <sid> <cwd> <name>
+  printf '{"pid":%s,"sessionId":"%s","cwd":"%s","name":"%s","status":"busy"}\n' \
+    "$1" "$2" "$3" "$4" > "$CBATH/.claude/sessions/$1.json"
+}
+at_run() {  # at_run <run-id> <dir> <build-sid> <watch-sid> <watch-name>
+  mkdir -p "$CBAT/runs/$1"
+  printf '{"dir":"%s","build_session_id":"%s","watch_session_id":"%s","watch_session_name":"%s"}\n' \
+    "$2" "$3" "$4" "$5" > "$CBAT/runs/$1/run.json"
+}
+at() {  # at <project-dir>  — the resolver's one verdict line
+  HOME="$CBATH" DIR="$1" RUNS="$CBAT/runs" python3 "$CBAT/attach.py" 2>&1
+}
+
+AT_PROJ="/fake/proj"
+ck "with nothing running, attach refuses instead of guessing" "FATAL" \
+   "$(at "$AT_PROJ" | head -1 | cut -c1-5)"
+ck "...saying the registry lists no session in that directory" "1" \
+   "$(at "$AT_PROJ" | grep -c 'no live Claude Code session is running in /fake/proj')"
+
+at_reg 4242 "aaaa-1111" "$AT_PROJ" "my-build"
+ck "one live session in the project is ADOPTED, id and pid and all" \
+   "OK:aaaa-1111|my-build|4242|busy|" "$(at "$AT_PROJ")"
+# The whole point: a fresh uuid here yields a watcher whose every readback says
+# NOT-REGISTERED about a build that is demonstrably alive.
+ck "...the adopted id is the REGISTRY's, never a minted one" "aaaa-1111" \
+   "$(at "$AT_PROJ" | sed 's/^OK://' | cut -d'|' -f1)"
+
+# A session in a DIFFERENT directory is not this project's build.
+at_reg 4343 "bbbb-2222" "/fake/other" "elsewhere"
+ck "a session in another directory is not adopted" "aaaa-1111" \
+   "$(at "$AT_PROJ" | sed 's/^OK://' | cut -d'|' -f1)"
+
+# The watchdog's own tmux session is started with -c "$DIR", so cwd alone
+# cannot tell an observer from the build it observes.
+at_reg 4444 "cccc-3333" "$AT_PROJ" "cb-watch-someproj-1"
+ck "an observer sitting in the same cwd is not mistaken for the build" \
+   "aaaa-1111" "$(at "$AT_PROJ" | sed 's/^OK://' | cut -d'|' -f1)"
+at_run r0 "/fake/elsewhere" "zzzz-0000" "cccc-3333" "cb-watch-someproj-1"
+ck "...and one already recorded as a watcher is excluded by id too" \
+   "aaaa-1111" "$(at "$AT_PROJ" | sed 's/^OK://' | cut -d'|' -f1)"
+
+# Two plausible builds: refuse, never pick. A watcher bound to the wrong
+# session looks armed and watches nothing, which is worse than no watcher.
+at_reg 4545 "dddd-4444" "$AT_PROJ" "another-build"
+ck "two candidate sessions are a refusal, not a coin flip" "FATAL" \
+   "$(at "$AT_PROJ" | head -1 | cut -c1-5)"
+ck "...naming every candidate it found" "2" \
+   "$(at "$AT_PROJ" | grep -c 'pid 4242\|pid 4545')"
+ck "...and saying why it will not choose" "1" \
+   "$(at "$AT_PROJ" | grep -c 'looks armed and watches nothing')"
+rm -f "$CBATH/.claude/sessions/4545.json"
+
+# A run this launcher started for THIS project breaks a tie the registry alone
+# cannot: an id it minted here outranks a bare cwd match.
+at_reg 4545 "dddd-4444" "$AT_PROJ" "another-build"
+at_run r1 "$AT_PROJ" "dddd-4444" "eeee-5555" "cb-watch-r1"
+ck "a session THIS launcher minted for THIS project wins the tie" "dddd-4444" \
+   "$(at "$AT_PROJ" | sed 's/^OK://' | cut -d'|' -f1)"
+ck "...and it hands back the watcher names bound to that build" "cb-watch-r1" \
+   "$(at "$AT_PROJ" | sed 's/^OK://' | cut -d'|' -f5)"
+
+# A watcher already attached: two independent signals, because either alone can
+# be wrong. Here the registry one.
+at_reg 4646 "eeee-5555" "$AT_PROJ" "cb-watch-r1"
+ck "a build that already has a LIVE watcher is refused" "FATAL" \
+   "$(at "$AT_PROJ" | head -1 | cut -c1-5)"
+ck "...naming the tmux session to attach to instead" "1" \
+   "$(at "$AT_PROJ" | grep -c 'tmux attach -t cb-watch-r1')"
+ck "...and why a second one is not harmless" "1" \
+   "$(at "$AT_PROJ" | grep -c 'one defect ends up with two ids')"
+rm -f "$CBATH/.claude/sessions/4646.json"
+ck "...and once that watcher is gone, attaching is allowed again" "dddd-4444" \
+   "$(at "$AT_PROJ" | sed 's/^OK://' | cut -d'|' -f1)"
+
+# A nameless registry record still yields a row peers.sh will print: the name
+# is the messaging address, and an empty one is silently skipped there.
+rm -f "$CBATH/.claude/sessions"/*.json
+rm -rf "$CBAT/runs"/*
+printf '{"pid":7,"sessionId":"ffff-6666","cwd":"%s","status":"busy"}\n' "$AT_PROJ" \
+  > "$CBATH/.claude/sessions/7.json"
+ck "a nameless session falls back to its id, never to an empty name" \
+   "ffff-6666" "$(at "$AT_PROJ" | sed 's/^OK://' | cut -d'|' -f2)"
+
+# ===========================================================================
+section "claude-build: the attach verb's argument surface  [fake skill tree]"
+
+# `attach` is a bare word, so it must sit above both the -*) and the *) arms —
+# otherwise `claude-build attach` creates a directory called "attach".
+CBATP="$TMP/cbattachproj"; mkdir -p "$CBATP/.claude"
+CBATP_R="$(cd "$CBATP" && pwd -P)"
+for m in attach --attach; do
+  cb "$CBATP" "$m"
+  ck_exit "'$m' parses and refuses a project with no install" 1 "$RC"
+  ck_has  "...naming the marker it looked for" ".claude-build.json"
+  ck_hasnt "'$m' is not taken as a directory" "would create directory"
+done
+
+# attach is a MODE, and MODE-setting words used to overwrite each other in
+# silence, so `--uninstall attach` and `attach --uninstall` read alike and did
+# opposite things.
+cb "$CBATP" --uninstall attach
+ck_exit "attach after another verb is refused" 1 "$RC"
+ck_has  "...naming the verb it collided with" "attach cannot be combined with uninstall"
+cb "$CBATP" attach --uninstall
+ck_exit "...and in the other order too" 1 "$RC"
+ck_has  "...same message, so neither order can win silently" \
+        "attach cannot be combined with uninstall"
+cb "$CBATP" --sessions attach
+ck_exit "attach with --sessions is refused" 1 "$RC"
+
+# A topology modifier is about starting sessions with a build; attach observes
+# one that already exists. The existing cross-flag check covers it.
+cb "$CBATP" attach watch
+ck_exit "a topology modifier with attach is refused" 1 "$RC"
+ck_has  "...naming the mode" "watch only means anything on a build run (you asked for: attach)"
+
+# The build knobs configure a build attach never starts. Accepting them would
+# read as "attach and run two audit loops" and deliver an observer.
+printf 'spec\n' > "$CBATP/SPEC.md"
+cb "$CBATP" attach --spec SPEC.md
+ck_exit "--spec with attach is refused" 1 "$RC"
+ck_has  "...saying attach observes a build that is already running" \
+        "attach observes one that is already running"
+cb "$CBATP" attach --audit-loops 2
+ck_exit "--audit-loops with attach is refused" 1 "$RC"
+cb "$CBATP" attach --max-cycles 2
+ck_exit "--max-cycles with attach is refused" 1 "$RC"
+cb "$CBATP" attach --in-tree
+ck_exit "--in-tree with attach is refused" 1 "$RC"
+ck_has  "...because the manifest is what names the worktree directory" \
+        "reads that from the install manifest"
+
+# With a marker but nothing running, the refusal has to name the registry —
+# this is the case an operator hits by attaching before starting the build.
+printf '{"worktree_dir":"%s"}\n' "$CBATP_R-worktrees" > "$CBATP/.claude/.claude-build.json"
+cb "$CBATP" attach
+ck_exit "a configured project with no build running is refused" 1 "$RC"
+ck_has  "...naming the registry it read" "~/.claude/sessions/"
+ck_has  "...and saying attach never starts a build" "it never starts one"
+
+# The whole observer half, through --dry-run: adoption, and the three things it
+# must NOT do.
+mkdir -p "$CBH/.claude/sessions"
+printf '{"pid":4242,"sessionId":"11111111-2222-3333-4444-555555555555","cwd":"%s","name":"my-build","status":"busy"}\n' \
+  "$CBATP_R" > "$CBH/.claude/sessions/4242.json"
+cb "$CBATP" attach --dry-run
+ck_exit "attach with one running build proceeds" 0 "$RC"
+ck_has  "...adopting that session's name and id and pid" \
+        "would adopt    build session my-build (id 11111111-2222-3333-4444-555555555555, pid 4242)"
+ck_has  "...binding the watcher to a run of its own" "would create"
+ck_has  "...with its own shift id" "would use      shift id"
+ck_has  "...and seeding the BUILD document" "swarm-loop-BUILD-cbattachproj-OPEN.md"
+ck_has  "...starting the restricted watchdog" "(watchdog, read-only profile)"
+ck_has  "...and saying what it will not touch" \
+        "would NOT touch"
+ck_has  "...naming the worktree probe it deliberately skips" \
+        "would NOT run the worktree probe"
+ck_has  "...and re-probing the guard rather than trusting the marker" \
+        "an install marker is not a live guard"
+ck_hasnt "...it does not start a fixer" "(fixer, writes only its copy)"
+ck_hasnt "...it does not bind a build session name of its own" "would bind"
+ck_hasnt "...and it never reaches the launch step" "7. Launch"
+ck "...and wrote nothing under --dry-run" "absent" \
+   "$([ -e "$CBH/claude-build/runs" ] && echo present || echo absent)"
+
+# A watchdog is not a build. Its own tmux session runs with cwd == the project.
+printf '{"pid":4444,"sessionId":"88888888-2222-3333-4444-555555555555","cwd":"%s","name":"cb-watch-x-1","status":"busy"}\n' \
+  "$CBATP_R" > "$CBH/.claude/sessions/4444.json"
+cb "$CBATP" attach --dry-run
+ck_exit "a watchdog sharing the cwd does not make attach ambiguous" 0 "$RC"
+ck_has  "...the build is still the one adopted" "id 11111111-2222-3333-4444-555555555555"
+rm -f "$CBH/.claude/sessions/4444.json"
+
+# Two builds: refuse.
+printf '{"pid":4343,"sessionId":"99999999-2222-3333-4444-555555555555","cwd":"%s","name":"other","status":"busy"}\n' \
+  "$CBATP_R" > "$CBH/.claude/sessions/4343.json"
+cb "$CBATP" attach --dry-run
+ck_exit "two candidate sessions refuse rather than guess" 1 "$RC"
+ck_has  "...listing both" "2 live sessions are running in"
+rm -f "$CBH/.claude/sessions/4343.json"
+
+# tmux holds the watcher, so its absence is a preflight refusal for attach too.
+cb_no_tmux "$CBATP" attach --dry-run
+ck_exit "attach with no tmux is refused at preflight" 1 "$RC"
+ck_has  "...naming tmux and the verb that needs it" "tmux not on PATH"
+
+# There is exactly ONE watchdog launch line in the launcher, and attach shares
+# it. A second copy is a second permission profile free to drift from the
+# first, and the profile IS the read-only guarantee.
+ck "attach did not add a second observer launch line" "2" \
+   "$(grep -c '^exec claude --restricted' "$CB_SRC")"
+ck "...nor a fourth exec-claude of any kind" "3" \
+   "$(grep -c '^exec claude ' "$CB_SRC")"
+ck "the watchdog launch script is generated in exactly one place" "1" \
+   "$(grep -c 'cat > "\$STATE_DIR/watchdog-launch.sh" <<LAUNCH_EOF' "$CB_SRC")"
+# attach must not write the build's launch record: it did not launch the build.
+ck "attach writes no build-launch record" "1" \
+   "$(grep -c '> "\$STATE_DIR/build-launch.sh"' "$CB_SRC")"
+# The ledger says HOW the build got there. 'attached' is neither 'yes' (this
+# script started it) nor 'no' (nobody has) — and both of those already carry a
+# meaning a watchdog reasons from.
+ck "the ledger records an attached build as its own third state" "1" \
+   "$(grep -c 'BUILD_LAUNCHED=attached' "$CB_SRC")"
+ck "...leaving the launched branch alone" "1" \
+   "$(grep -c 'BUILD_LAUNCHED=yes' "$CB_SRC")"
+ck "...and the not-launched one" "1" \
+   "$(grep -c 'BUILD_LAUNCHED=no' "$CB_SRC")"
+# The help has to describe the verb, or nobody finds it.
+cb --help
+ck_has "--help lists the attach verb in USAGE" "claude-build [DIR] attach"
+ck_has "...and explains that it adopts the running session" "ADOPTS that"
+ck_has "...and what it refuses to do" "does NOT run the worktree"
+ck_has "...and that watch-fix's copy carries the contract producer leg" \
+       "build-docs/references/templates.md"
+rm -f "$CBH/.claude/sessions"/*.json
+
+# ===========================================================================
+section "claude-build: --issues reads a closure marker only where it means one"
+
+# W09031949-09. --issues built `blob = title + body` and substring-searched it
+# for "[RESOLVED]"/"[RETRACTED]", so ANY entry whose PROSE quoted a marker was
+# classified closed and silently dropped from the backlog. Measured on the live
+# document: every recorded entry read **[VERIFIED]** in its status position and
+# --issues still withheld the two that discussed the convention — one of them
+# the HIGH reporting that entries were disappearing. The bug hid the report of
+# itself.
+CBISS="$CBH/claude-build/observations"; mkdir -p "$CBISS"
+cat > "$CBISS/swarm-loop-HARNESS-OPEN.md" <<'ISSUES'
+# harness issues
+
+Status markers: `[VERIFIED]`, `[RESOLVED]`, `[RETRACTED]`.
+
+## W09039901-01 · defect — PLAINOPEN an ordinary open entry
+**[VERIFIED]** severity: HIGH
+evidence: something measured.
+fix: something small.
+
+## W09039901-02 · defect — QUOTINGOPEN an entry whose PROSE discusses the markers
+**[VERIFIED]** severity: HIGH
+evidence: `--issues` treated any entry mentioning `[RESOLVED]` or `[RETRACTED]`
+as closed. Nobody may mark another shift's entry `[RESOLVED]` on their reading.
+fix: anchor the match to the status line.
+
+## W09039901-03 · defect — STATUSCLOSED marked in its status position
+**[RESOLVED]** severity: MEDIUM
+evidence: it was fixed and measured.
+
+## W09039901-04 · defect — ARCHIVEDCLOSED, the by-the-owner form
+**[RESOLVED]** by the skill-owner session at 21:00 after re-measuring.
+
+## W09039901-05 · inefficiency — RETRACTEDENTRY, marker in its status position
+**[RETRACTED]** severity: LOW
+evidence: the measurement was wrong.
+ISSUES
+cb --issues
+ck_exit "--issues reads the document" 0 "$RC"
+ck_has "an entry that merely QUOTES a marker in prose stays OPEN" "QUOTINGOPEN"
+ck_has "...and an ordinary open entry is open" "PLAINOPEN"
+ck_hasnt "an entry marked in its status position is withheld" "STATUSCLOSED"
+ck_hasnt "...the archived '**[RESOLVED]** by ...' form is withheld too" "ARCHIVEDCLOSED"
+ck_hasnt "...and a retraction in its status position" "RETRACTEDENTRY"
+ck_has "the arithmetic matches: 2 open of 5 recorded" "2 OPEN | 3 resolved/retracted | 5 recorded"
+# The silent half: a count alone cannot show a WRONG classification. Which
+# entries were withheld has to be on screen.
+ck_has "the withheld ids are named, not just counted" "withheld as closed"
+ck_has "...naming the entry and the marker that closed it" "W09039901-03 [RESOLVED]"
+ck_has "...the archived one" "W09039901-04 [RESOLVED]"
+ck_has "...and the retraction, by its own marker" "W09039901-05 [RETRACTED]"
+
+# A document with nothing closed must say so out loud, so "0 withheld" is a
+# statement rather than an absence.
+cat > "$CBISS/swarm-loop-HARNESS-OPEN.md" <<'ISSUES2'
+## W09039902-01 · defect — QUOTINGONLY, open and quoting `[RESOLVED]` in prose
+**[VERIFIED]** severity: HIGH
+evidence: the convention says `[RESOLVED]` entries are DELETED, not archived.
+ISSUES2
+cb --issues
+ck_has "every recorded entry open: the count says so" "1 OPEN | 0 resolved/retracted | 1 recorded"
+ck_has "...and the withheld line says so in words" \
+       "withheld as closed: none — every recorded entry is OPEN"
+ck_has "...with the quoting entry listed" "QUOTINGONLY"
+
+# All closed: the no-open branch must name them too, or a fully-withheld
+# document is indistinguishable from an empty one.
+cat > "$CBISS/swarm-loop-HARNESS-OPEN.md" <<'ISSUES3'
+## W09039903-01 · defect — ALLCLOSED
+**[RESOLVED]** severity: HIGH
+ISSUES3
+cb --issues
+ck_has "a fully resolved document reports no open issues" "no OPEN issues"
+ck_has "...and still names what it withheld" "W09039903-01 [RESOLVED]"
+rm -f "$CBISS/swarm-loop-HARNESS-OPEN.md"
 
 # ===========================================================================
 cd / 2>/dev/null || true

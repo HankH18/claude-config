@@ -41,6 +41,11 @@ LAUNCH=1 ; IN_TREE=0 ; DRY=0 ; QUIET=0 ; MODE=install ; PURGE=0
 # uninstall); WATCH says how many SESSIONS the run gets. They are orthogonal,
 # so they get separate variables — "" | watch | watch-fix | full-auto.
 WATCH="" ; AUTHORITY=0 ; CTO_ROLE=""
+# `attach` is a MODE, and MODE is set by several arms that would otherwise
+# overwrite each other in silence — `--uninstall attach` and `attach
+# --uninstall` would both run whichever came last. Remember that attach was
+# asked for, so the cross-flag check below can say so instead.
+ATTACH=0
 
 # The one-line sentinel that says hooks/git-guard.py has grown the authorization
 # gate full-auto is built on. Until that string appears in the guard, full-auto
@@ -52,6 +57,7 @@ GATE_SENTINEL="CLAUDE_BUILD_AUTHORIZATION_GATE"
 # flow that used to define it.
 RUNS="$HOME/claude-build/runs"            # per-run scaffolding, not a document
 OBS="$HOME/claude-build/observations"     # documents a person reads
+PROJ_ROOT="$HOME/.claude/projects"        # where Claude Code keeps transcripts
 
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 ok()   { [ "$QUIET" = 1 ] || printf '  \033[32m✓\033[0m %s\n' "$*"; }
@@ -459,6 +465,18 @@ allow += ["Edit(" + g(obs) + ")", "Edit(" + g(state) + ")"]
 if role == "fixer":
     allow += ["Edit(" + g(work) + ")", "Read(" + g(work) + ")"]
 
+# The copied contract producer leg, at <state>/build-docs/references/templates.md.
+# The workspace carries it so the contract battery can run at all — and that
+# file is an INPUT the battery measures the skill against. Edit(<state>/**) is
+# granted to BOTH roles for their notebooks, which without this would hand the
+# fixer write access to the very document its own gate compares the skill to:
+# it could turn run-tests.sh green by rewriting the producer rather than the
+# skill, and nothing downstream could tell the difference. Deny beats allow, so
+# this narrows the notebook grant exactly the way the watchdog's
+# skill/skill-baseline carve-out below does. Neither role writes it. Derived
+# from `state`, so it is inert under plain `watch`, where the path never exists.
+deny += ["Edit(" + g(state + "/build-docs") + ")"]
+
 cto = os.environ.get("CTO_DIR", "")
 if role == "watchdog" and os.environ.get("CTO_ROLE") == "watchdog":
     # The CTO hat, under `all`. The store sits outside every directory the
@@ -526,6 +544,172 @@ with open(tmp, "w") as f:
 os.replace(tmp, out)
 print("OK:" + out)
 PY_RUNJSON_EOF
+
+# `attach`: find the ONE build session already running in this project, so its
+# name, id and pid can be ADOPTED. Minting fresh ones is what would make attach
+# useless — peers.sh and wait-build.sh both resolve the build by the id in
+# run.json, so an invented id yields a watcher that reports NOT-REGISTERED
+# forever about a build that is demonstrably alive.
+#
+# Emits exactly one line: OK:<sid>|<name>|<pid>|<status>|<watcher-names,...>
+# or FATAL:<why>. Ambiguity is never resolved by picking one — a watcher bound
+# to the wrong session is worse than no watcher, because it looks armed.
+read -r -d '' PY_ATTACH <<'PY_ATTACH_EOF' || true
+import json, os, re, sys
+
+proj = os.environ["DIR"]
+runs = os.environ["RUNS"]
+reg = os.path.join(os.path.expanduser("~"), ".claude", "sessions")
+
+
+def records():
+    out = []
+    try:
+        names = sorted(os.listdir(reg))
+    except OSError:
+        return out
+    for fn in names:
+        if not fn.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(reg, fn)) as f:
+                out.append(json.load(f))
+        except Exception:
+            continue          # a record being rewritten is not an error
+    return out
+
+
+live = records()
+live_ids = set(r.get("sessionId") for r in live if r.get("sessionId"))
+
+# Every session claude-build has ever started, so an OBSERVER is never adopted
+# as the build it is observing. The watchdog's tmux session is started with
+# `-c "$DIR"`, so its cwd is the project too and cwd alone cannot tell them
+# apart.
+observers = set()
+builds = {}
+if os.path.isdir(runs):
+    for rid in sorted(os.listdir(runs)):
+        try:
+            with open(os.path.join(runs, rid, "run.json")) as f:
+                rj = json.load(f)
+        except Exception:
+            continue
+        for k in ("watch_session_id", "fix_session_id"):
+            if rj.get(k):
+                observers.add(rj[k])
+        if rj.get("build_session_id"):
+            builds.setdefault(rj["build_session_id"], []).append(rj)
+
+cands = []
+for r in live:
+    sid = r.get("sessionId")
+    if not sid or r.get("cwd") != proj:
+        continue
+    if sid in observers:
+        continue
+    if re.match(r"^cb-(watch|fix)-", r.get("name") or ""):
+        continue
+    cands.append(r)
+
+# A session THIS launcher minted for THIS project is the strongest evidence
+# available, so it breaks a tie the registry alone cannot.
+strong = [r for r in cands
+          if any(rj.get("dir") == proj for rj in builds.get(r["sessionId"], []))]
+if len(strong) == 1:
+    cands = strong
+
+if not cands:
+    print("FATAL:no live Claude Code session is running in " + proj + "\n"
+          "  attach observes a build that already exists; it never starts one.\n"
+          "  The registry at ~/.claude/sessions/ lists no session whose cwd is\n"
+          "  that directory. Start the build first (claude-build " + proj + "),\n"
+          "  or use `claude-build " + proj + " watch` to start both together.")
+    sys.exit(3)
+if len(cands) > 1:
+    rows = ["    %s  (pid %s, id %s)" % (r.get("name") or "?", r.get("pid"),
+                                         r.get("sessionId")) for r in cands]
+    print("FATAL:%d live sessions are running in %s and attach will not guess "
+          "which is the build:\n%s\n"
+          "  A watcher bound to the wrong session looks armed and watches "
+          "nothing. Close the ones that are not the build, then rerun."
+          % (len(cands), proj, "\n".join(rows)))
+    sys.exit(3)
+
+r = cands[0]
+sid = r["sessionId"]
+# The name is the messaging address the watchdog uses to reach the build, so a
+# nameless record falls back to the id rather than to an empty string, which
+# peers.sh would silently skip.
+name = r.get("name") or sid
+pid = str(r.get("pid") or "")
+
+# Watchers already bound to this exact build, by BOTH signals: a live registry
+# entry here, and the tmux names handed back for the caller to check.
+already, names = [], []
+for rj in builds.get(sid, []):
+    w, wn = rj.get("watch_session_id"), rj.get("watch_session_name")
+    if wn:
+        names.append(wn)
+    if w and w in live_ids:
+        already.append(wn or w)
+if already:
+    print("FATAL:a watcher is already attached to %s: %s.\n"
+          "  Attach to it with:  tmux attach -t %s\n"
+          "  A second watcher files the same findings into the same documents "
+          "under a different shift prefix, which is how one defect ends up with "
+          "two ids." % (name, ", ".join(already), already[0]))
+    sys.exit(3)
+
+print("OK:%s|%s|%s|%s|%s" % (sid, name, pid, r.get("status", "?"),
+                             ",".join(names)))
+PY_ATTACH_EOF
+
+# `attach`'s grant probe. READ, not exercised: the install's worktree probe adds
+# a worktree and a branch, and attach runs against a repo with a build live in
+# it — a probe checkout would appear in that build's own `git worktree list`.
+# So the grant is verified where it actually takes effect, in the settings file
+# the session will read, rather than trusted from the install manifest.
+read -r -d '' PY_ATTACH_GRANT <<'PY_ATTACH_GRANT_EOF' || true
+import json, os, sys
+
+path, wt = os.environ["SETTINGS"], os.environ["WT"]
+try:
+    with open(path) as f:
+        d = json.load(f) or {}
+except Exception as e:
+    print("FATAL:cannot read %s (%s) — the install is gone or broken" % (path, e))
+    sys.exit(3)
+
+probs = []
+if d.get("disableAllHooks") is True:
+    probs.append('%s sets "disableAllHooks": true, which kills the git-guard'
+                 % path)
+
+pre = (d.get("hooks") or {}).get("PreToolUse") or []
+found = False
+for e in pre:
+    if not isinstance(e, dict):
+        continue
+    for h in e.get("hooks") or []:
+        if isinstance(h, dict) and "git-guard.py" in str(h.get("command", "")):
+            found = True
+if not found:
+    probs.append("no git-guard PreToolUse hook survives in %s" % path)
+
+adds = (d.get("permissions") or {}).get("additionalDirectories") or []
+if wt not in adds:
+    probs.append("the worktree directory %s is no longer granted in %s" % (wt, path))
+if not os.path.isdir(wt):
+    probs.append("the granted worktree directory %s does not exist" % wt)
+elif not os.access(wt, os.W_OK):
+    probs.append("the granted worktree directory %s is not writable" % wt)
+
+if probs:
+    print("FATAL:" + "; ".join(probs))
+    sys.exit(3)
+print("OK:git-guard hook live in settings, worktree grant intact at " + wt)
+PY_ATTACH_GRANT_EOF
 
 # Dropped into the run's state directory as runinfo.py and wrapped by three
 # one-line shell scripts, so the observers' permission profiles can allow those
@@ -741,6 +925,7 @@ claude-build — open a Claude Code session preconfigured for a swarm-loop run.
 USAGE
   claude-build [DIR] [options]
   claude-build [DIR] watch|watch-fix|full-auto|all [options]
+  claude-build [DIR] attach
   claude-build [DIR] --uninstall
   claude-build --uninstall-self
   claude-build --sessions
@@ -761,7 +946,13 @@ SESSION TOPOLOGY (modifiers — bare word or --flag, both accepted)
   watch-fix            Everything `watch` does, plus a third session: a FIXER
                        that watches the harness document and fixes what is
                        obviously fixable — in a COPY of the skill, never in the
-                       live one, and never as a commit.
+                       live one, and never as a commit. The copy is made
+                       RUNNABLE: the contract battery's producer leg
+                       (build-docs/references/templates.md, a SIBLING skill) is
+                       copied beside it, because tests/run.sh preflights that
+                       path and aborts the whole suite without it. The fixer
+                       may read that leg and may not write it — it is an input
+                       its own gate measures the skill against.
   full-auto            `watch`'s TWO sessions, with the watcher also wearing
                        a CTO hat: it may authorize non-destructive operations
                        the guard blocked pending review.
@@ -780,8 +971,32 @@ SESSION TOPOLOGY (modifiers — bare word or --flag, both accepted)
                        happening. They exit 3 naming what is missing.
                        See references/watch-sessions.md.
 
+ATTACH TO A BUILD ALREADY RUNNING (bare word or --flag, both accepted)
+  attach               Start a WATCHDOG against a build that is already
+                       running in DIR, and nothing else. It ADOPTS that
+                       session's name, id and pid — discovered from the
+                       project's install marker and the session registry at
+                       ~/.claude/sessions/ — so peers.sh and wait-build.sh
+                       resolve the real build rather than an invented id.
+                       It provisions ONLY the observer half: the run
+                       directory, run.json, a shift id, the BUILD document and
+                       the restricted watchdog session. It does NOT rewrite
+                       .claude/settings.local.json, does NOT run the worktree
+                       probe (a build is live in that repo), and never starts
+                       or touches the build.
+                       It DOES re-probe the git-guard and the worktree grant
+                       first: the marker proves an install happened once, not
+                       that it is live now, and a probe is what establishes a
+                       guard here.
+                       Refuses if no build is running in DIR, if more than one
+                       session is and it cannot tell which, or if a watcher is
+                       already attached to that build.
+                       This is the supported alternative to hand-starting an
+                       observer, which forfeits the whole --restricted profile.
+
   NOTE  A modifier is a bare word, so a project directory literally named
-        `watch`, `watch-fix`, `full-auto` or `all` must be written `./watch`.
+        `watch`, `watch-fix`, `full-auto`, `all` or `attach` must be written
+        `./watch`.
 
   NOTE  `watch-fix` and `--audit-loops N` are different mechanisms that happen
         to share a word. `--audit-loops` is the skill's ACT TWO: whole-codebase
@@ -859,6 +1074,10 @@ WATCHERS
   A watcher is read-only with respect to the build repo, its worktrees, the
   transcript directory and the live skill — enforced by its permission profile,
   measured by attacking it. See references/watch-sessions.md.
+
+  `attach` gives a build you started yourself the same watcher on the same
+  profile. Hand-starting an observer instead is what put an unrestricted
+  session, holding write access and an Agent tool, inside a live build repo.
 HELP_TEXT
   exit 0
 }
@@ -899,6 +1118,13 @@ while [ $# -gt 0 ]; do
     all|--all)              [ -n "$WATCH" ] && [ "$WATCH" != all ] \
                               && die "two topology modifiers given: $WATCH and $1"
                             WATCH=all; shift ;;
+    # attach is a MODE, not a topology: it provisions the observer half against
+    # a build that already exists and starts nothing else. Same bare-word/flag
+    # treatment as the modifiers, and for the same reason — the `*)` arm would
+    # otherwise take `attach` for a directory name and create one.
+    attach|--attach)        [ "$MODE" != install ] \
+                              && die "attach cannot be combined with $MODE — they are different verbs, and one of them would have won silently"
+                            ATTACH=1; MODE=attach; LAUNCH=0; shift ;;
     -*)               die "unknown option: $1  (claude-build --help)" ;;
     *)                [ -n "$DIR" ] && die "more than one directory given: $DIR and $1"
                       DIR="$1"; shift ;;
@@ -917,6 +1143,21 @@ fi
 # does the opposite — a full INSTALL — with no hint that the flag did nothing.
 if [ "$PURGE" = 1 ] && [ "$MODE" != uninstall ]; then
   die "--purge only means anything with --uninstall (you asked for: $MODE)"
+fi
+# Two MODE-setting words on one line used to mean "whichever came last wins",
+# with nothing said. `claude-build ~/proj --uninstall attach` would then ATTACH
+# and `attach --uninstall` would UNINSTALL, from lines that read the same.
+if [ "$ATTACH" = 1 ] && [ "$MODE" != attach ]; then
+  die "attach cannot be combined with $MODE — they are different verbs, and one of them would have won silently"
+fi
+# The build knobs configure a build. attach does not start one, so accepting
+# them silently would read as "attach and run two audit loops" and deliver an
+# observer — the same do-nothing-quietly failure as --purge above.
+if [ "$MODE" = attach ]; then
+  [ -n "$SPEC" ]        && die "--spec configures a build; attach observes one that is already running"
+  [ -n "$AUDIT_LOOPS" ] && die "--audit-loops configures a build; attach observes one that is already running"
+  [ -n "$MAX_CYCLES" ]  && die "--max-cycles configures a build; attach observes one that is already running"
+  [ "$IN_TREE" = 1 ]    && die "--in-tree decides where a build's worktrees go; attach reads that from the install manifest"
 fi
 
 # ------------------------------------------------------ the full-auto gate
@@ -1015,18 +1256,42 @@ for ln in txt:
         ents.append(cur)
     elif cur is not None:
         cur["body"].append(ln)
-closed = ("[RESOLVED]", "[RETRACTED]")
-open_, done = [], 0
+# A closure marker counts ONLY in its documented position: the entry's status
+# line, `**[RESOLVED]** ...` / `**[RETRACTED]** ...` at the start of a line.
+# This used to substring-search title+body for "[RESOLVED]"/"[RETRACTED]", so
+# ANY entry whose PROSE quoted a marker was filed as closed and silently
+# dropped from the backlog. Measured on the live document: 9 entries, every one
+# of them reading `**[VERIFIED]**` in its status position, reported as
+# "7 OPEN | 2 resolved/retracted" — the two withheld being exactly the two that
+# discussed the convention, one of them the HIGH reporting that entries vanish.
+# The archived form appends "**[RESOLVED]** by the skill-owner session ..." at
+# line start too, so an anchored match still catches genuinely closed entries.
+CLOSED_RE = re.compile(r'^\*\*\[(RESOLVED|RETRACTED)\]')
+open_, done = [], []
 for e in ents:
-    blob = e["title"] + " " + "\n".join(e["body"])
-    if any(k in blob for k in closed):
-        done += 1
+    mark = None
+    for ln in e["body"]:
+        m = CLOSED_RE.match(ln)
+        if m:
+            mark = m.group(1)
+            break
+    if mark:
+        done.append("%s [%s]" % (e["id"], mark))
     else:
         open_.append(e)
+# Say WHICH entries were withheld, never just how many. An arithmetic line is
+# not auditable: the count above was wrong for the life of this document and
+# nothing on screen could show it.
+withheld = ("  withheld as closed (status line, not a mention in prose): "
+            + ", ".join(done)) if done else \
+           "  withheld as closed: none — every recorded entry is OPEN"
 if not open_:
-    print("\n  no OPEN issues - %d recorded, all resolved or retracted" % done)
+    print("\n  no OPEN issues - %d recorded, all resolved or retracted" % len(done))
+    print(withheld)
 else:
-    print("\n  %d OPEN | %d resolved/retracted | %d recorded\n" % (len(open_), done, len(ents)))
+    print("\n  %d OPEN | %d resolved/retracted | %d recorded"
+          % (len(open_), len(done), len(ents)))
+    print(withheld + "\n")
     for e in open_:
         t = e["title"]
         print("  %-16s %s" % (e["id"], t if len(t) <= 96 else t[:93] + "..."))
@@ -1078,7 +1343,15 @@ if [ "$MODE" = sessions ]; then
         printf '    %-9s gone   %s\n' "$ROLE" "$NAME"
       fi
     done
-    [ -n "$BN" ] && printf '    %-9s %s   (exec\x27d into the terminal you launched from, never tmux)\n' "build" "$BN"
+    # An attach run did NOT start the build, and saying it exec'd one would be
+    # this listing inventing a history for a session it only observed.
+    if [ -n "$BN" ]; then
+      if [ "$TOPO" = attach ]; then
+        printf '    %-9s %s   (adopted — already running when the watcher attached; claude-build never started it)\n' "build" "$BN"
+      else
+        printf '    %-9s %s   (exec\x27d into the terminal you launched from, never tmux)\n' "build" "$BN"
+      fi
+    fi
     [ -f "$SDIR/teardown.sh" ] && printf '    %-9s bash %s\n' "teardown" "$SDIR/teardown.sh"
   done
   [ "$FOUND" = 0 ] && warn "no runs recorded under $RUNS"
@@ -1112,13 +1385,19 @@ command -v git     >/dev/null || die "git not on PATH"
 # capture-pane, and the human can `tmux attach` to watch or type. Nothing else
 # available here does all four.
 TPL_DIR="$SKILL/templates"
-if [ -n "$WATCH" ]; then
-  command -v tmux >/dev/null || die "tmux not on PATH — $WATCH needs it to hold the watcher sessions (brew install tmux)"
+if [ -n "$WATCH" ] || [ "$MODE" = attach ]; then
+  NEEDS_TMUX="${WATCH:-attach}"
+  command -v tmux >/dev/null || die "tmux not on PATH — $NEEDS_TMUX needs it to hold the watcher sessions (brew install tmux)"
   for t in watchdog-prompt.md obs-harness.md obs-build.md; do
     [ -f "$TPL_DIR/$t" ] || die "missing template $TPL_DIR/$t — is the swarm-loop skill complete?"
   done
-  [ "$WATCH" = watch ] || [ -f "$TPL_DIR/fixer-prompt.md" ] \
-    || die "missing template $TPL_DIR/fixer-prompt.md — is the swarm-loop skill complete?"
+  # Only the fixer topology needs the fixer's brief. attach starts a watchdog
+  # and nothing else, so demanding it there would be a refusal over a template
+  # nothing in the run will read.
+  if [ "$WATCH" = watch-fix ]; then
+    [ -f "$TPL_DIR/fixer-prompt.md" ] \
+      || die "missing template $TPL_DIR/fixer-prompt.md — is the swarm-loop skill complete?"
+  fi
 fi
 
 DIR="${DIR:-$PWD}"
@@ -1200,6 +1479,378 @@ if [ -n "$SPEC" ]; then
   elif [ -f "$DIR/$SPEC" ];   then SPEC="$DIR/$SPEC"
   else die "--spec: no such file — tried '$SPEC' and '$DIR/$SPEC'"
   fi
+fi
+
+# =============================================== shared probes + provisioning
+# Everything below is used by MORE THAN ONE entry point — the install flow and
+# the `attach` verb — so it lives here as functions rather than being written
+# twice. That is not tidiness: a second copy of the watchdog's launch line is a
+# second permission profile free to drift from the first, and the profile IS
+# the read-only guarantee an observer rests on. There is exactly ONE
+# `exec claude --restricted` for the watchdog in this file, and
+# tests/test_harness.sh counts them.
+
+# settings.local.json is not the only file that can turn the guard off, and it
+# was the only one this script ever looked at. A project .claude/settings.json —
+# or the user-level ~/.claude/settings.json — carrying "disableAllHooks": true
+# leaves the session with NO hooks at all, and every guard probe still comes
+# back green, because those probes pipe JSON straight into git-guard.py and
+# never go through the settings harness that reads these files. Green checks
+# over a dead guard is the worst failure this script can produce, so look, say
+# so loudly, and let the caller refuse. Sets HOOKS_OFF_AT.
+scan_hooks_off() {
+  local other state
+  HOOKS_OFF_AT=""
+  for other in "$DIR/.claude/settings.json" "$HOME/.claude/settings.json"; do
+    [ -f "$other" ] || continue
+    state="$(OTHER="$other" python3 -c '
+import json, os
+try:
+    d = json.load(open(os.environ["OTHER"])) or {}
+except Exception:
+    print("unreadable"); raise SystemExit
+print("off" if d.get("disableAllHooks") is True else "ok")' 2>/dev/null || echo unreadable)"
+    case "$state" in
+      off) HOOKS_OFF_AT="$other"
+           warn "$other sets \"disableAllHooks\": true"
+           warn "  that switch kills EVERY hook for the session — including the git-guard"
+           warn "  in settings.local.json — and it outlives this script."
+           warn "  Remove that key from $other, then rerun." ;;
+      unreadable) warn "could not parse $other — check it by hand for disableAllHooks" ;;
+    esac
+  done
+}
+
+probe_guard() {  # probe_guard <command-text> -> the guard's exit code
+  printf '%s' "$1" \
+    | python3 -c 'import json,sys;print(json.dumps({"tool_name":"Bash","tool_input":{"command":sys.stdin.read()}}))' \
+    | python3 "$GUARD" >/dev/null 2>&1
+  echo $?
+}
+
+# The three cases that separate "a guard file exists" from "the guard is loaded
+# and answering". Returns nonzero if any of them is wrong.
+probe_guard_trio() {
+  local r rc=0
+  r="$(cd "$DIR" && probe_guard 'git stash')"
+  [ "$r" = 2 ] && ok "guard BLOCKS 'git stash' (exit 2)" || { warn "guard did NOT block 'git stash' (exit $r)"; rc=1; }
+  r="$(cd "$DIR" && probe_guard 'git status --porcelain')"
+  [ "$r" = 0 ] && ok "guard ALLOWS 'git status' (exit 0)" || { warn "guard blocked a read-only command (exit $r)"; rc=1; }
+  r="$(cd "$DIR" && probe_guard $'git status\ngit stash')"
+  [ "$r" = 2 ] && ok "guard blocks the multi-line form (exit 2)" || { warn "multi-line bypass is open (exit $r)"; rc=1; }
+  return "$rc"
+}
+
+render_tpl() {  # render_tpl <template-basename> <out-path>
+  local out
+  out="$(TPL="$TPL_DIR/$1" OUT_PATH="$2" python3 -c "$PY_RENDER")" || true
+  case "$out" in
+    OK:*)    return 0 ;;
+    FATAL:*) die "${out#FATAL:}" ;;
+    *)       die "rendering $1 failed: ${out:-no output}" ;;
+  esac
+}
+
+# A session is proven up by the REGISTRY, never by the launcher's own optimism.
+# ~/.claude/sessions/<pid>.json appears ~5-8s after a launch and is removed
+# within ~6s of the process dying, so it is the one readback that distinguishes
+# "started" from "started and still alive".
+wait_registered() {  # wait_registered <tmux-name> <session-id>
+  local i=0
+  while [ "$i" -lt 45 ]; do
+    grep -qs -F -- "$2" "$HOME"/.claude/sessions/*.json 2>/dev/null && return 0
+    # TRAP: a fresh cwd sits on "Quick safety check: Is this a project you
+    # created or one you trust?" forever, producing an empty pane and no
+    # registry entry. Answer it — once, and only while it is actually on
+    # screen — for a directory this run named or this script created.
+    if tmux capture-pane -p -t "$1" 2>/dev/null | grep -q "Quick safety check"; then
+      tmux send-keys -t "$1" Down
+      sleep 1
+      tmux send-keys -t "$1" Enter
+      warn "answered the workspace-trust dialog for $1"
+    fi
+    tmux has-session -t "$1" 2>/dev/null || return 2
+    sleep 2
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# The run ledger. Every identity in the topology is written down BEFORE any
+# session starts, so no agent in it ever has to correlate a pid to a transcript
+# by timestamp. Reads the globals its callers have already set.
+write_run_json() {
+  local rj
+  rj="$(OUT_PATH="$STATE_DIR/run.json" \
+        R_RUN_ID="$RUN_ID" R_RUN_TAG="$RUN_TAG" R_TOPOLOGY="$TOPOLOGY" \
+        R_AUTHORITY="$AUTHORITY" R_SHIFT="$SHIFT_ID" R_PROJECT="$NAME" \
+        R_DIR="$DIR" R_WORKTREE_ROOT="$WT" R_SKILL="$SKILL" \
+        R_STATE_DIR="$STATE_DIR" R_OBS_DIR="$OBS" \
+        R_HARNESS_DOC="$HARNESS_DOC" R_BUILD_DOC="$BUILD_DOC" \
+        R_BUILD_SESSION_NAME="$BUILD_SESSION_NAME" R_BUILD_SESSION_ID="$BUILD_SID" \
+        R_BUILD_PID="$BUILD_PID" R_BUILD_TRANSCRIPT="$BUILD_TRANSCRIPT" \
+        R_WATCH_SESSION_NAME="$WATCH_SESSION_NAME" R_WATCH_SESSION_ID="$WATCH_SID" \
+        R_FIX_SESSION_NAME="$FIX_LABEL" R_FIX_SESSION_ID="$FIX_SID" \
+        R_WORK_DIR="$WORK_DIR" R_BUILD_LAUNCHED="$BUILD_LAUNCHED" \
+        R_CTO_ROLE="$CTO_ROLE" R_CTO_DIR="$CTO_DIR" R_CTO_LOG="$CTO_LOG" \
+        R_CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        python3 -c "$PY_RUNJSON")" || true
+  case "$rj" in
+    OK:*) ok "ledger $STATE_DIR/run.json" ;;
+    *)    die "could not write the run ledger: ${rj:-no output}" ;;
+  esac
+}
+
+write_run_helpers() {
+  local h
+  printf '%s\n' "$RUNINFO_PY" > "$STATE_DIR/runinfo.py"
+  # Executable and invoked BY PATH, never as `bash <script>`: the watchdog's
+  # profile denies every interpreter by name, so `bash x.sh` would be refused
+  # while ./x.sh runs through its own shebang.
+  for h in peers wait-build wait-harness; do
+    printf '#!/bin/sh\nexec python3 "%s/runinfo.py" %s "$@"\n' "$STATE_DIR" "$h" > "$STATE_DIR/$h.sh"
+    chmod +x "$STATE_DIR/$h.sh"
+  done
+  ok "watch helpers (peers.sh, wait-build.sh, wait-harness.sh)"
+}
+
+write_teardown() {  # write_teardown "<tmux-name> [<tmux-name>...]"
+  {
+    printf '#!/bin/sh\n# teardown for claude-build run %s. Kills the watcher\n' "$RUN_ID"
+    printf '# sessions this run started, then READS THE REGISTRY BACK: a kill\n'
+    printf '# that is only asserted is not a teardown. The build session is\n'
+    printf '# deliberately NOT touched — peer sessions are out of scope.\n'
+    printf 'for s in %s; do\n' "$1"
+    printf '  tmux kill-session -t "$s" 2>/dev/null && echo "killed $s" || echo "not running: $s"\n'
+    printf 'done\n'
+    printf 'sleep 8\n'
+    printf 'echo "registry readback (a dead session leaves within ~6s):"\n'
+    printf 'python3 "%s/runinfo.py" peers\n' "$STATE_DIR"
+  } > "$STATE_DIR/teardown.sh"
+  chmod +x "$STATE_DIR/teardown.sh"
+  ok "teardown script: bash $STATE_DIR/teardown.sh"
+}
+
+start_watchdog() {
+  local set_out rc=0
+  render_tpl watchdog-prompt.md "$STATE_DIR/watchdog-prompt.txt"
+  set_out="$(ROLE=watchdog OUT_PATH="$STATE_DIR/watchdog-settings.json" \
+             DIR="$DIR" WT="$WT" OBS="$OBS" STATE_DIR="$STATE_DIR" \
+             PROJECTS_DIR="$PROJ_ROOT" SKILL="$SKILL" GUARD="$GUARD" WORK_DIR="" \
+             CTO_ROLE="$CTO_ROLE" CTO_DIR="$CTO_DIR" \
+             python3 -c "$PY_WATCH_SETTINGS")" || true
+  case "$set_out" in
+    OK:*) ok "watchdog profile — ${set_out#OK:}" ;;
+    *)    die "watchdog profile failed: ${set_out:-no output}" ;;
+  esac
+
+  # The observer's write boundary, and why each flag is the one it is.
+  #
+  # run-permissions.md: this script shells out to the CLI, so every session it
+  # starts is OUTSIDE the build's git-guard unless provisioned. Both observers
+  # are provisioned — same guard, same matcher — and the watchdog is
+  # additionally read-only by construction.
+  #
+  # --restricted   ignores user/project/local settings so nothing widens this
+  #                profile from inside, confines the file tools to the working
+  #                directories, and refuses bypassPermissions.
+  # --tools        omits Task/Agent. The watchdog's fan-out cap is therefore
+  #                ZERO and structural, not a sentence in a prompt it can talk
+  #                itself out of — measured: with Task unnamed, no Agent tool
+  #                is present at all.
+  # acceptEdits    NOT `dontAsk`: measured, dontAsk refuses EVERY file write
+  #                including the observer's own notebook, with an explicit
+  #                allow rule in place, so a dontAsk watchdog cannot file
+  #                anything. NOT `plan`: a plan-mode session refuses
+  #                SendMessage, so a plan-mode watchdog cannot talk to anyone.
+  #                The writes that matter are shut by path denies instead.
+  cat > "$STATE_DIR/watchdog-launch.sh" <<LAUNCH_EOF
+#!/bin/bash
+# started by claude-build $RUN_ID — see run.json in this directory
+exec claude --restricted \\
+  --add-dir "$DIR" "$WT" "$OBS" "$STATE_DIR" "$PROJ_ROOT" "$SKILL" \\
+  --tools "Read,Glob,Grep,Write,Edit,Bash,Monitor,SendMessage,ListAgents" \\
+  --permission-mode acceptEdits \\
+  --settings "$STATE_DIR/watchdog-settings.json" \\
+  -n "$WATCH_SESSION_NAME" \\
+  --session-id "$WATCH_SID" \\
+  "\$(cat "$STATE_DIR/watchdog-prompt.txt")"
+LAUNCH_EOF
+  chmod +x "$STATE_DIR/watchdog-launch.sh"
+
+  tmux new-session -d -s "$WATCH_SESSION_NAME" -c "$DIR" "bash $STATE_DIR/watchdog-launch.sh"
+  wait_registered "$WATCH_SESSION_NAME" "$WATCH_SID" || rc=$?
+  case "$rc" in
+    0) ok "watchdog registered — $WATCH_SESSION_NAME (tmux: $WATCH_SESSION_NAME)" ;;
+    2) die "the watchdog's tmux session died before it registered. Read $STATE_DIR/watchdog-launch.sh and run it by hand to see why." ;;
+    *) die "the watchdog never appeared in ~/.claude/sessions/ within 90s — refusing to report an unwatched build. Inspect it with: tmux attach -t $WATCH_SESSION_NAME   (tear down: bash $STATE_DIR/teardown.sh)" ;;
+  esac
+}
+
+# ================================================================== ATTACH
+# Observe a build that is ALREADY RUNNING. Until this existed the topology
+# modifiers were legal only on a launch, so the only way to watch a build you
+# had already started was to hand-start a session — which forfeits the entire
+# --restricted profile. Measured live: an unrestricted observer ended up inside
+# a build repo holding write access AND an Agent tool, both of which its own
+# brief calls impossible. (W09031949-01, W09031949-02.)
+#
+# The identity is ADOPTED, never minted. peers.sh and wait-build.sh resolve the
+# build through run.json's build_session_id, so a fresh uuid here would produce
+# a watcher whose every readback says NOT-REGISTERED about a build that is
+# demonstrably alive — a watcher that looks armed and is watching nothing.
+if [ "$MODE" = attach ]; then
+  step "claude-build — attach an observer to the build in $NAME"
+  [ "$DRY" = 1 ] && warn "DRY RUN — nothing will be written and no session will start"
+
+  [ -f "$MANIFEST" ] || die "no claude-build install in $DIR (no $MANIFEST). attach observes a build claude-build configured; run \`claude-build $DIR\` first."
+
+  # -- 1. WHOSE build. The marker says this project was configured once; the
+  #       registry says what is running in it now, and only the registry can.
+  AT_OUT="$(DIR="$DIR" RUNS="$RUNS" python3 -c "$PY_ATTACH")" || true
+  case "$AT_OUT" in
+    OK:*)    ;;
+    FATAL:*) die "${AT_OUT#FATAL:}" ;;
+    *)       die "attach: session discovery produced no verdict (${AT_OUT:-no output})" ;;
+  esac
+  AT_REST="${AT_OUT#OK:}"
+  BUILD_SID="${AT_REST%%|*}";          AT_REST="${AT_REST#*|}"
+  BUILD_SESSION_NAME="${AT_REST%%|*}"; AT_REST="${AT_REST#*|}"
+  BUILD_PID="${AT_REST%%|*}";          AT_REST="${AT_REST#*|}"
+  BUILD_REG_STATUS="${AT_REST%%|*}";   AT_REST="${AT_REST#*|}"
+  EXISTING_WATCHERS="$AT_REST"
+  ok "adopted the running build: $BUILD_SESSION_NAME"
+  ok "  session id $BUILD_SID   pid $BUILD_PID   registry status $BUILD_REG_STATUS"
+
+  # Two independent signals for "already watched", because either alone can be
+  # wrong: the registry entry of a live session can be absent for seconds after
+  # launch, and a tmux session can outlive the process inside it.
+  for W in $(printf '%s' "$EXISTING_WATCHERS" | tr ',' ' '); do
+    [ -n "$W" ] || continue
+    if tmux has-session -t "$W" 2>/dev/null; then
+      die "a watcher is already attached to this build: tmux session $W is live.
+  Attach to it with:  tmux attach -t $W
+  A second watcher would file the same findings into the same documents under
+  a different shift prefix, which is how an issue store gets two ids for one
+  defect. List every run with: claude-build --sessions"
+    fi
+  done
+
+  # -- 2. The worktree grant, from the manifest — the one file allowed to name
+  #       it. Guessing the sibling path would be guessing at what a past
+  #       install decided, and --in-tree makes that guess wrong.
+  WT="$(MANIFEST="$MANIFEST" python3 -c '
+import json, os
+try:
+    d = json.load(open(os.environ["MANIFEST"])) or {}
+except Exception:
+    d = {}
+print(d.get("worktree_dir") or "")' 2>/dev/null || true)"
+  [ -n "$WT" ] || die "the install manifest at $MANIFEST names no worktree_dir, so there is nothing to grant the observer. Re-run \`claude-build $DIR --no-launch\` to repair the install."
+
+  # -- 3. PROBE. The marker proves an install HAPPENED; it says nothing about
+  #       whether the guard is loaded now or the grant survived an edit. This
+  #       skill's standing rule is that a probe, never a file's existence,
+  #       establishes a guard — and attach reaches a repo somebody else has been
+  #       working in for hours, so it is exactly where a stale marker lies.
+  #
+  #       The guard probes EXECUTE the guard. The grant is READ, deliberately:
+  #       the install's worktree probe creates a worktree and a branch, and this
+  #       repo has a build running in it right now — a probe checkout would turn
+  #       up in that build's own `git worktree list` and in any root-walking
+  #       metric command it runs. attach touches nothing.
+  step "Probes — an install marker is not a live guard"
+  if [ "$DRY" = 1 ]; then
+    echo "  would probe: guard blocks 'git stash' / allows 'git status' / blocks the"
+    echo "               multi-line form"
+    echo "  would read:  $SETTINGS still carries the git-guard hook and grants $WT"
+    echo "  would NOT run the worktree probe — a build is live in this repo"
+  else
+    AT_FAIL=0
+    probe_guard_trio || AT_FAIL=1
+    GRANT_OUT="$(SETTINGS="$SETTINGS" WT="$WT" python3 -c "$PY_ATTACH_GRANT")" || true
+    case "$GRANT_OUT" in
+      OK:*)    ok "${GRANT_OUT#OK:}" ;;
+      FATAL:*) warn "${GRANT_OUT#FATAL:}"; AT_FAIL=1 ;;
+      *)       warn "grant probe produced no verdict (${GRANT_OUT:-no output})"; AT_FAIL=1 ;;
+    esac
+    scan_hooks_off
+    if [ -n "$HOOKS_OFF_AT" ]; then
+      warn "disableAllHooks: true in $HOOKS_OFF_AT — the probes above cannot see this, and the guard will not run"
+      AT_FAIL=1
+    fi
+    [ "$AT_FAIL" = 1 ] && die "probes failed — refusing to attach. An observer that reports on a build it believes is guarded, when it is not, is worse than no observer."
+  fi
+
+  # -- 4. The observer half, and ONLY the observer half. No settings surgery on
+  #       the repo, no .gitignore, no git init, no worktree probe, no build.
+  step "Observer"
+  RUN_TAG="$(date +%Y%m%d-%H%M%S)"
+  SLUG="$(printf '%s' "$NAME" | tr -c 'A-Za-z0-9-' '-' | cut -c1-20)"
+  RUN_ID="$SLUG-attach-$RUN_TAG"
+  STATE_DIR="$RUNS/$RUN_ID"
+  # 'A' rather than 'W': shift ids are namespaced per session and an attached
+  # watcher must not collide with the shift of a watcher the build launched.
+  SHIFT_ID="A$(date +%m%d%H%M)"
+  TOPOLOGY=attach
+  AUTHORITY=0
+  WATCH_SID="$(python3 -c 'import uuid;print(uuid.uuid4())')"
+  WATCH_SESSION_NAME="cb-watch-$RUN_ID"
+  FIX_SID="" ; FIX_LABEL="(none — attach topology)"
+  WORK_DIR=""
+  CTO_ROLE="" ; CTO_DIR="$STATE_DIR/authority" ; CTO_LOG="$CTO_DIR/approvals.log"
+  CTO_LABEL="(none — no authorization gate in this topology)"
+  # Derived from the ADOPTED id, which is the whole point: transcript paths are
+  # cwd + session id, so an adopted id lands on the real transcript and a minted
+  # one lands on a file that will never exist.
+  BUILD_TRANSCRIPT="$PROJ_ROOT/$(printf '%s' "$DIR" | tr '/._' '---')/$BUILD_SID.jsonl"
+  HARNESS_DOC="$OBS/swarm-loop-HARNESS-OPEN.md"
+  BUILD_DOC="$OBS/swarm-loop-BUILD-$SLUG-OPEN.md"
+  BUILD_LAUNCHED=attached
+  BUILD_STATUS="claude-build did NOT start this build and does not manage it. The session above was ALREADY RUNNING and was adopted from the registry at ~/.claude/sessions/, so its name, id and pid are OBSERVATIONS rather than predictions. It was mid-run when you attached: expect a transcript that already has history, and do NOT read an early state you did not see reached as a finding."
+
+  if [ "$DRY" = 1 ]; then
+    echo "  would create   $STATE_DIR"
+    echo "  would adopt    build session $BUILD_SESSION_NAME (id $BUILD_SID, pid $BUILD_PID)"
+    echo "  would seed     $HARNESS_DOC"
+    echo "  would seed     $BUILD_DOC"
+    echo "  would use      shift id $SHIFT_ID"
+    echo "  would start    tmux session $WATCH_SESSION_NAME  (watchdog, read-only profile)"
+    echo "  would NOT touch $SETTINGS, the worktree, or the build itself"
+    echo "  nothing was written and no session was started (--dry-run)"
+    exit 0
+  fi
+
+  mkdir -p "$STATE_DIR" "$OBS" "$RUNS" "$PROJ_ROOT"
+  [ -f "$BUILD_TRANSCRIPT" ] || warn "the adopted build's transcript is not at $BUILD_TRANSCRIPT yet — wait-build.sh reads growth there and will report NOT-STARTED until it appears"
+
+  export T_RUN_ID="$RUN_ID"          T_RUN_TAG="$RUN_TAG"
+  export T_MODE="$TOPOLOGY"          T_PROJECT="$NAME"
+  export T_DIR="$DIR"                T_WT="$WT"
+  export T_OBS="$OBS"                T_STATE_DIR="$STATE_DIR"
+  export T_SKILL="$SKILL"            T_SHIFT="$SHIFT_ID"
+  export T_BUILD_NAME="$BUILD_SESSION_NAME"   T_BUILD_SID="$BUILD_SID"
+  export T_BUILD_PID="$BUILD_PID"    T_BUILD_TRANSCRIPT="$BUILD_TRANSCRIPT"
+  export T_WATCH_NAME="$WATCH_SESSION_NAME"   T_WATCH_SID="$WATCH_SID"
+  export T_FIX_NAME="$FIX_LABEL"     T_FIX_SID="$FIX_SID"
+  export T_HARNESS_DOC="$HARNESS_DOC" T_BUILD_DOC="$BUILD_DOC"
+  export T_WORK_DIR="$WORK_DIR"  T_BUILD_STATUS="$BUILD_STATUS"
+  export T_CTO_ROLE="$CTO_LABEL" T_CTO_DIR="$CTO_DIR" T_CTO_LOG="$CTO_LOG"
+
+  [ -f "$HARNESS_DOC" ] || { render_tpl obs-harness.md "$HARNESS_DOC"; ok "seeded $HARNESS_DOC"; }
+  [ -f "$BUILD_DOC" ]   || { render_tpl obs-build.md   "$BUILD_DOC";   ok "seeded $BUILD_DOC"; }
+
+  write_run_json
+  write_run_helpers
+  start_watchdog
+  write_teardown "$WATCH_SESSION_NAME"
+
+  echo
+  echo "  watchdog:  tmux attach -t $WATCH_SESSION_NAME"
+  echo "  watching:  $BUILD_SESSION_NAME (pid $BUILD_PID) — untouched, still yours"
+  echo "  tear down: bash $STATE_DIR/teardown.sh"
+  echo "  detach with ctrl-b d; list every run with claude-build --sessions"
+  exit 0
 fi
 
 # ================================================================ UNINSTALL
@@ -1319,25 +1970,7 @@ esac
 # go through the settings harness that reads these files. Four green checks over
 # a dead guard is the worst failure this script can produce, so look, say so
 # loudly, and let step 5 refuse the launch.
-HOOKS_OFF_AT=""
-for OTHER in "$DIR/.claude/settings.json" "$HOME/.claude/settings.json"; do
-  [ -f "$OTHER" ] || continue
-  OTHER_STATE="$(OTHER="$OTHER" python3 -c '
-import json, os
-try:
-    d = json.load(open(os.environ["OTHER"])) or {}
-except Exception:
-    print("unreadable"); raise SystemExit
-print("off" if d.get("disableAllHooks") is True else "ok")' 2>/dev/null || echo unreadable)"
-  case "$OTHER_STATE" in
-    off) HOOKS_OFF_AT="$OTHER"
-         warn "$OTHER sets \"disableAllHooks\": true"
-         warn "  that switch kills EVERY hook for the session — including the git-guard"
-         warn "  just written to settings.local.json — and it outlives this script."
-         warn "  Remove that key from $OTHER, then rerun." ;;
-    unreadable) warn "could not parse $OTHER — check it by hand for disableAllHooks" ;;
-  esac
-done
+scan_hooks_off
 
 step "4. .gitignore"
 GI="$DIR/.gitignore"
@@ -1384,19 +2017,8 @@ if [ "$DRY" = 1 ]; then
   echo "  would probe: guard blocks 'git stash' / allows 'git status' / blocks the"
   echo "               multi-line form; worktree add+write+read+teardown at $WT"
 else
-  probe_guard() {
-    printf '%s' "$1" \
-      | python3 -c 'import json,sys;print(json.dumps({"tool_name":"Bash","tool_input":{"command":sys.stdin.read()}}))' \
-      | python3 "$GUARD" >/dev/null 2>&1
-    echo $?
-  }
   FAIL=0
-  R="$(cd "$DIR" && probe_guard 'git stash')"
-  [ "$R" = 2 ] && ok "guard BLOCKS 'git stash' (exit 2)" || { warn "guard did NOT block 'git stash' (exit $R)"; FAIL=1; }
-  R="$(cd "$DIR" && probe_guard 'git status --porcelain')"
-  [ "$R" = 0 ] && ok "guard ALLOWS 'git status' (exit 0)" || { warn "guard blocked a read-only command (exit $R)"; FAIL=1; }
-  R="$(cd "$DIR" && probe_guard $'git status\ngit stash')"
-  [ "$R" = 2 ] && ok "guard blocks the multi-line form (exit 2)" || { warn "multi-line bypass is open (exit $R)"; FAIL=1; }
+  probe_guard_trio || FAIL=1
 
   # A grant covering reads but not writes passes the first half of this and
   # hangs the wave on the second, so probe all four operations.
@@ -1464,41 +2086,6 @@ fi
 STATE_DIR="" ; BUILD_SESSION_NAME="" ; BUILD_SID=""
 WATCH_SESSION_NAME="" ; FIX_SESSION_NAME=""
 
-render_tpl() {  # render_tpl <template-basename> <out-path>
-  local out
-  out="$(TPL="$TPL_DIR/$1" OUT_PATH="$2" python3 -c "$PY_RENDER")" || true
-  case "$out" in
-    OK:*)    return 0 ;;
-    FATAL:*) die "${out#FATAL:}" ;;
-    *)       die "rendering $1 failed: ${out:-no output}" ;;
-  esac
-}
-
-# A session is proven up by the REGISTRY, never by the launcher's own optimism.
-# ~/.claude/sessions/<pid>.json appears ~5-8s after a launch and is removed
-# within ~6s of the process dying, so it is the one readback that distinguishes
-# "started" from "started and still alive".
-wait_registered() {  # wait_registered <tmux-name> <session-id>
-  local i=0
-  while [ "$i" -lt 45 ]; do
-    grep -qs -F -- "$2" "$HOME"/.claude/sessions/*.json 2>/dev/null && return 0
-    # TRAP: a fresh cwd sits on "Quick safety check: Is this a project you
-    # created or one you trust?" forever, producing an empty pane and no
-    # registry entry. Answer it — once, and only while it is actually on
-    # screen — for a directory this run named or this script created.
-    if tmux capture-pane -p -t "$1" 2>/dev/null | grep -q "Quick safety check"; then
-      tmux send-keys -t "$1" Down
-      sleep 1
-      tmux send-keys -t "$1" Enter
-      warn "answered the workspace-trust dialog for $1"
-    fi
-    tmux has-session -t "$1" 2>/dev/null || return 2
-    sleep 2
-    i=$((i + 1))
-  done
-  return 1
-}
-
 if [ -n "$WATCH" ]; then
   step "6. Watchers ($TOPOLOGY)"
 
@@ -1507,7 +2094,6 @@ if [ -n "$WATCH" ]; then
   RUN_ID="$SLUG-$RUN_TAG"
   STATE_DIR="$RUNS/$RUN_ID"
   SHIFT_ID="W$(date +%m%d%H%M)"
-  PROJ_ROOT="$HOME/.claude/projects"
 
   # Identity is ASSIGNED, never discovered. --session-id fixes the transcript
   # name and -n fixes the messaging address, so every session's transcript path
@@ -1564,6 +2150,7 @@ if [ -n "$WATCH" ]; then
     echo "  would seed     $BUILD_DOC"
     echo "  would start    tmux session $WATCH_SESSION_NAME  (watchdog, read-only profile)"
     [ "$WATCH" = watch-fix ] && echo "  would copy     $SKILL -> $WORK_DIR"
+    [ "$WATCH" = watch-fix ] && echo "  would copy     the contract producer leg -> $STATE_DIR/build-docs/references/templates.md"
     [ "$WATCH" = watch-fix ] && echo "  would start    tmux session $FIX_SESSION_NAME  (fixer, writes only its copy)"
     echo "  would bind     the build session to -n $BUILD_SESSION_NAME"
     [ "$AUTHORITY" = 1 ] && echo "  would arm      the CTO authorization gate ($GATE_SENTINEL is declared in the guard)"
@@ -1597,90 +2184,53 @@ if [ -n "$WATCH" ]; then
     [ -f "$HARNESS_DOC" ] || { render_tpl obs-harness.md "$HARNESS_DOC"; ok "seeded $HARNESS_DOC"; }
     [ -f "$BUILD_DOC" ]   || { render_tpl obs-build.md   "$BUILD_DOC";   ok "seeded $BUILD_DOC"; }
 
-    RJ="$(OUT_PATH="$STATE_DIR/run.json" \
-          R_RUN_ID="$RUN_ID" R_RUN_TAG="$RUN_TAG" R_TOPOLOGY="$TOPOLOGY" \
-          R_AUTHORITY="$AUTHORITY" R_SHIFT="$SHIFT_ID" R_PROJECT="$NAME" \
-          R_DIR="$DIR" R_WORKTREE_ROOT="$WT" R_SKILL="$SKILL" \
-          R_STATE_DIR="$STATE_DIR" R_OBS_DIR="$OBS" \
-          R_HARNESS_DOC="$HARNESS_DOC" R_BUILD_DOC="$BUILD_DOC" \
-          R_BUILD_SESSION_NAME="$BUILD_SESSION_NAME" R_BUILD_SESSION_ID="$BUILD_SID" \
-          R_BUILD_PID="$BUILD_PID" R_BUILD_TRANSCRIPT="$BUILD_TRANSCRIPT" \
-          R_WATCH_SESSION_NAME="$WATCH_SESSION_NAME" R_WATCH_SESSION_ID="$WATCH_SID" \
-          R_FIX_SESSION_NAME="$FIX_LABEL" R_FIX_SESSION_ID="$FIX_SID" \
-          R_WORK_DIR="$WORK_DIR" R_BUILD_LAUNCHED="$BUILD_LAUNCHED" \
-          R_CTO_ROLE="$CTO_ROLE" R_CTO_DIR="$CTO_DIR" R_CTO_LOG="$CTO_LOG" \
-          R_CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-          python3 -c "$PY_RUNJSON")" || true
-    case "$RJ" in OK:*) ok "ledger $STATE_DIR/run.json" ;; *) die "could not write the run ledger: ${RJ:-no output}" ;; esac
-
-    printf '%s\n' "$RUNINFO_PY" > "$STATE_DIR/runinfo.py"
-    # Executable and invoked BY PATH, never as `bash <script>`: the watchdog's
-    # profile denies every interpreter by name, so `bash x.sh` would be refused
-    # while ./x.sh runs through its own shebang.
-    for h in peers wait-build wait-harness; do
-      printf '#!/bin/sh\nexec python3 "%s/runinfo.py" %s "$@"\n' "$STATE_DIR" "$h" > "$STATE_DIR/$h.sh"
-      chmod +x "$STATE_DIR/$h.sh"
-    done
-    ok "watch helpers (peers.sh, wait-build.sh, wait-harness.sh)"
-
-    render_tpl watchdog-prompt.md "$STATE_DIR/watchdog-prompt.txt"
-    SET_OUT="$(ROLE=watchdog OUT_PATH="$STATE_DIR/watchdog-settings.json" \
-               DIR="$DIR" WT="$WT" OBS="$OBS" STATE_DIR="$STATE_DIR" \
-               PROJECTS_DIR="$PROJ_ROOT" SKILL="$SKILL" GUARD="$GUARD" WORK_DIR="" \
-               CTO_ROLE="$CTO_ROLE" CTO_DIR="$CTO_DIR" \
-               python3 -c "$PY_WATCH_SETTINGS")" || true
-    case "$SET_OUT" in OK:*) ok "watchdog profile — ${SET_OUT#OK:}" ;; *) die "watchdog profile failed: ${SET_OUT:-no output}" ;; esac
-
-    # The observer's write boundary, and why each flag is the one it is.
-    #
-    # run-permissions.md: this script shells out to the CLI, so every session it
-    # starts is OUTSIDE the build's git-guard unless provisioned. Both observers
-    # are provisioned — same guard, same matcher — and the watchdog is
-    # additionally read-only by construction.
-    #
-    # --restricted   ignores user/project/local settings so nothing widens this
-    #                profile from inside, confines the file tools to the working
-    #                directories, and refuses bypassPermissions.
-    # --tools        omits Task/Agent. The watchdog's fan-out cap is therefore
-    #                ZERO and structural, not a sentence in a prompt it can talk
-    #                itself out of — measured: with Task unnamed, no Agent tool
-    #                is present at all.
-    # acceptEdits    NOT `dontAsk`: measured, dontAsk refuses EVERY file write
-    #                including the observer's own notebook, with an explicit
-    #                allow rule in place, so a dontAsk watchdog cannot file
-    #                anything. NOT `plan`: a plan-mode session refuses
-    #                SendMessage, so a plan-mode watchdog cannot talk to anyone.
-    #                The writes that matter are shut by path denies instead.
-    cat > "$STATE_DIR/watchdog-launch.sh" <<LAUNCH_EOF
-#!/bin/bash
-# started by claude-build $RUN_ID — see run.json in this directory
-exec claude --restricted \\
-  --add-dir "$DIR" "$WT" "$OBS" "$STATE_DIR" "$PROJ_ROOT" "$SKILL" \\
-  --tools "Read,Glob,Grep,Write,Edit,Bash,Monitor,SendMessage,ListAgents" \\
-  --permission-mode acceptEdits \\
-  --settings "$STATE_DIR/watchdog-settings.json" \\
-  -n "$WATCH_SESSION_NAME" \\
-  --session-id "$WATCH_SID" \\
-  "\$(cat "$STATE_DIR/watchdog-prompt.txt")"
-LAUNCH_EOF
-    chmod +x "$STATE_DIR/watchdog-launch.sh"
-
-    tmux new-session -d -s "$WATCH_SESSION_NAME" -c "$DIR" "bash $STATE_DIR/watchdog-launch.sh"
-    RC=0; wait_registered "$WATCH_SESSION_NAME" "$WATCH_SID" || RC=$?
-    case "$RC" in
-      0) ok "watchdog registered — $WATCH_SESSION_NAME (tmux: $WATCH_SESSION_NAME)" ;;
-      2) die "the watchdog's tmux session died before it registered. Read $STATE_DIR/watchdog-launch.sh and run it by hand to see why." ;;
-      *) die "the watchdog never appeared in ~/.claude/sessions/ within 90s — refusing to launch an unwatched build. Inspect it with: tmux attach -t $WATCH_SESSION_NAME   (tear down: bash $STATE_DIR/teardown.sh)" ;;
-    esac
+    write_run_json
+    write_run_helpers
+    start_watchdog
 
     if [ "$WATCH" = watch-fix ]; then
       # The fixer edits a COPY. The live skill is the measuring apparatus of a
       # build that is running right now, and editing it mid-run changes the
-      # instrument during the measurement. The suite locates itself by relative
-      # path (tests/run.sh says so), so the copy is fully testable. Its profile
-      # additionally DENIES edits to $SKILL, so this is enforced twice.
+      # instrument during the measurement. Its profile additionally DENIES edits
+      # to $SKILL, so that half is enforced twice.
+      #
+      # The suite does NOT locate everything it needs inside the skill tree —
+      # the comment that used to sit here said it did, and it was the
+      # justification for copying the skill alone. tests/run.sh:72 preflights
+      # `$SKILL_DIR/../build-docs/references/templates.md`, the contract
+      # battery's PRODUCER leg, which lives in a SIBLING skill. Copy the skill
+      # by itself and that path resolves inside the run directory, where nothing
+      # exists — so run.sh aborts at exit 3 having run NO battery at all, while
+      # `run.sh --guard --harness` in the same tree is fully green. The fixer's
+      # brief requires a green run-tests.sh before it may touch anything, so the
+      # missing leg is not a missing test: it is a gate that can never be
+      # satisfied, and an evening of findings deferred behind it. (W09031940f-01.)
+      #
+      # So the leg is copied too. Its destination is fixed by how the two
+      # consumers resolve it, and neither takes an override: run.sh computes
+      # SKILL_DIR from its own location and test_contract.py computes
+      # SKILLS_ROOT as <skill>/.., so the producer must sit at
+      # <parent-of-the-copy>/build-docs/references/templates.md. The copy and
+      # the baseline share one parent — $STATE_DIR — so ONE copy serves both,
+      # and it stays outside `diff -ruN skill-baseline skill` rather than
+      # doubling into it.
       cp -R "$SKILL" "$WORK_DIR"
       cp -R "$SKILL" "$STATE_DIR/skill-baseline"
+      BD_SRC="$SKILL/../build-docs/references/templates.md"
+      BD_DST="$STATE_DIR/build-docs/references/templates.md"
+      if [ -f "$BD_SRC" ]; then
+        mkdir -p "$(dirname "$BD_DST")"
+        cp "$BD_SRC" "$BD_DST"
+        ok "contract producer leg copied to $BD_DST"
+      else
+        # Loud, and not fatal: the watchdog is already registered above, and
+        # dying here would leave it running with no build to watch. Say exactly
+        # what the fixer will see instead.
+        warn "no build-docs sibling at $BD_SRC"
+        warn "  the contract battery's producer leg is therefore absent from the"
+        warn "  workspace, run-tests.sh will exit 3 at 'MISSING contract leg',"
+        warn "  and the fixer's green-suite gate cannot be satisfied."
+      fi
       ok "skill copied to $WORK_DIR ($(du -sk "$WORK_DIR" | cut -f1) KB) + pristine baseline"
       # The only way the fixer can execute the suite. It has no interpreter of
       # its own, so this wrapper is the whole of its ability to run code — and
@@ -1720,20 +2270,7 @@ LAUNCH_EOF
 
     TEARDOWN_NAMES="$WATCH_SESSION_NAME"
     [ "$WATCH" = watch-fix ] && TEARDOWN_NAMES="$WATCH_SESSION_NAME $FIX_SESSION_NAME"
-    {
-      printf '#!/bin/sh\n# teardown for claude-build run %s. Kills the watcher\n' "$RUN_ID"
-      printf '# sessions this run started, then READS THE REGISTRY BACK: a kill\n'
-      printf '# that is only asserted is not a teardown. The build session is\n'
-      printf '# deliberately NOT touched — peer sessions are out of scope.\n'
-      printf 'for s in %s; do\n' "$TEARDOWN_NAMES"
-      printf '  tmux kill-session -t "$s" 2>/dev/null && echo "killed $s" || echo "not running: $s"\n'
-      printf 'done\n'
-      printf 'sleep 8\n'
-      printf 'echo "registry readback (a dead session leaves within ~6s):"\n'
-      printf 'python3 "%s/runinfo.py" peers\n' "$STATE_DIR"
-    } > "$STATE_DIR/teardown.sh"
-    chmod +x "$STATE_DIR/teardown.sh"
-    ok "teardown script: bash $STATE_DIR/teardown.sh"
+    write_teardown "$TEARDOWN_NAMES"
     [ "$AUTHORITY" = 1 ] && ok "CTO authorization gate armed ($GATE_SENTINEL found in the guard)"
   fi
 fi
