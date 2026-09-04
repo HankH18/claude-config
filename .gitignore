@@ -14,6 +14,10 @@
 !/README.md
 !/settings.json
 !/statusline.sh
+# Global instructions loaded into every session. Versioned because a machine
+# without it loses the harness-issue entry point and every agent has to be
+# directed by hand again. Instructions only — no tokens, no transcripts.
+!/CLAUDE.md
 
 # If you start versioning custom agents/commands/hooks, uncomment:
 # !/agents/
