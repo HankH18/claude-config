@@ -3242,20 +3242,37 @@ def _scan_segment(seg: list[str], depth: int, allow_cd: bool = True) -> None:
 # sentinel present while the gate does nothing is not a state this file can be
 # left in without the gate's own tests going red.
 # ---------------------------------------------------------------------------
-# CTO AUTHORIZATION GATE — WRITTEN, NOT ARMED, NOT TESTED.
+# CTO AUTHORIZATION GATE — ARMED AND TESTED.
 #
-# The code below was authored in a session that was cut off mid-function and
-# it has ZERO test cases. `bin/claude-build` arms `full-auto` and `all` by
-# grepping this file for the exact string C-L-A-U-D-E_BUILD_AUTHORIZATION_GATE,
-# so that literal is deliberately NOT spelled here: an armed sentinel over an
-# unverified gate would turn the launcher's honest refusal into a launch, and a
-# CTO that does not really gate is a review step the operator BELIEVES is
-# happening — strictly worse than the feature not existing, which is the
-# launcher's own stated reason for refusing.
+# WHAT IT WAS, because the state it was armed OUT OF is the thing to recognise
+# again. This gate was authored by a session that was cut off part-way and left
+# with zero test cases, and it read as finished. It was not: `_REQUEST_TOOL` /
+# `_REQUEST_OPERATION` / `_REQUEST_SESSION` were declared and never assigned,
+# so `_gate_verdict` bailed at "the operation being requested could not be read
+# from the tool payload" on EVERY invocation and everything below that line —
+# the whole grant path — was unreachable. `_store_isolated`, which the comment
+# above calls the entire mechanism, was defined and called by nothing.
+# `cto_dir` was read by nothing. And `block()` stops at the first rule that
+# refuses, so a grant naming `<reviewable op> && <destructive op>` would have
+# run the destructive half unexamined. All four are fixed and pinned:
+# `_set_request` (plumbing), the isolation check in `_gate_verdict`, and
+# `_is_compound`.
 #
-# TO ARM IT, and only after it has tests: set GATE_ID to that literal string.
-# Nothing else needs to change; every reference below goes through this name.
-GATE_ID = "CTO-GATE-UNARMED-UNTESTED"
+# ARMED means the constant below is the literal string `bin/claude-build`
+# greps for, and that grep is what makes `full-auto` and `all` launchable
+# instead of exit 3. Do not set it back to a placeholder to "temporarily
+# disable" anything: it is also the schema tag every approval record carries
+# (`_is_grant`), so changing it silently invalidates every grant already
+# written — which is the correct failure direction, but is a different change
+# from disarming the launcher and should be made deliberately.
+#
+# The gate's own battery is `GATE_CASES` in tests/test_git_guard.py: the grant
+# path, single-use and replay, the destructive families refused WITH a valid
+# approval in hand, user-settings denials, self-approval in each of its
+# spellings, a poisoned/missing/unreadable/non-isolated store, and the controls
+# that show the ~3300 cases above it are unchanged and that a broken authority
+# store still cannot wedge an allowed command.
+GATE_ID = "CLAUDE_BUILD_AUTHORIZATION_GATE"
 
 # WHAT A CTO MAY DO, and the whole of it: lift a refusal this guard is holding
 # PENDING REVIEW. Bounded by REVERSIBILITY, never by how good the reasoning is.
@@ -3295,6 +3312,19 @@ GATE_ID = "CTO-GATE-UNARMED-UNTESTED"
 #       reversible, correctly signed, and unspent. The laundering loop the
 #       design doc names — the watcher suggesting an op and then approving it —
 #       is caught by the record, not prevented by it.
+#     - A grant names a COMMAND STRING, not an effect. The same string can do
+#       different things at different times (a moved worktree, a changed
+#       branch, a `$VAR` that expands elsewhere). `_is_compound` refuses the
+#       shapes where that is unbounded — anything with `&&`, `;`, `|`, a
+#       newline, a redirection or `$(...)` — because `block()` stops at the
+#       FIRST rule that refuses and the rest of a compound line is never
+#       classified at all. What remains is one simple command, re-evaluated by
+#       every rule in this file on the re-run; the gate only decides whether
+#       the ONE refusal that fired is lifted.
+#     - The identity it checks is the harness's `session_id` field, not a
+#       secret. It is written by the harness rather than the agent, which is
+#       the same permission-layer boundary as everything above and not a
+#       stronger one.
 #   Guard rail against a mistake, plus an audit trail. Not a sandbox.
 #
 # AND WHAT IT STRUCTURALLY CANNOT DO: override the user's own settings. A
@@ -3332,8 +3362,46 @@ GATE_NO_REVIEW = (
 )
 
 
+GATE_COMPOUND = (
+    "NOT AUTHORIZABLE AS WRITTEN — this is a COMPOUND command, and an approval "
+    "covers one. `block()` stops at the FIRST rule that refuses, so in "
+    "`<reviewable op> && <destructive op>` only the reviewable half is ever "
+    "classified; granting the string would run the rest of the line "
+    "unexamined, which is how a destructive operation gets through a gate that "
+    "may never authorize one. Re-run the reviewable command BY ITSELF — no "
+    "`&&`, `;`, `|`, newline, redirection or `$(...)` — and that single "
+    "command can be reviewed."
+)
+
+
 def _gate_note(text: str) -> str:
     return "CTO AUTHORIZATION: " + text
+
+
+def _is_compound(op: str) -> bool:
+    """Is this more than ONE simple command? Unanswerable -> True (deny).
+
+    THE HOLE THIS CLOSES, which is not hypothetical: exactly one refusal family
+    in this file is `Reviewable`, and `block()` exits at the first rule that
+    fires. `git -C <dirty-run> push origin main; git stash` refuses on the PUSH
+    — reviewable — so a grant naming that whole string would step aside for the
+    `git stash` too, and the scanner never even reached it to classify it. The
+    gate's bound is REVERSIBILITY, and it cannot be enforced on segments no
+    rule has looked at.
+
+    So: one command, or no grant. Narrow on purpose — the reviewable op is a
+    single `git push` and the build can always run it alone."""
+    if not isinstance(op, str) or not op.strip():
+        return True
+    if "\n" in op or "\r" in op:
+        return True
+    if "$(" in op or "`" in op:
+        return True
+    try:
+        toks = tokenize(op)
+    except Exception:
+        return True                      # cannot see the shape -> not grantable
+    return any(is_operator(t) for t in toks)
 
 
 def _run_ledger(state_dir: str):
@@ -3594,9 +3662,37 @@ def _gate_verdict(reason: str, state_dir: str) -> tuple:
         return False, _gate_note("DENIED — authority is not armed for this run.")
     run_id = _ledger_str(run, "run_id")
     log_path = _ledger_str(run, "cto_log")
-    if not run_id or not log_path:
+    cto_dir = _ledger_str(run, "cto_dir")
+    if not run_id or not log_path or not cto_dir:
         return False, _gate_note(
-            "DENIED — `run.json` names no run_id / cto_log.")
+            "DENIED — `run.json` names no run_id / cto_dir / cto_log.")
+
+    # THE ISOLATION CHECK, and it is not decoration: the whole reason the build
+    # cannot forge a grant is that the store sits outside every directory the
+    # build session was granted. A `cto_log` that has drifted INSIDE the repo,
+    # a worktree, the session root or the command's own directory is a store
+    # the requester can write, and a grant read out of one proves nothing at
+    # all. Checked on the log AND on the directory that holds it, and the log
+    # must actually be under that directory — `claude-build` writes
+    # `cto_dir=<state>/authority`, `cto_log=<cto_dir>/approvals.log`, and a
+    # ledger where those two have come apart is a ledger this gate does not
+    # understand well enough to grant from. Unanswerable -> deny.
+    try:
+        inside = _under(os.path.realpath(log_path), os.path.realpath(cto_dir))
+    except Exception:
+        inside = False
+    if not inside:
+        return False, _gate_note(
+            "DENIED — `cto_log` (" + log_path + ") is not inside `cto_dir` ("
+            + cto_dir + "). The approvals store is not where the run ledger "
+            "says it is.")
+    if not _store_isolated(log_path) or not _store_isolated(cto_dir):
+        return False, _gate_note(
+            "DENIED — the approvals store (" + log_path + ") is NOT outside "
+            "the trees the requesting session can reach. Its isolation is the "
+            "only thing that stops the build writing its own approval, so a "
+            "store inside the repo, a worktree, the session root or this "
+            "command's own directory grants nothing.")
 
     recs = _read_approvals(log_path)
     if recs is None:
@@ -3615,14 +3711,24 @@ def _gate_verdict(reason: str, state_dir: str) -> tuple:
     spent = _spent_ids(recs)
     grants = [r for r in recs if _is_grant(r, run_id, tool, operation)]
     unspent = [g for g in grants if g["id"].strip() not in spent]
+    compound = _is_compound(operation)
+
     if not grants:
         # Nothing has been approved. A REVIEWABLE refusal tells the build the
         # review path exists; a destructive one says nothing new, so its text is
-        # left exactly as it was.
-        return False, (_gate_note(GATE_ASK) if reviewable else None)
+        # left exactly as it was. A reviewable refusal on a COMPOUND command is
+        # told the truth instead of GATE_ASK — pointing it at a review that can
+        # never grant this string is exactly the false-advice failure this
+        # file's refusal text is written to avoid.
+        if not reviewable:
+            return False, None
+        return False, _gate_note(GATE_COMPOUND if compound else GATE_ASK)
 
     if not reviewable:
         return False, _gate_note(GATE_NO_REVIEW)
+
+    if compound:
+        return False, _gate_note(GATE_COMPOUND)
 
     if not unspent:
         return False, _gate_note(
@@ -3637,8 +3743,23 @@ def _gate_verdict(reason: str, state_dir: str) -> tuple:
         return False, _gate_note(
             "DENIED — this run has no session holding the CTO role.")
     cto = _identities(run, prefix)
-    requester = _identities(run, "build")
+    build_ids = _identities(run, "build")
+    requester = set(build_ids)
     if _REQUEST_SESSION:
+        # The payload NAMES the session, and the harness writes that field, not
+        # the agent. `claude-build` assigns the build's session id up front
+        # (`--session-id "$BUILD_SID"`) and writes it to `run.json` before the
+        # build starts, so the two are comparable and a mismatch means the
+        # session asking is not the one this run's grants are addressed to —
+        # the CTO itself, a fixer, or a fourth session standing in the repo.
+        # Without this the identity set was ADDITIVE: a stranger session
+        # inherited the build's identities and could spend a grant issued to
+        # the build. Deny rather than widen.
+        if _REQUEST_SESSION not in build_ids:
+            return False, _gate_note(
+                "DENIED — the requesting session (" + _REQUEST_SESSION + ") is "
+                "not this run's build session. Approvals are addressed to one "
+                "session and are not transferable.")
         requester.add(_REQUEST_SESSION)
     if not cto:
         return False, _gate_note(
@@ -3698,11 +3819,43 @@ def _gate_verdict(reason: str, state_dir: str) -> tuple:
         "DENIED — no usable approval names this operation.")
 
 
-# What the request IS, for the gate. Set once by `_main`; an approval names one
+# What the request IS, for the gate. Set once by `_set_request` below, from the
+# payload and before any rule can reach `block()`; an approval names one
 # operation and is matched against these byte for byte.
+#
+# THESE WERE DECLARED AND NEVER ASSIGNED. The session that wrote this gate was
+# cut off before it plumbed them, so `_REQUEST_OPERATION` was `None` on every
+# invocation and `_gate_verdict` bailed out at "the operation being requested
+# could not be read from the tool payload" — i.e. the grant path below it was
+# unreachable, and the gate could deny but could never grant. Nothing in the
+# file said so; it read as complete. Arming the sentinel over that state would
+# have launched `full-auto` with a CTO whose every answer is "no".
 _REQUEST_TOOL: str = "Bash"
 _REQUEST_OPERATION: str | None = None
 _REQUEST_SESSION: str | None = None
+
+
+def _set_request(tool: str, operation, session) -> None:
+    """Record WHAT is being asked, verbatim, for the gate to match approvals on.
+
+    `operation` is the command string EXACTLY as the agent submitted it, before
+    `elide_long_tokens` rewrites it for the scanner: the CTO approves a command
+    it was shown and the build re-runs that same string, so matching on the
+    guard's internal rewrite would mean approving a string nobody typed. It is
+    also the string Claude Code's own `permissions.deny` rules are matched
+    against, which is what makes `_user_denies` mean the same thing here as it
+    does to the permission layer.
+
+    Never raises: an unusable payload leaves the operation unset, and an unset
+    operation denies authorization while the refusal itself stands unchanged."""
+    global _REQUEST_TOOL, _REQUEST_OPERATION, _REQUEST_SESSION
+    try:
+        if isinstance(tool, str) and tool.strip():
+            _REQUEST_TOOL = tool.strip()
+        _REQUEST_OPERATION = operation if isinstance(operation, str) and operation else None
+        _REQUEST_SESSION = session.strip() if isinstance(session, str) and session.strip() else None
+    except Exception:
+        _REQUEST_OPERATION = None
 
 
 def _main() -> None:
@@ -3758,6 +3911,12 @@ def _main() -> None:
     if tool is not None and tool != "Bash":
         if tool in FILE_TOOLS:
             path = tool_input.get("file_path") or tool_input.get("notebook_path")
+            # Before `block()`, which is where the gate is consulted. A file
+            # tool's "operation" is the path, matching how a `Write(...)` /
+            # `Edit(...)` permission rule names one. Every refusal reachable
+            # from here is a LEDGER write, which is destructive and therefore
+            # unauthorizable — the gate will say so rather than say nothing.
+            _set_request(tool, path, data.get("session_id"))
             reason = protected_write_reason(path) if isinstance(path, str) else None
             if reason:
                 block(reason)
@@ -3768,6 +3927,11 @@ def _main() -> None:
     if not isinstance(command, str) or not command.strip():
         allow()
         return
+
+    # The RAW command, not the elided one — see `_set_request`. Set before
+    # `scan_command`, because every rule reaches exit 2 through `block()` and
+    # `block()` consults the gate.
+    _set_request("Bash", command, data.get("session_id"))
 
     command = elide_long_tokens(command)
 

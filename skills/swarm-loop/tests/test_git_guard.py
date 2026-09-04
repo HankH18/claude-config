@@ -2084,6 +2084,15 @@ def git_env(root):
     env = dict(os.environ)
     env["HOME"] = os.path.join(root, "home")
     env["XDG_CONFIG_HOME"] = os.path.join(root, "home", ".config")
+    # The CTO gate is INERT unless `CLAUDE_BUILD_STATE_DIR` is set, and it reads
+    # the user's settings through `CLAUDE_CONFIG_DIR`. Both are inherited from
+    # `os.environ`, so a developer running this suite from inside a live
+    # `claude-build full-auto` session would have every one of the ~3300 cases
+    # below silently start consulting a real approvals store. Dropped here so
+    # the battery means the same thing everywhere; GATE_CASES sets them back,
+    # per case, at paths it owns.
+    env.pop("CLAUDE_BUILD_STATE_DIR", None)
+    env.pop("CLAUDE_CONFIG_DIR", None)
     env["GIT_CONFIG_GLOBAL"] = os.devnull
     env["GIT_CONFIG_SYSTEM"] = os.devnull
     env["GIT_CONFIG_NOSYSTEM"] = "1"
@@ -2658,6 +2667,545 @@ PROC_CWD_CASES = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# THE CTO AUTHORIZATION GATE
+# ---------------------------------------------------------------------------
+#
+# The gate is the ONE place in this file where a refusal can be LIFTED, so it is
+# the one place where a bug allows instead of blocks. Everything above asserts
+# that the guard refuses; this section asserts what it refuses to un-refuse.
+#
+# It is also the only part of the guard that fails CLOSED. The rest of the hook
+# must never wedge an unattended run, so a crashed parser allows; an
+# authorization is not a blocking decision but the LIFTING of one, and an
+# authorization that cannot be verified is denied. Both halves are asserted
+# here — the fail-closed cases, and the controls that show the fail-OPEN
+# contract above them is untouched.
+#
+# WHAT IT WAS WHEN THESE TESTS WERE WRITTEN: the gate had been authored by a
+# session that was cut off mid-way and had zero cases. `_REQUEST_OPERATION` was
+# declared and never assigned, so `_gate_verdict` bailed at "the operation
+# being requested could not be read from the tool payload" on every single
+# invocation and the grant path underneath it was unreachable. The gate could
+# deny; it could not grant. `gate-reviewable-granted` below is the case that
+# says otherwise, and `gate-use-record-appended` is the one that proves the
+# grant was actually spent rather than merely honoured.
+#
+# Every case gets its OWN state directory, run ledger and approvals log, so
+# "single-use" is a property of one log and not of the order the table happens
+# to run in.
+
+GATE_BUILD_SID = "cb-build-sid-0000000000000001"
+GATE_WATCH_SID = "cb-watch-sid-0000000000000002"
+GATE_RUN_ID = "R-gate-1"
+
+# The guard's ONE reviewable refusal (`Reviewable`, top of git-guard.py): a push
+# from a tree whose `.swarm-loop` ledger is dirty. Nothing else in the file is
+# authorizable, and `gate-destructive-*` below is the enumeration of that.
+GATE_OP = "git push origin main"
+
+# The gate tag every record must carry, read from the guard rather than
+# duplicated — this is the constant `bin/claude-build` greps for, and hard-coding
+# it here would make these cases pass against a gate that had been renamed out
+# from under them (or, worse, keep passing after it was disarmed).
+GATE_ID = re.search(r'^GATE_ID = "([^"]+)"', open(HOOK).read(), re.M).group(1)
+
+
+def _grant(**kw):
+    rec = {"gate": GATE_ID, "kind": "grant", "id": "g1", "run_id": GATE_RUN_ID,
+           "granted_by": GATE_WATCH_SID, "requester": GATE_BUILD_SID,
+           "tool": "Bash", "operation": GATE_OP,
+           "reason": "epoch evidence is already committed on main",
+           "ts": "2026-01-01T00:00:00Z"}
+    rec.update(kw)
+    return dict((k, v) for k, v in rec.items() if v is not _DROP)
+
+
+def _use(**kw):
+    rec = {"gate": GATE_ID, "kind": "use", "grant_id": "g1",
+           "run_id": GATE_RUN_ID, "requester": GATE_BUILD_SID, "tool": "Bash",
+           "operation": GATE_OP, "ts": "2026-01-01T00:00:01Z"}
+    rec.update(kw)
+    return rec
+
+
+_DROP = object()          # sentinel: remove this key rather than set it
+
+_ASK = "CTO REVIEW IS AVAILABLE FOR THIS ONE"
+_ALLOWED = "ALLOWED BY CTO AUTHORIZATION"
+_NO_REVIEW = "NOT AUTHORIZABLE. An approval naming this operation is present"
+_ANY_GATE = "CTO AUTHORIZATION:"
+
+# (name, want_exit, spec).  Spec keys, all optional:
+#   cmd/tool/path/cwd/session  the request
+#   run     dict of run.json overrides (value _DROP deletes the key), or the
+#           strings "missing" / "malformed"
+#   log     list of records, or a raw string, or "missing" / "unreadable"
+#   store   "isolated" (default) | "in_dirtyrun" | "in_repo" | "split"
+#   deny    list of permissions.deny rules to write as the USER's settings,
+#           or "malformed"
+#   uses    expected number of `kind: "use"` records in the log afterwards
+#   must / must_not   stderr fragments
+GATE_CASES = [
+    # -- the gate is INERT outside a full-auto/all run ----------------------
+    # No CLAUDE_BUILD_STATE_DIR: the identical refusal, with nothing added.
+    # This is the control for the whole section — every case below changes
+    # behaviour only because that variable is set.
+    ("gate-inactive-no-state-dir", BLOCK,
+     {"state_dir": None, "log": [_grant()],
+      "must": ["BLOCKED (swarm-loop git-guard):"], "must_not": [_ANY_GATE]}),
+    # ...and an ALLOWED command never reaches the gate at all.
+    ("gate-inert-on-allow", ALLOW,
+     {"cmd": "git status", "log": [_grant()], "must_not": [_ANY_GATE], "uses": 0}),
+
+    # -- the reviewable refusal, which is the only grantable one ------------
+    ("gate-reviewable-no-grant-asks", BLOCK,
+     {"log": [], "uses": 0,
+      "must": [_ASK, "single-use", "message the session holding the"],
+      "must_not": [_ALLOWED]}),
+    # THE GRANT PATH. Unreachable before `_REQUEST_OPERATION` was plumbed.
+    ("gate-reviewable-granted", ALLOW,
+     {"log": [_grant()],
+      "must": [_ALLOWED, "grant g1", "signed by " + GATE_WATCH_SID,
+               "now spent", "epoch evidence is already committed on main"],
+      "must_not": ["BLOCKED (swarm-loop git-guard):"]}),
+    # ...and the grant is SPENT by the same call that honours it. Without the
+    # append there is no single-use, only a claim of one.
+    ("gate-use-record-appended", ALLOW, {"log": [_grant()], "uses": 1}),
+    # Replay. Same log, with the consumption record already in it.
+    ("gate-replay-refused", BLOCK,
+     {"log": [_grant(), _use()], "uses": 1,
+      "must": ["already been used", "second request"], "must_not": [_ALLOWED]}),
+    # Two runs of the same command against a store holding ONE grant: the
+    # second is a replay of a grant the first spent. This is single-use as an
+    # end-to-end property rather than as a fixture.
+    ("gate-single-use-second-run", BLOCK,
+     {"log": [_grant()], "repeat": 2, "uses": 1,
+      "must": ["already been used"], "must_not": [_ALLOWED]}),
+
+    # -- DESTRUCTIVE operations are unauthorizable, approval or not ---------
+    # Enumerated against the guard's own refusal families (see `Reviewable`):
+    # working-tree destroyers, ref/history destroyers, ledger writes, the
+    # `rm -r` path rules, and the one fail-closed rule.
+    ("gate-destructive-stash-with-valid-approval", BLOCK,
+     {"cmd": "git stash", "log": [_grant(operation="git stash")], "uses": 0,
+      "must": [_NO_REVIEW, "bounded", "goes to the human"],
+      "must_not": [_ALLOWED]}),
+    ("gate-destructive-reset-hard-with-approval", BLOCK,
+     {"cmd": "git reset --hard", "log": [_grant(operation="git reset --hard")],
+      "uses": 0, "must": [_NO_REVIEW], "must_not": [_ALLOWED]}),
+    ("gate-destructive-checkout-path-with-approval", BLOCK,
+     {"cmd": "git checkout -- src.py",
+      "log": [_grant(operation="git checkout -- src.py")], "uses": 0,
+      "must": [_NO_REVIEW], "must_not": [_ALLOWED]}),
+    ("gate-destructive-clean-with-approval", BLOCK,
+     {"cmd": "git clean -fdx", "log": [_grant(operation="git clean -fdx")],
+      "uses": 0, "must": [_NO_REVIEW], "must_not": [_ALLOWED]}),
+    ("gate-destructive-push-force-with-approval", BLOCK,
+     {"cmd": "git push --force origin main",
+      "log": [_grant(operation="git push --force origin main")], "uses": 0,
+      "must": [_NO_REVIEW], "must_not": [_ALLOWED]}),
+    ("gate-destructive-branch-force-with-approval", BLOCK,
+     {"cmd": "git branch -f main HEAD~1",
+      "log": [_grant(operation="git branch -f main HEAD~1")], "uses": 0,
+      "must": [_NO_REVIEW], "must_not": [_ALLOWED]}),
+    ("gate-destructive-update-ref-with-approval", BLOCK,
+     {"cmd": "git update-ref -d refs/heads/main",
+      "log": [_grant(operation="git update-ref -d refs/heads/main")], "uses": 0,
+      "must": [_NO_REVIEW], "must_not": [_ALLOWED]}),
+    ("gate-destructive-reflog-expire-with-approval", BLOCK,
+     {"cmd": "git reflog expire --expire=now --all",
+      "log": [_grant(operation="git reflog expire --expire=now --all")],
+      "uses": 0, "must": [_NO_REVIEW], "must_not": [_ALLOWED]}),
+    ("gate-destructive-worktree-remove-f-with-approval", BLOCK,
+     {"cmd": "git worktree remove --force {WT}",
+      "log": [_grant(operation="git worktree remove --force {WT}")], "uses": 0,
+      "must": [_NO_REVIEW], "must_not": [_ALLOWED]}),
+    ("gate-destructive-rm-worktree-with-approval", BLOCK,
+     {"cmd": "rm -rf {WT}", "cwd": "{REPO}",
+      "log": [_grant(operation="rm -rf {WT}")], "uses": 0,
+      "must": [_NO_REVIEW], "must_not": [_ALLOWED]}),
+    ("gate-destructive-ledger-shell-write-with-approval", BLOCK,
+     {"cmd": "sed -i '' s/a/b/ {REPO}/.swarm-loop/state.json", "cwd": "{REPO}",
+      "log": [_grant(operation="sed -i '' s/a/b/ {REPO}/.swarm-loop/state.json")],
+      "uses": 0, "must": [_NO_REVIEW], "must_not": [_ALLOWED]}),
+    # The FILE tools reach `block()` too, and their one refusal — a ledger
+    # write — is destructive. Same answer, different payload shape.
+    ("gate-destructive-file-tool-write-with-approval", BLOCK,
+     {"tool": "Write", "path": "{REPO}/.swarm-loop/state.json", "cwd": "{REPO}",
+      "log": [_grant(tool="Write", operation="{REPO}/.swarm-loop/state.json")],
+      "uses": 0, "must": [_NO_REVIEW], "must_not": [_ALLOWED]}),
+    # ...and with the gate armed but NOTHING approved, a destructive refusal's
+    # text is byte-for-byte what it was: no "ask the CTO" path is offered for
+    # an operation that has none. Offering one would be the false-advice
+    # failure this file's refusal text exists to avoid.
+    ("gate-destructive-no-grant-text-unchanged", BLOCK,
+     {"cmd": "git stash", "log": [], "uses": 0,
+      "must": ["BLOCKED (swarm-loop git-guard):"], "must_not": [_ANY_GATE]}),
+
+    # -- a COMPOUND command is not one operation ---------------------------
+    # `block()` stops at the FIRST rule that refuses, so only the push half of
+    # this line is ever classified. A grant naming the whole string would have
+    # run the `git stash` unexamined — a destructive op through a gate that may
+    # never authorize one.
+    ("gate-compound-smuggles-destructive", BLOCK,
+     {"cmd": GATE_OP + "; git stash",
+      "log": [_grant(operation=GATE_OP + "; git stash")], "uses": 0,
+      "must": ["COMPOUND", "destructive operation gets through"],
+      "must_not": [_ALLOWED]}),
+    ("gate-compound-and-and", BLOCK,
+     {"cmd": GATE_OP + " && git reset --hard",
+      "log": [_grant(operation=GATE_OP + " && git reset --hard")], "uses": 0,
+      "must": ["COMPOUND"], "must_not": [_ALLOWED]}),
+    ("gate-compound-newline", BLOCK,
+     {"cmd": GATE_OP + "\ngit clean -fdx",
+      "log": [_grant(operation=GATE_OP + "\ngit clean -fdx")], "uses": 0,
+      "must": ["COMPOUND"], "must_not": [_ALLOWED]}),
+    ("gate-compound-redirection", BLOCK,
+     {"cmd": GATE_OP + " > /dev/null",
+      "log": [_grant(operation=GATE_OP + " > /dev/null")], "uses": 0,
+      "must": ["COMPOUND"], "must_not": [_ALLOWED]}),
+    # A command substitution whose INTERIOR is destructive is classified by the
+    # interior — `scan_command` reaches the `git stash` first, so this refuses
+    # as unauthorizable rather than as compound. Both answers deny; pinned to
+    # the one the guard actually gives, so a change in scan order is visible.
+    ("gate-substitution-destructive-interior", BLOCK,
+     {"cmd": GATE_OP + " $(git stash)",
+      "log": [_grant(operation=GATE_OP + " $(git stash)")], "uses": 0,
+      "must": [_NO_REVIEW], "must_not": [_ALLOWED, "COMPOUND"]}),
+    # ...and un-granted, a compound reviewable refusal is told the truth rather
+    # than pointed at a review that can never grant it.
+    ("gate-compound-no-grant-says-so", BLOCK,
+     {"cmd": GATE_OP + "; git stash", "log": [], "uses": 0,
+      "must": ["COMPOUND", "BY ITSELF"], "must_not": [_ASK, _ALLOWED]}),
+
+    # -- the user's own settings are never overridden ----------------------
+    ("gate-user-deny-prefix-rule", BLOCK,
+     {"log": [_grant()], "deny": ["Bash(git push:*)"], "uses": 0,
+      "must": ["user's own settings deny", "A user-level denial is absolute",
+               "Bash(git push:*)"],
+      "must_not": [_ALLOWED]}),
+    ("gate-user-deny-exact-rule", BLOCK,
+     {"log": [_grant()], "deny": ["Bash(" + GATE_OP + ")"], "uses": 0,
+      "must": ["user's own settings deny"], "must_not": [_ALLOWED]}),
+    ("gate-user-deny-glob-rule", BLOCK,
+     {"log": [_grant()], "deny": ["Bash(git push*)"], "uses": 0,
+      "must": ["user's own settings deny"], "must_not": [_ALLOWED]}),
+    ("gate-user-deny-bare-tool-rule", BLOCK,
+     {"log": [_grant()], "deny": ["Bash"], "uses": 0,
+      "must": ["user's own settings deny"], "must_not": [_ALLOWED]}),
+    # A rule the gate cannot parse is a rule it must not decide is harmless.
+    ("gate-user-deny-unparseable-rule", BLOCK,
+     {"log": [_grant()], "deny": ["Bash(git push"], "uses": 0,
+      "must": ["not understood"], "must_not": [_ALLOWED]}),
+    ("gate-user-deny-unparseable-settings", BLOCK,
+     {"log": [_grant()], "deny": "malformed", "uses": 0,
+      "must": ["<unparseable"], "must_not": [_ALLOWED]}),
+    # THE CONTROL. Without it "user deny blocks" is equally well explained by
+    # "the presence of a settings file blocks", which would be a gate that
+    # never grants and a section that proves nothing.
+    ("gate-user-deny-unrelated-rule-still-grants", ALLOW,
+     {"log": [_grant()], "deny": ["Bash(rm:*)", "Write(/etc/**)"], "uses": 1,
+      "must": [_ALLOWED]}),
+
+    # -- nothing approves its own request ----------------------------------
+    # The requesting session IS the CTO: `all`/`full-auto` put the CTO hat on
+    # the watcher precisely so these are different sessions.
+    ("gate-self-approval-cto-is-build", BLOCK,
+     {"log": [_grant()], "run": {"watch_session_id": GATE_BUILD_SID,
+                                 "watch_session_name": "cb-build-R-gate-1"},
+      "uses": 0,
+      "must": ["cannot authorize its own request"], "must_not": [_ALLOWED]}),
+    # The grant is signed by the build itself — the forgery this gate exists
+    # to refuse, tested as if the isolation boundary had already failed.
+    ("gate-grant-signed-by-requester", BLOCK,
+     {"log": [_grant(granted_by=GATE_BUILD_SID)], "uses": 0,
+      "must": ["signed by the requesting session"], "must_not": [_ALLOWED]}),
+    ("gate-grant-signed-by-build-session-name", BLOCK,
+     {"log": [_grant(granted_by="cb-build-R-gate-1")], "uses": 0,
+      "must": ["signed by the requesting session"], "must_not": [_ALLOWED]}),
+    # Signed by nobody this run knows.
+    ("gate-grant-signed-by-stranger", BLOCK,
+     {"log": [_grant(granted_by="some-other-session")], "uses": 0,
+      "must": ["not the session", "holding the CTO role"],
+      "must_not": [_ALLOWED]}),
+    # Signed by the FIXER, which does not hold the CTO role in this run.
+    ("gate-grant-signed-by-fixer", BLOCK,
+     {"log": [_grant(granted_by="cb-fix-sid-3")],
+      "run": {"fix_session_id": "cb-fix-sid-3"}, "uses": 0,
+      "must": ["holding the CTO role"], "must_not": [_ALLOWED]}),
+    # Issued to a different session than the one asking.
+    ("gate-grant-issued-to-other-session", BLOCK,
+     {"log": [_grant(requester="cb-build-some-other-run")], "uses": 0,
+      "must": ["issued for a different session"], "must_not": [_ALLOWED]}),
+    # The session ASKING is not this run's build session. Approvals are
+    # addressed to one session and are not transferable — before this check the
+    # identity set was additive and a stranger inherited the build's.
+    ("gate-requester-is-the-cto-session", BLOCK,
+     {"session": GATE_WATCH_SID, "log": [_grant()], "uses": 0,
+      "must": ["not this run's build session"], "must_not": [_ALLOWED]}),
+    ("gate-requester-is-a-stranger", BLOCK,
+     {"session": "cb-somebody-else", "log": [_grant()], "uses": 0,
+      "must": ["not this run's build session"], "must_not": [_ALLOWED]}),
+    # No CTO at all: `cto_role` is "" in every topology but full-auto/all.
+    ("gate-no-cto-role", BLOCK,
+     {"log": [_grant()], "run": {"cto_role": ""}, "uses": 0,
+      "must": ["no session holding the CTO role"], "must_not": [_ALLOWED]}),
+    ("gate-unknown-cto-role", BLOCK,
+     {"log": [_grant()], "run": {"cto_role": "build"}, "uses": 0,
+      "must": ["no session holding the CTO role"], "must_not": [_ALLOWED]}),
+    ("gate-cto-role-names-no-session", BLOCK,
+     {"log": [_grant()],
+      "run": {"watch_session_id": _DROP, "watch_session_name": _DROP},
+      "uses": 0,
+      "must": ["names no session for the CTO role"], "must_not": [_ALLOWED]}),
+
+    # -- approvals are SPECIFIC: byte for byte, no wildcards ---------------
+    ("gate-operation-wildcard-does-not-match", BLOCK,
+     {"log": [_grant(operation="git push*")], "uses": 0,
+      "must": [_ASK], "must_not": [_ALLOWED]}),
+    ("gate-operation-star-does-not-match", BLOCK,
+     {"log": [_grant(operation="*")], "uses": 0,
+      "must": [_ASK], "must_not": [_ALLOWED]}),
+    ("gate-operation-prefix-does-not-match", BLOCK,
+     {"log": [_grant(operation="git push")], "uses": 0,
+      "must": [_ASK], "must_not": [_ALLOWED]}),
+    ("gate-operation-whitespace-does-not-match", BLOCK,
+     {"log": [_grant(operation="git  push origin main")], "uses": 0,
+      "must": [_ASK], "must_not": [_ALLOWED]}),
+    ("gate-grant-for-another-tool", BLOCK,
+     {"log": [_grant(tool="Write")], "uses": 0,
+      "must": [_ASK], "must_not": [_ALLOWED]}),
+    ("gate-grant-for-another-run", BLOCK,
+     {"log": [_grant(run_id="R-gate-2")], "uses": 0,
+      "must": [_ASK], "must_not": [_ALLOWED]}),
+    # A record carrying some other gate's tag is not this gate's record. This
+    # is what makes GATE_ID load-bearing rather than decoration: renaming or
+    # disarming it invalidates every approval already written.
+    ("gate-grant-with-foreign-gate-tag", BLOCK,
+     {"log": [_grant(gate="SOME-OTHER-GATE")], "uses": 0,
+      "must": [_ASK], "must_not": [_ALLOWED]}),
+    ("gate-grant-with-wrong-kind", BLOCK,
+     {"log": [_grant(kind="note")], "uses": 0,
+      "must": [_ASK], "must_not": [_ALLOWED]}),
+
+    # -- a MALFORMED approval is not a weak approval, it is not one --------
+    ("gate-grant-missing-reason", BLOCK,
+     {"log": [_grant(reason=_DROP)], "uses": 0,
+      "must": [_ASK], "must_not": [_ALLOWED]}),
+    ("gate-grant-missing-id", BLOCK,
+     {"log": [_grant(id=_DROP)], "uses": 0,
+      "must": [_ASK], "must_not": [_ALLOWED]}),
+    ("gate-grant-missing-granted-by", BLOCK,
+     {"log": [_grant(granted_by=_DROP)], "uses": 0,
+      "must": [_ASK], "must_not": [_ALLOWED]}),
+    ("gate-grant-empty-field", BLOCK,
+     {"log": [_grant(reason="   ")], "uses": 0,
+      "must": [_ASK], "must_not": [_ALLOWED]}),
+    ("gate-grant-non-string-field", BLOCK,
+     {"log": [_grant(ts=17)], "uses": 0,
+      "must": [_ASK], "must_not": [_ALLOWED]}),
+
+    # -- the STORE fails closed --------------------------------------------
+    # One unparseable line poisons the whole read: a line the guard cannot
+    # parse might be the `use` record that spends the grant it is about to
+    # honour, so "unspent" stops being knowable.
+    ("gate-log-has-a-junk-line", BLOCK,
+     {"log": json.dumps(_grant()) + "\nnot json at all\n",
+      "must": ["contains a line that is not a valid record"],
+      "must_not": [_ALLOWED]}),
+    ("gate-log-line-is-not-an-object", BLOCK,
+     {"log": json.dumps(_grant()) + "\n[1, 2, 3]\n",
+      "must": ["not a valid record"], "must_not": [_ALLOWED]}),
+    ("gate-log-missing", BLOCK,
+     {"log": "missing", "must": ["unreadable"], "must_not": [_ALLOWED]}),
+    ("gate-log-unreadable", BLOCK,
+     {"log": "unreadable", "must": ["unreadable"], "must_not": [_ALLOWED]}),
+    # The store's ISOLATION is the whole mechanism — a store the build can
+    # write is not a gate. Both trees the guard knows about are probed.
+    ("gate-store-inside-the-command-tree", BLOCK,
+     {"log": [_grant()], "store": "in_dirtyrun", "uses": 0,
+      "must": ["NOT outside", "the build writing its own approval"],
+      "must_not": [_ALLOWED]}),
+    ("gate-store-inside-the-session-root", BLOCK,
+     {"log": [_grant()], "store": "in_repo", "uses": 0,
+      "must": ["NOT outside"], "must_not": [_ALLOWED]}),
+    ("gate-log-outside-its-cto-dir", BLOCK,
+     {"log": [_grant()], "store": "split", "uses": 0,
+      "must": ["is not inside `cto_dir`"], "must_not": [_ALLOWED]}),
+
+    # -- the run LEDGER fails closed ---------------------------------------
+    ("gate-run-json-missing", BLOCK,
+     {"log": [_grant()], "run": "missing",
+      "must": ["no readable `run.json`"], "must_not": [_ALLOWED]}),
+    ("gate-run-json-malformed", BLOCK,
+     {"log": [_grant()], "run": "malformed",
+      "must": ["no readable `run.json`"], "must_not": [_ALLOWED]}),
+    ("gate-authority-not-armed", BLOCK,
+     {"log": [_grant()], "run": {"authority": "0"},
+      "must": ["authority is not armed"], "must_not": [_ALLOWED]}),
+    ("gate-authority-absent", BLOCK,
+     {"log": [_grant()], "run": {"authority": _DROP},
+      "must": ["authority is not armed"], "must_not": [_ALLOWED]}),
+    ("gate-run-id-absent", BLOCK,
+     {"log": [_grant()], "run": {"run_id": _DROP},
+      "must": ["names no run_id"], "must_not": [_ALLOWED]}),
+    ("gate-cto-log-absent", BLOCK,
+     {"log": [_grant()], "run": {"cto_log": _DROP},
+      "must": ["names no run_id / cto_dir / cto_log"], "must_not": [_ALLOWED]}),
+    ("gate-cto-dir-absent", BLOCK,
+     {"log": [_grant()], "run": {"cto_dir": _DROP},
+      "must": ["names no run_id / cto_dir / cto_log"], "must_not": [_ALLOWED]}),
+    # The state directory is named but is not there at all.
+    ("gate-state-dir-does-not-exist", BLOCK,
+     {"log": [_grant()], "state_dir": "{STATE}/nope",
+      "must": ["no readable `run.json`"], "must_not": [_ALLOWED]}),
+
+    # -- ...and a broken gate must not wedge the run -----------------------
+    # The gate is the one part of this hook that fails CLOSED, and the whole
+    # point of confining it to `block()` is that the fail-OPEN contract above
+    # it is untouched. A totally unusable authority store — no ledger, no
+    # readable log — must leave an ALLOWED command allowed, not turn a fault
+    # into a block of all bash in an unattended run.
+    ("gate-broken-store-does-not-wedge-allows", ALLOW,
+     {"cmd": "git status", "run": "malformed", "log": "unreadable",
+      "must_not": [_ANY_GATE, "BLOCKED"]}),
+    ("gate-broken-store-leaves-refusals-as-refusals", BLOCK,
+     {"cmd": "git stash", "run": "malformed", "log": "unreadable",
+      "must": ["BLOCKED (swarm-loop git-guard):"], "must_not": [_ALLOWED]}),
+]
+
+# A grant that cannot be marked SPENT is a grant that can be replayed, so the
+# write of the consumption record is itself a fail-closed step. Reached by
+# making the log readable but not writable — which root ignores, so the case is
+# declared only where it can actually mean something rather than passing for
+# the wrong reason.
+if getattr(os, "geteuid", lambda: 1)() != 0:
+    GATE_CASES.append(
+        ("gate-cannot-record-use-refuses", BLOCK,
+         {"log": [_grant()], "readonly_log": True, "uses": 0,
+          "must": ["could not be marked as used", "could be replayed"],
+          "must_not": [_ALLOWED]}))
+
+
+def run_gate_case(name, spec, repo, root, base_env, idx):
+    """One gate case in its own state directory. Returns (exit, stderr, uses).
+
+    `uses` is the number of consumption records in the approvals log AFTER the
+    call — the assertion that a grant was actually spent, and that a DENIED
+    request spent nothing."""
+    home = os.path.join(root, "gate", "%03d-%s" % (idx, name))
+    state = os.path.join(home, "state")
+    auth = os.path.join(state, "authority")
+    cfg = os.path.join(home, "config")
+    os.makedirs(auth)
+    os.makedirs(cfg)
+
+    store = spec.get("store", "isolated")
+    if store == "in_dirtyrun":
+        auth = os.path.join(fill_paths("{DIRTYRUN}", repo, root), "cto-authority")
+    elif store == "in_repo":
+        auth = os.path.join(repo, "cto-authority")
+    if store in ("in_dirtyrun", "in_repo"):
+        os.makedirs(auth, exist_ok=True)
+    log = os.path.join(auth, "approvals.log")
+    cto_dir = auth
+    if store == "split":
+        # The log is real and readable, but it does not live under the
+        # directory the ledger says holds it.
+        cto_dir = os.path.join(state, "elsewhere")
+        os.makedirs(cto_dir, exist_ok=True)
+
+    logspec = spec.get("log", [])
+    if logspec == "missing":
+        pass
+    elif logspec == "unreadable":
+        # A DIRECTORY where the log should be: `open()` raises for every user,
+        # including root, so this case cannot silently pass on a CI box that
+        # ignores a chmod.
+        os.makedirs(log)
+    elif isinstance(logspec, str):
+        with open(log, "w") as fh:
+            fh.write(fill_paths(logspec, repo, root))
+    else:
+        with open(log, "w") as fh:
+            for rec in logspec:
+                fh.write(json.dumps(fill_paths(rec, repo, root)) + "\n")
+        if spec.get("readonly_log"):
+            os.chmod(log, 0o444)
+
+    runspec = spec.get("run", {})
+    run_path = os.path.join(state, "run.json")
+    if runspec == "missing":
+        pass
+    elif runspec == "malformed":
+        with open(run_path, "w") as fh:
+            fh.write("[not, an, object\n")
+    else:
+        run = {"run_id": GATE_RUN_ID, "topology": "full-auto", "authority": "1",
+               "state_dir": state,
+               "build_session_name": "cb-build-R-gate-1",
+               "build_session_id": GATE_BUILD_SID,
+               "watch_session_name": "cb-watch-R-gate-1",
+               "watch_session_id": GATE_WATCH_SID,
+               "fix_session_name": "", "fix_session_id": "",
+               "cto_role": "watchdog", "cto_dir": cto_dir, "cto_log": log}
+        run.update(runspec)
+        run = dict((k, v) for k, v in run.items() if v is not _DROP)
+        with open(run_path, "w") as fh:
+            json.dump(run, fh)
+
+    env = dict(base_env)
+    env["CLAUDE_CONFIG_DIR"] = cfg
+    deny = spec.get("deny")
+    if deny == "malformed":
+        with open(os.path.join(cfg, "settings.json"), "w") as fh:
+            fh.write("{ this is not json")
+    elif deny:
+        with open(os.path.join(cfg, "settings.json"), "w") as fh:
+            json.dump({"permissions": {"deny": deny}}, fh)
+
+    sd = spec.get("state_dir", "{STATE}")
+    if sd is None:
+        env.pop("CLAUDE_BUILD_STATE_DIR", None)
+    else:
+        env["CLAUDE_BUILD_STATE_DIR"] = sd.replace("{STATE}", state)
+
+    payload = {"tool_name": spec.get("tool", "Bash"),
+               "cwd": fill_paths(spec.get("cwd", "{DIRTYRUN}"), repo, root)}
+    if spec.get("session", GATE_BUILD_SID) is not None:
+        payload["session_id"] = spec.get("session", GATE_BUILD_SID)
+    if spec.get("tool") in FILE_TOOL_NAMES:
+        payload["tool_input"] = {"file_path": fill_paths(spec["path"], repo, root)}
+    else:
+        payload["tool_input"] = {
+            "command": fill_paths(spec.get("cmd", GATE_OP), repo, root)}
+
+    got, stderr = ALLOW, ""
+    for _ in range(spec.get("repeat", 1)):
+        got, stderr = run_payload(repo, env, json.dumps(payload))
+
+    uses = None
+    try:
+        with open(log, "r", encoding="utf-8") as fh:
+            uses = sum(1 for ln in fh if '"kind": "use"' in ln
+                       or '"kind":"use"' in ln)
+    except Exception:
+        uses = None
+
+    if store in ("in_dirtyrun", "in_repo"):
+        # Do not leave a directory inside a fixture repo that ~3300 other cases
+        # resolve paths against — see build_ledger_repos' note on what a stray
+        # sibling did to four unrelated cells.
+        shutil.rmtree(auth, ignore_errors=True)
+    return got, stderr, uses
+
+
+# Tool names whose payload carries a path rather than a command. Mirrors
+# FILE_TOOLS in the guard; only the ones this section uses.
+FILE_TOOL_NAMES = ("Edit", "Write", "NotebookEdit", "MultiEdit")
+
+
 def build_matrix(repo, root):
     """Every case, at every cwd, under every prefix. Returns (name, payload,
     want, kind) tuples. Three of the four axes derive their expectation instead
@@ -2810,7 +3358,8 @@ def main():
                     + [n for n, _, _, _ in ENV_CASES]
                     + [n for n, _, _ in MALFORMED_PAYLOADS]
                     + [n for n, _, _, _ in TEXT_CASES]
-                    + [n for n, _, _, _, _, _, _ in PROC_CWD_CASES])
+                    + [n for n, _, _, _, _, _, _ in PROC_CWD_CASES]
+                    + [n for n, _, _ in GATE_CASES])
         dupes = sorted({n for n in declared if declared.count(n) > 1})
         if dupes:
             print("TEST_GIT_GUARD: duplicate case names: %s" % ", ".join(dupes))
@@ -2930,6 +3479,46 @@ def main():
                                               frag),
                         payload, pwant, got, text, "text"))
 
+        # The CTO gate. Serial and last: each case owns a state directory, a run
+        # ledger and an approvals log, and two of them briefly place a store
+        # inside a fixture repo to prove the isolation check is load-bearing —
+        # neither of which may be visible to anything above.
+        os.makedirs(os.path.join(root, "gate"), exist_ok=True)
+        for gidx, (gname, gwant, gspec) in enumerate(GATE_CASES):
+            got, stderr, uses = run_gate_case(gname, gspec, repo, root, env, gidx)
+            text = stderr or ""
+            by_kind["gate"] = by_kind.get("gate", 0) + 1
+            if got == gwant:
+                passed += 1
+                if verbose:
+                    print("  ok    %-40s exit %d" % (gname, got))
+            else:
+                failures.append((gname, gname, gwant, got, text, "gate"))
+            for frag, want_present in ([(f, True) for f in gspec.get("must", [])]
+                                       + [(f, False) for f in gspec.get("must_not", [])]):
+                frag = fill_paths(frag, repo, root)
+                by_kind["gate"] = by_kind.get("gate", 0) + 1
+                if (frag in text) == want_present:
+                    passed += 1
+                else:
+                    failures.append((
+                        "%s :: must %s %r" % (gname,
+                                              "CONTAIN" if want_present else "NOT contain",
+                                              frag),
+                        gname, gwant, got, text, "text"))
+            # Did the approval actually get SPENT? A grant honoured without a
+            # consumption record is a grant that can be replayed, and a DENIED
+            # request that writes one has burned an approval nobody used.
+            if "uses" in gspec:
+                by_kind["gate"] = by_kind.get("gate", 0) + 1
+                if uses == gspec["uses"]:
+                    passed += 1
+                else:
+                    failures.append((
+                        "%s :: approvals log must hold %r use record(s), holds %r"
+                        % (gname, gspec["uses"], uses),
+                        gname, gwant, got, text, "text"))
+
         label = {BLOCK: "BLOCK (exit 2)", ALLOW: "ALLOW (exit 0)"}
         for name, payload, want, got, stderr, kind in failures:
             kindlabel = "MISSED BLOCK" if want == BLOCK else "FALSE BLOCK"
@@ -2948,10 +3537,10 @@ def main():
 
         print("")
         print("  declared: %d block  %d allow  %d payload  %d env  %d malformed"
-              "  %d text  %d proccwd"
+              "  %d text  %d proccwd  %d gate"
               % (len(MUST_BLOCK), len(MUST_ALLOW), len(PAYLOAD_CASES),
                  len(ENV_CASES), len(MALFORMED_PAYLOADS), len(TEXT_CASES),
-                 len(PROC_CWD_CASES)))
+                 len(PROC_CWD_CASES), len(GATE_CASES)))
         print("  cells run: " + "  ".join(
             "%s=%d" % (k, by_kind[k]) for k in sorted(by_kind)))
         print("TEST_GIT_GUARD: PASS=%d FAIL=%d" % (passed, len(failures)))
