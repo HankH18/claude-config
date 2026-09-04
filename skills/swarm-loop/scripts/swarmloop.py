@@ -3766,7 +3766,36 @@ def cmd_check_branch(args):
                   "file(s) since — and let the LANE measure the impact: an inference about "
                   "impact, shipped as if it were measured, is its own defect, and the lane is "
                   "the one standing in the tree where the impact can be measured.")
-    print("check-branch: OK (review the file list above against the task's ownership map)")
+    # NAME WHAT THIS RUN DID NOT CHECK. Both optional flags gate real refusals,
+    # and without them the command prints an unqualified OK over a question it
+    # never asked. Measured on a live collection: six branches all returned
+    # "check-branch: OK" exit 0 without `--ticket`; re-run WITH it, one of them
+    # hard-VETOED on a red-check stamp that already existed and was correct. The
+    # collecting agent found it only because it ran both forms on its own
+    # initiative — following the documented shape exactly would have merged a
+    # vetoed branch and reported success. An OK that does not say what it
+    # skipped is the same false green this file catalogues everywhere else.
+    _skipped = []
+    if not args.ticket:
+        _skipped.append(
+            "--ticket <id>: the red-check ledger was NOT consulted, so a ticket whose gate "
+            "is stamped weak/vacuous/hung/no-gate is NOT refused here. That stamp is the "
+            "merge gate for a ticket's own verify, and it is only read when this flag is "
+            "passed")
+    if not args.worktree:
+        _skipped.append(
+            "--worktree <path>: no tip SHA was pinned and no working tree was read, so a "
+            "lane holding UNCOMMITTED work, or a tree that has MOVED past the ref you are "
+            "judging, is NOT refused here")
+    if _skipped:
+        print("check-branch: OK for the checks it RAN — and it did not run these:")
+        for _sk in _skipped:
+            print("    - %s" % _sk)
+        print("  Re-run with the missing flag(s) before merging. An unqualified OK from the "
+              "shorter form is the shape that let six branches read clean while one of them "
+              "was genuinely vetoed.")
+    else:
+        print("check-branch: OK (review the file list above against the task's ownership map)")
 
 
 # ----------------------------------------------------------- measure/record

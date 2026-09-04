@@ -82,6 +82,49 @@ Phase 0 is where the guard is provisioned, so this is where its real scope belon
 
 **Not a set, and not exact.** Coverage is bounded by what the tokenizer can see as an argv, and the guard fails open on any parse or logic error. A heredoc body piped to a shell, `eval "$var"`, `python3 -c 'os.system("git stash")'`, a script file, and `$X stash` where `$X` does not mention git all pass through by design — widening any of them costs false blocks, and a false block wedges an unattended run. Re-probe rather than quoting this list at a version you have not checked.
 
+## The SECOND hook — the delegation guard, and its SEPARATE matcher
+
+`hooks/delegation-guard.py` is a different hook with a different job, installed in the same file. The git-guard asks *is this command destructive?*; the delegation guard asks *how long since you last delegated?* It counts CONSECUTIVE repo-mutating tool calls by one session, resets that count to zero on any `Agent`/`Task` dispatch, injects a reminder at **5**, and refuses at **8**.
+
+**Why a hook rather than a rule.** The instruction already exists in two places that are loaded at session start, and neither prevents the failure. What was measured: an orchestrator delegated correctly at every phase boundary — seven lanes, three auditors, a verifier, a report writer, unprompted — and then, reactively mid-turn on one verifier finding, personally read two modules, wrote a repro, patched two files, ran the suite, reverted half, wrote two regression tests, fixed lint and committed. ~20 consecutive calls, all delegable. Nobody decides to do that; it accretes one command at a time, because mid-turn each next step looks like *one more command* and never like *a task*. The standing rule fires on doubt, and mid-turn there is no doubt — which is exactly why it never fires. So this one does not consult judgement, the same way the git-guard does not ask anyone to feel cautious about `git stash`.
+
+**It needs its OWN `PreToolUse` entry, with its OWN matcher.** Hook entries merge across settings levels and across entries, so a second entry is normal — but do NOT extend the git-guard's matcher instead, and do NOT reuse it:
+
+```
+"matcher": "Bash|Edit|Write|NotebookEdit|MultiEdit|Task|Agent|SendMessage"
+```
+
+`Task`, `Agent` and `SendMessage` are the half that gets dropped, and dropping them is worse than not installing the hook at all: **the RESET never fires, and a delegation clock with no reset is a blanket cap on mutating calls.** The value is stated in the guard as `REQUIRED_MATCHER` and the battery asserts every routed tool appears in it. Keep it OFF the git-guard's entry — `bin/claude-build` hand-copies that matcher and `tests/test_git_guard.py` fails if the two drift.
+
+**What it never counts, so a green run is not mistaken for a broken hook.** Read-only work; every `swarmloop.py` invocation whatever the subcommand and however it is piped or logged (so Phase 7's `verify` → `measure` → `analyze` → `checkpoint` sequence, run one at a time in a row, is inert); the git integration verbs (`merge`, `rebase`, `revert`, `cherry-pick`, `checkout`, `switch`, `branch`, `worktree`, `push`, `fetch`, `pull`), so a nine-branch Phase 6 collection and the Phase 9 landing cost nothing; anything at all while a merge/rebase/cherry-pick is in progress, because `merge-protocol.md` step 5 makes conflict resolution the orchestrator's own job; any call whose work area is a linked worktree, because that is a worker doing what its packet asked; writes under `.swarm-loop/` or `.claude/`; anything outside the work area; and heredoc bodies, which are dropped as data exactly as the git-guard drops them. What DOES count is authoring: `Edit`/`Write`/`NotebookEdit`/`MultiEdit` in-tree, a write redirect into the repo, `sed -i`, `tee`/`dd`/`truncate`, `rm`/`mv`/`cp`/`mkdir`/`chmod` on the operand each actually writes, a package ADD (never `npm ci`/`uv sync`), and `git add`/`git commit`/`git apply`. Phase 7's ledger commit therefore costs exactly one of the five — affordable, and pinned by a test so it stays visible.
+
+**The thresholds are UNCALIBRATED.** 5 and 8 are one reading of one incident and nothing else. They are environment variables, and the place to set them is the `env` block of the same settings file — a `VAR=x` prefix on a Bash call sets it for the child, never for the hook:
+
+| variable | default | effect |
+|---|---|---|
+| `SWARMLOOP_DELEGATION_REMIND` | `5` | allow, but inject a reminder |
+| `SWARMLOOP_DELEGATION_DENY` | `8` | refuse, exit 2 |
+| `SWARMLOOP_DELEGATION_GUARD` | unset | `off`/`0`/`false` disables it entirely |
+| `SWARMLOOP_DELEGATION_STATE_DIR` | `~/.claude/swarm-loop/delegation` | where the per-session counters live |
+
+If a run is reminded during legitimate orchestration, **raise them and record what tripped it** — that reading is worth more than the defaults are. A malformed or `0` override falls back to the default rather than denying the first call of the run.
+
+**State lives outside the measured repo** — one small JSON file per `session_id` under `~/.claude/swarm-loop/delegation/`. That is not fussiness: this skill has a measured incident about files inside the repo being swept into root-walking metric commands, and a counter that changes on every tool call is the worst possible thing to hand one. A payload carrying no `session_id` is not counted at all.
+
+**Probe it in Phase 0, alongside the git-guard probe.** Two Bash tool calls, in this order:
+
+```bash
+# call 1 — one counted write, cleaned up in the same call (so it counts ONCE).
+touch .dg-probe && rm .dg-probe
+
+# call 2 — read the counter back. Read-only, so it does not count itself.
+cat ~/.claude/swarm-loop/delegation/*.json
+```
+
+**PASS is exactly one outcome: call 2 prints a JSON object whose `count` is at least 1.** No file, an empty directory, or `count` absent means the hook is not loaded — the same failure the git-guard probe exists to catch, and it fails the same way, silently. The counter is left at 1; Phase 4's first `Agent` dispatch resets it. As with the git-guard, run the probe as a Bash **tool call**, never from inside a script file.
+
+**Fail-open, everywhere, with no exception.** Unreadable state, an unwritable directory, a corrupt counter, an unparseable payload, a tokenizer crash — every one allows. Unlike the git-guard it has no fail-closed rule at all, and it should not: a missed delegation reminder costs nothing, and a hook that can wedge an unattended loop gets switched off.
+
 ## The worktree location is a permission scope
 
 Phase 4 puts each worker's worktree at `../<repo>-worktrees/<task-id>` — a **sibling of the repo, outside the project root** — because a worktree inside the repo lands inside every root-walking metric command's scan. That fixes the measurement and creates a permission problem in the same move: `git worktree add` writes there, every worker then reads, edits and commits there, and `swarmloop.py retire` calls `git worktree remove` against it (**not** `rm -rf` — that form is guard-blocked, exit 2). A session scoped to the project root prompts on the first of those, which under this skill's premise is not one prompt — it is **every worker in the first mutating wave hung at once**, each one eventually marked failed-hung for a reason that has nothing to do with its task.
@@ -120,6 +163,10 @@ One JSON document, permissions and git-guard together. JSON has no comments, so 
       "mcp__claude-in-chrome"
     ]
   },
+  "env": {
+    "SWARMLOOP_DELEGATION_REMIND": "5",
+    "SWARMLOOP_DELEGATION_DENY": "8"
+  },
   "disableAllHooks": false,
   "hooks": {
     "PreToolUse": [
@@ -131,11 +178,22 @@ One JSON document, permissions and git-guard together. JSON has no comments, so 
             "command": "python3 \"$HOME/.claude/skills/swarm-loop/hooks/git-guard.py\""
           }
         ]
+      },
+      {
+        "matcher": "Bash|Edit|Write|NotebookEdit|MultiEdit|Task|Agent|SendMessage",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.claude/skills/swarm-loop/hooks/delegation-guard.py\""
+          }
+        ]
       }
     ]
   }
 }
 ```
+
+**Two `PreToolUse` entries, two matchers, and they are not interchangeable.** The first is the git-guard (destructive-op refusals); the second is the delegation guard, whose matcher additionally routes `Task`/`Agent`/`SendMessage` because that is what resets its counter. Widening the FIRST matcher instead breaks `tests/test_git_guard.py`, which ties it to `git-guard.py`'s `REQUIRED_MATCHER` and to `bin/claude-build`. The `env` block is where the delegation thresholds belong — they are read by the hook process, so a `VAR=x` prefix on a Bash call never reaches them — and both entries may be dropped independently: omit the second and the run is guarded but not delegation-clocked.
 
 `additionalDirectories` is what lets tools reach outside the project root; it is the sibling-worktree grant from the section above, and it is omitted only when the run is on the in-tree fallback. `"mcp__claude-in-chrome"` is a server-level grant — it covers every tool that browser server exposes, which is what an unattended browser task needs. `"Bash(git push:*)"` covers Phase 7's push and nothing else; drop it under `--push-remote never`. `"disableAllHooks": false` is pinned rather than left to the default: hook *entries* merge across settings levels, so nothing a worker writes can delete the git-guard entry — but a single `disableAllHooks: true` at any level that outranks this file switches every hook off at once, the guard included, and pinning it here is what makes that a conflict instead of a silent win.
 

@@ -6903,10 +6903,24 @@ ck_has "V3 ...saying git could not place it" "git cannot place relative to"
 # THE BACKWARD-COMPATIBILITY ASSERTION. Every existing check-branch invocation
 # in SKILL.md, in merge-protocol.md and in every packet omits --ticket, and must
 # keep working verbatim — including on a repo that HAS a populated ledger.
+#
+# WHAT CHANGED, and why this case no longer asserts SILENCE. It used to require
+# that the short form say nothing about red-check at all. That silence was the
+# defect: measured on a live collection, six branches all returned an
+# unqualified "check-branch: OK" exit 0 under the short form, and re-running
+# WITH --ticket hard-VETOED one of them on a red-check stamp that already
+# existed and was correct. The collecting agent caught it only by running both
+# forms unprompted; following the documented shape exactly would have merged a
+# vetoed branch and reported success. The EXIT CODE contract is unchanged and
+# still pinned below — the command now names what it did not check instead of
+# implying it checked everything.
 sl check-branch --branch task/T-5
 ck_exit "V3 check-branch WITHOUT --ticket is unchanged, ledger or no ledger" 0 "$RC"
-ck_hasnt "V3 ...and says nothing about red-check at all" "red-check"
-ck_has "V3 ...still ending in its own verdict line" "check-branch: OK"
+ck_has "V3 ...and NAMES the red-check ledger as a thing it did not consult" \
+       "the red-check ledger was NOT consulted"
+ck_hasnt "V3 ...so it never prints an unqualified OK that hides a veto" \
+         "check-branch: OK (review"
+ck_has "V3 ...still ending in its own verdict line" "check-branch: OK for the checks it RAN"
 
 
 
