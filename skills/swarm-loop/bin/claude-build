@@ -32,6 +32,13 @@ if [ -n "$SELF_SKILL" ] \
   SKILL="$SELF_SKILL"
 fi
 GUARD="$SKILL/hooks/git-guard.py"
+# The SECOND PreToolUse hook — the delegation clock (references/run-permissions.md,
+# "The SECOND hook"). Deliberately NOT a precondition the way $GUARD is: an older
+# skill tree has no delegation-guard.py, and a launcher that refused to run
+# against one would trade a run that is guarded-but-not-delegation-clocked for no
+# run at all. So this is a path that is checked when the settings are written,
+# never one that is required to exist.
+DGUARD="$SKILL/hooks/delegation-guard.py"
 HARNESS="$SKILL/scripts/swarmloop.py"
 
 DIR="" ; SPEC="" ; AUDIT_LOOPS="" ; MAX_CYCLES=""
@@ -87,11 +94,38 @@ num_val() {  # num_val <flag> <value>   — a positive whole number, or a loud d
 # heredoc sits inside $( ... ) — one apostrophe in a Python comment then breaks
 # the whole script. Define these at top level and pass them with -c instead.
 read -r -d '' PY_MERGE <<'PY_MERGE_EOF' || true
-import json, os, sys
+import json, os, re, sys
 
 path, wt, dry = os.environ["SETTINGS"], os.environ["WT"], os.environ["DRY"] == "1"
 manifest_p = os.environ["MANIFEST"]
-cmd = 'python3 "$HOME/.claude/skills/swarm-loop/hooks/git-guard.py"'
+cmd  = 'python3 "$HOME/.claude/skills/swarm-loop/hooks/git-guard.py"'
+dcmd = 'python3 "$HOME/.claude/skills/swarm-loop/hooks/delegation-guard.py"'
+
+# The delegation guard's matcher is READ OUT OF THE HOOK, never copied into this
+# file. The git-guard's matcher below IS a hand-copied literal, and the two drifted
+# apart once already — this script installed a Bash-only matcher while the guard
+# had grown the file-writing tools, so every Edit/Write went unguarded — which is
+# why tests/test_git_guard.py now ties that literal to git-guard.py's
+# REQUIRED_MATCHER. Rather than add a second literal that can drift the same way,
+# this one is derived: it cannot disagree with the hook, because it IS the hook's
+# own value.
+#
+# And the value is not interchangeable with the git-guard's. It carries
+# `Task|Agent|SendMessage`, which is what the delegation counter RESETS on; drop
+# those and the reset never fires, turning a delegation CLOCK into a blanket CAP
+# on mutating calls — strictly worse than not installing the hook at all. So a
+# matcher that cannot be read is a reason to install NOTHING, never a reason to
+# guess one.
+dguard = os.environ.get("DGUARD", "")
+dg_matcher = None
+if dguard:
+    try:
+        with open(dguard) as f:
+            _m = re.search(r'^REQUIRED_MATCHER\s*=\s*"([^"]+)"', f.read(), re.M)
+        if _m:
+            dg_matcher = _m.group(1)
+    except Exception:
+        dg_matcher = None
 
 data, note = {}, []
 if os.path.exists(path):
@@ -153,19 +187,41 @@ if not isinstance(pre, list):
     print("FATAL:hooks.PreToolUse is not a list — fix settings.local.json by hand")
     sys.exit(3)
 
-def has_guard(entries):
+def has_hook(entries, script):
+    """Is a PreToolUse hook invoking <script> already registered?
+
+    Keyed on the SCRIPT NAME, so a second install adds nothing (idempotence) and
+    an entry a user wrote by hand — different matcher, different spelling of the
+    command — is recognised and left exactly as it is. "git-guard.py" is not a
+    substring of "delegation-guard.py", so neither hook ever sees the other's
+    entry as its own."""
     for e in entries:
         if isinstance(e, dict):
             for h in e.get("hooks") or []:
-                if isinstance(h, dict) and "git-guard.py" in str(h.get("command", "")):
+                if isinstance(h, dict) and script in str(h.get("command", "")):
                     return True
     return False
 
-if has_guard(pre):
+if has_hook(pre, "git-guard.py"):
     note.append("git-guard hook already present (left as-is)")
 else:
     pre.append({"matcher": "Bash|Edit|Write|NotebookEdit|MultiEdit", "hooks": [{"type": "command", "command": cmd}]})
     note.append("added git-guard PreToolUse hook")
+
+# The delegation guard gets its OWN entry with its OWN matcher. Two entries is
+# the normal shape — hook entries merge, across levels and across entries — and
+# the alternative is worse in both directions: widening the git-guard's matcher
+# routes Task/Agent/SendMessage into a hook that has no rules for them, and
+# reusing it for the delegation hook drops the three tools its RESET is keyed on.
+if has_hook(pre, "delegation-guard.py"):
+    note.append("delegation-guard hook already present (left as-is)")
+elif dg_matcher:
+    pre.append({"matcher": dg_matcher, "hooks": [{"type": "command", "command": dcmd}]})
+    note.append("added delegation-guard PreToolUse hook")
+else:
+    note.append("delegation-guard NOT installed (no readable REQUIRED_MATCHER at %s)"
+                " — the run is guarded but not delegation-clocked"
+                % (dguard or "$SKILL/hooks/delegation-guard.py"))
 
 perms = data.setdefault("permissions", {})
 adds = perms.get("additionalDirectories")
@@ -243,7 +299,13 @@ if os.path.exists(settings):
         print(f"FATAL:{settings} is not valid JSON ({e}) — remove entries by hand")
         sys.exit(3)
 
-    # Hook: always signature-matched. Only entries pointing at OUR guard go.
+    # Hooks: always signature-matched. Only entries pointing at OUR OWN hook
+    # scripts go — and BOTH of them do. "git-guard.py" is not a substring of
+    # "delegation-guard.py", so a filter that named only the first left the
+    # second behind, which is the worst of the three possible states: a
+    # PreToolUse entry invoking a script in a skill the user has just removed,
+    # failing on every single tool call, with nothing in the project to say why.
+    OUR_HOOKS = ("git-guard.py", "delegation-guard.py")
     hooks = data.get("hooks") or {}
     pre = hooks.get("PreToolUse")
     if isinstance(pre, list):
@@ -252,7 +314,9 @@ if os.path.exists(settings):
         for e in pre:
             if isinstance(e, dict):
                 inner = [h for h in (e.get("hooks") or [])
-                         if not (isinstance(h, dict) and "git-guard.py" in str(h.get("command", "")))]
+                         if not (isinstance(h, dict)
+                                 and any(g in str(h.get("command", ""))
+                                         for g in OUR_HOOKS))]
                 if len(inner) != len(e.get("hooks") or []):
                     removed += 1
                     if inner:
@@ -260,7 +324,7 @@ if os.path.exists(settings):
                     continue
             kept.append(e)
         if removed:
-            notes.append(f"removed {removed} git-guard hook entr" + ("y" if removed == 1 else "ies"))
+            notes.append(f"removed {removed} swarm-loop hook entr" + ("y" if removed == 1 else "ies"))
         if kept:
             hooks["PreToolUse"] = kept
         else:
@@ -1955,7 +2019,11 @@ ok "$WT_MODE → $WT"
 
 step "3. Settings (.claude/settings.local.json)"
 [ "$DRY" = 1 ] || mkdir -p "$DIR/.claude"
-MERGE_OUT="$(WT="$WT" SETTINGS="$SETTINGS" MANIFEST="$MANIFEST" DRY="$DRY" python3 -c "$PY_MERGE")" || true
+# Said out loud here rather than left as a green tick in the merge notes: a
+# missing second hook is not a failure, but it IS a difference in what the
+# session is about to enforce, and it is invisible from inside the run.
+[ -f "$DGUARD" ] || warn "no delegation-guard at $DGUARD — the session will be guarded but NOT delegation-clocked"
+MERGE_OUT="$(WT="$WT" SETTINGS="$SETTINGS" MANIFEST="$MANIFEST" DRY="$DRY" DGUARD="$DGUARD" python3 -c "$PY_MERGE")" || true
 case "$MERGE_OUT" in
   FATAL:*) die "${MERGE_OUT#FATAL:}" ;;
   OK:*)    ok "${MERGE_OUT#OK:}" ;;
@@ -2280,7 +2348,16 @@ PROMPT="Use the swarm-loop skill to run an autonomous build in this directory."
 [ -n "$SPEC" ]        && PROMPT="$PROMPT The spec is at: $SPEC."
 [ -n "$AUDIT_LOOPS" ] && PROMPT="$PROMPT Use $AUDIT_LOOPS audit-fix loops."
 [ -n "$MAX_CYCLES" ]  && PROMPT="$PROMPT Use --max-cycles $MAX_CYCLES."
-PROMPT="$PROMPT Worktrees for this run go in $WT — Phase 0 is already provisioned: .claude/settings.local.json exists, the git-guard hook is live and probed, and that worktree directory is granted. Do not re-install the hook; verify and continue."
+# What Phase 0 can and cannot claim. The git-guard is PROVEN — step 5 pipes
+# payloads straight into it — but the delegation guard cannot be probed from
+# out here at all: it counts CONSECUTIVE tool calls in a session that does not
+# exist yet, so the only probe that means anything is the two-tool-call one in
+# references/run-permissions.md, run from inside the session. Saying "installed"
+# for one and "live and probed" for the other is the difference between a
+# provisioning claim a run can rely on and one it has to re-derive.
+HOOK_CLAIM="the git-guard hook is live and probed"
+[ -f "$DGUARD" ] && HOOK_CLAIM="$HOOK_CLAIM, the delegation-guard hook is installed alongside it (not probed — run the two-call delegation probe in references/run-permissions.md yourself, from THIS session)"
+PROMPT="$PROMPT Worktrees for this run go in $WT — Phase 0 is already provisioned: .claude/settings.local.json exists, $HOOK_CLAIM, and that worktree directory is granted. Do not re-install the hooks; verify and continue."
 if [ -n "$WATCH" ]; then
   PROMPT="$PROMPT A WATCHDOG session (name: $WATCH_SESSION_NAME) is observing this run from its own terminal; it is read-only with respect to this repository and files what it sees under $OBS. It is not part of your swarm and you do not manage it. Note that its name says 'watch' and NOT 'audit-fix' on purpose: --audit-loops is your act two, running inside THIS session, and is a different mechanism from these watcher sessions."
   [ "$WATCH" = watch-fix ] && PROMPT="$PROMPT A FIXER session (name: $FIX_SESSION_NAME) may repair the skill in a copy at $WORK_DIR; it never touches this repository. The run ledger is $STATE_DIR/run.json."

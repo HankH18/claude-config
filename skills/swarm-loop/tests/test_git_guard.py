@@ -41,6 +41,11 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HOOK = os.path.join(HERE, os.pardir, "hooks", "git-guard.py")
+# The SECOND PreToolUse hook. Not under test here — it has its own battery in
+# tests/test_delegation_guard.py — but bin/claude-build installs BOTH, and the
+# matcher-agreement check below is the one place that reads the two hooks'
+# constants side by side and holds each entry to its own.
+DELEG_HOOK = os.path.join(HERE, os.pardir, "hooks", "delegation-guard.py")
 
 BLOCK = 2
 ALLOW = 0
@@ -3373,25 +3378,251 @@ def main():
         # unguarded with no test to notice. Asserting they agree is what makes
         # the constant load-bearing; deleting it as "dead" would have removed
         # the only written statement of the correct value.
+        #
+        # THERE ARE NOW TWO HOOKS AND TWO MATCHERS, and the property to preserve
+        # is per-hook: each installed entry's matcher must equal the
+        # REQUIRED_MATCHER of the hook THAT ENTRY INVOKES. Relaxing this to "at
+        # least one entry carries a known matcher" would be satisfied by a
+        # delegation-guard entry carrying the GIT-guard's matcher — i.e. with
+        # `Task|Agent|SendMessage` dropped — and that is the single wrong value
+        # this hook cannot survive: its counter RESETS on delegation, so a
+        # matcher with no reset tools turns a delegation CLOCK into a blanket CAP
+        # on mutating calls, which is strictly worse than not installing it. So
+        # the entries are identified BY THE SCRIPT THEY RUN, and each is compared
+        # to that script's own constant — both read out of the hook sources, so
+        # neither correct value is written down twice.
         static_failures = []
-        _mm = re.search(r'^REQUIRED_MATCHER\s*=\s*"([^"]+)"',
-                        open(HOOK).read(), re.M)
-        if not _mm:
-            static_failures.append("git-guard.py no longer defines REQUIRED_MATCHER")
+        static_cells = [0]
+
+        def _static(ok, detail):
+            """One counted assertion. Counted, not merely checked: before this
+            the static block contributed only FAILURES, so a block that had
+            silently stopped executing was indistinguishable from a block that
+            passed — the same invisible-hole failure the checks are about."""
+            static_cells[0] += 1
+            if not ok:
+                static_failures.append(detail)
+            return bool(ok)
+
+        def _required_matcher(src_path):
+            """A hook's own written statement of the matcher it must be routed
+            with, or None. Read from the hook, never restated here: a copy in
+            this file would be one more thing that can drift."""
+            try:
+                _m = re.search(r'^REQUIRED_MATCHER\s*=\s*"([^"]+)"',
+                               open(src_path).read(), re.M)
+            except Exception:
+                return None
+            return _m.group(1) if _m else None
+
+        _build = os.path.join(os.path.dirname(HOOK), os.pardir, "bin", "claude-build")
+        _want_git = _required_matcher(HOOK)
+        _want_del = _required_matcher(DELEG_HOOK)
+        _static(_want_git is not None,
+                "git-guard.py no longer defines REQUIRED_MATCHER")
+        _static(_want_del is not None,
+                "delegation-guard.py no longer defines REQUIRED_MATCHER")
+        # Said here as well as in the delegation battery, because THIS file is
+        # about what gets installed, and the reset tools are the half that gets
+        # dropped when someone "simplifies" the two matchers into one.
+        for _t in ("Task", "Agent", "SendMessage"):
+            _static(bool(_want_del) and _t in _want_del.split("|"),
+                    "delegation-guard REQUIRED_MATCHER %r does not route %s — "
+                    "without it the counter never RESETS and the hook stops "
+                    "being a delegation clock" % (_want_del, _t))
+
+        if not _static(os.path.isfile(_build),
+                       "bin/claude-build not found at %s" % _build):
+            _cb_src = ""
         else:
-            _want = _mm.group(1)
-            _build = os.path.join(os.path.dirname(HOOK), os.pardir, "bin", "claude-build")
-            if not os.path.isfile(_build):
-                static_failures.append("bin/claude-build not found at %s" % _build)
-            else:
-                _installed = re.findall(r'"matcher":\s*"([^"]+)"', open(_build).read())
-                if not _installed:
-                    static_failures.append("bin/claude-build installs no PreToolUse matcher")
-                for _got in _installed:
-                    if _got != _want:
-                        static_failures.append(
-                            "matcher DRIFT: bin/claude-build installs %r but "
-                            "git-guard.py REQUIRED_MATCHER is %r" % (_got, _want))
+            _cb_src = open(_build).read()
+            # (a) THE LITERAL. The launcher writes three settings files and
+            # hand-copies the git-guard's matcher into them. The delegation
+            # guard's matcher is NOT a literal anywhere in that file — the
+            # launcher reads it out of the hook at install time, which is why it
+            # cannot drift and why a source grep cannot see it — so every
+            # matcher literal that IS in the file must still be the git-guard's.
+            # tests/test_harness.sh pins the same statement from the other side.
+            _installed = re.findall(r'"matcher":\s*"([^"]+)"', _cb_src)
+            _static(bool(_installed),
+                    "bin/claude-build installs no PreToolUse matcher")
+            for _got in _installed:
+                _static(_got == _want_git,
+                        "matcher DRIFT: bin/claude-build installs %r but "
+                        "git-guard.py REQUIRED_MATCHER is %r" % (_got, _want_git))
+
+            # (b) WHAT IT ACTUALLY WRITES. A grep cannot see a computed matcher,
+            # cannot tell which entry runs which hook, and cannot see a second
+            # install duplicating an entry. So the launcher's own settings-merge
+            # program is extracted and RUN against throwaway projects, and the
+            # file it produces is read back.
+            _body, _grab = [], False
+            for _line in _cb_src.splitlines(True):
+                if _line.startswith("read -r -d '' PY_MERGE <<"):
+                    _grab = True
+                    continue
+                if _grab and _line.startswith("PY_MERGE_EOF"):
+                    break
+                if _grab:
+                    _body.append(_line)
+            _cbdir = os.path.join(root, "cbmerge")
+            os.makedirs(_cbdir, exist_ok=True)
+            _merge_py = os.path.join(_cbdir, "merge.py")
+            if _static(bool(_body),
+                       "bin/claude-build no longer defines a PY_MERGE "
+                       "settings-merge program that can be run"):
+                with open(_merge_py, "w") as _fh:
+                    _fh.write("".join(_body))
+
+                def _merge_into(proj):
+                    """Run the launcher's merge once against <proj>; returns its
+                    PreToolUse list, or None if it refused."""
+                    _s = os.path.join(proj, ".claude", "settings.local.json")
+                    _p = subprocess.run(
+                        [sys.executable, _merge_py],
+                        env=dict(os.environ, SETTINGS=_s, DRY="0",
+                                 WT=os.path.join(proj, os.pardir, "wt"),
+                                 MANIFEST=os.path.join(proj, ".claude",
+                                                       ".claude-build.json"),
+                                 DGUARD=os.path.abspath(DELEG_HOOK)),
+                        capture_output=True, text=True)
+                    if not _static(
+                            _p.returncode == 0 and _p.stdout.startswith("OK:"),
+                            "the launcher's settings merge failed: rc=%d %r"
+                            % (_p.returncode,
+                               (_p.stdout + _p.stderr).strip()[:200])):
+                        return None
+                    try:
+                        with open(_s) as _fh2:
+                            return ((json.load(_fh2).get("hooks") or {})
+                                    .get("PreToolUse") or [])
+                    except Exception as _e:
+                        _static(False, "the launcher wrote no readable "
+                                       "settings.local.json (%s)" % _e)
+                        return None
+
+                def _entries_by_script(pre):
+                    """(index, matcher) per entry, keyed by the hook script it
+                    invokes. Ordered so the longer name is tested first —
+                    "git-guard.py" is not a substring of "delegation-guard.py",
+                    and this is the line that has to keep being true."""
+                    out = {}
+                    for _i2, _e2 in enumerate(pre or []):
+                        if not isinstance(_e2, dict):
+                            continue
+                        for _h in _e2.get("hooks") or []:
+                            _c = str((_h or {}).get("command", "")) if isinstance(_h, dict) else ""
+                            for _script in ("delegation-guard.py", "git-guard.py"):
+                                if _script in _c:
+                                    out.setdefault(_script, []).append(
+                                        (_i2, _e2.get("matcher")))
+                                    break
+                    return out
+
+                def _assert_both(pre, label):
+                    got = _entries_by_script(pre)
+                    for _script, _want in (("git-guard.py", _want_git),
+                                           ("delegation-guard.py", _want_del)):
+                        _hits = got.get(_script) or []
+                        if not _static(len(_hits) == 1,
+                                       "%s: bin/claude-build leaves %d "
+                                       "PreToolUse entries invoking %s, "
+                                       "expected exactly 1 %r"
+                                       % (label, len(_hits), _script, _hits)):
+                            continue
+                        _static(_hits[0][1] == _want,
+                                "%s: matcher DRIFT — the entry bin/claude-build "
+                                "installs for %s carries %r, but that hook's own "
+                                "REQUIRED_MATCHER is %r"
+                                % (label, _script, _hits[0][1], _want))
+                    # Two hooks, two matchers, and one entry can only carry one
+                    # matcher — so merging them into a single entry necessarily
+                    # gives one hook the other's routing.
+                    _g = got.get("git-guard.py") or []
+                    _d = got.get("delegation-guard.py") or []
+                    _static(not (_g and _d and _g[0][0] == _d[0][0]),
+                            "%s: both hooks are registered under ONE PreToolUse "
+                            "entry, and an entry has ONE matcher — so one of "
+                            "them is routed with the other's: %r" % (label, pre))
+
+                # A fresh project: both entries appear, each with its own matcher.
+                _p1 = os.path.join(_cbdir, "fresh")
+                os.makedirs(os.path.join(_p1, ".claude"), exist_ok=True)
+                _assert_both(_merge_into(_p1), "fresh install")
+                # And again into the same project: idempotent, not duplicated.
+                _assert_both(_merge_into(_p1), "re-install")
+
+                # The upgrade path that actually exists in the wild: a settings
+                # file written by an EARLIER claude-build, carrying the git-guard
+                # entry and nothing else, next to a hook the user wrote. The
+                # second entry must be added without touching either.
+                _p2 = os.path.join(_cbdir, "legacy")
+                os.makedirs(os.path.join(_p2, ".claude"), exist_ok=True)
+                _mine = {"matcher": "Bash",
+                         "hooks": [{"type": "command", "command": "echo mine"}]}
+                with open(os.path.join(_p2, ".claude",
+                                       "settings.local.json"), "w") as _fh3:
+                    json.dump({"hooks": {"PreToolUse": [
+                        {"matcher": _want_git,
+                         "hooks": [{"type": "command", "command":
+                                    'python3 "$HOME/.claude/skills/'
+                                    'swarm-loop/hooks/git-guard.py"'}]},
+                        _mine]}}, _fh3)
+                _pre2 = _merge_into(_p2)
+                _assert_both(_pre2, "upgrade from a git-guard-only install")
+                _static(_mine in (_pre2 or []),
+                        "the upgrade dropped a PreToolUse entry the user wrote: "
+                        "%r" % (_pre2,))
+
+            # (c) AND BACK OUT AGAIN. Install and uninstall are one property,
+            # not two: the uninstaller signature-matches on the hook script
+            # name, and "git-guard.py" is not a substring of
+            # "delegation-guard.py" — so a filter naming only the first leaves
+            # the second behind, pointing at a skill the user has just removed
+            # and failing on every tool call, with nothing in the project to say
+            # why. Half-uninstalled is worse than either whole state, so the
+            # launcher's own uninstall program is extracted and run against the
+            # file its own merge program just wrote.
+            _ubody, _ugrab = [], False
+            for _line in _cb_src.splitlines(True):
+                if _line.startswith("read -r -d '' PY_UNINSTALL <<"):
+                    _ugrab = True
+                    continue
+                if _ugrab and _line.startswith("PY_UNINSTALL_EOF"):
+                    break
+                if _ugrab:
+                    _ubody.append(_line)
+            if _static(bool(_ubody),
+                       "bin/claude-build no longer defines a PY_UNINSTALL "
+                       "program that can be run") and _body:
+                _un_py = os.path.join(_cbdir, "uninstall.py")
+                with open(_un_py, "w") as _fh4:
+                    _fh4.write("".join(_ubody))
+                _s2 = os.path.join(_p2, ".claude", "settings.local.json")
+                _up = subprocess.run(
+                    [sys.executable, _un_py],
+                    env=dict(os.environ, SETTINGS=_s2, DIR=_p2, DRY="0",
+                             MANIFEST=os.path.join(_p2, ".claude",
+                                                   ".claude-build.json")),
+                    capture_output=True, text=True)
+                _static(_up.returncode == 0 and _up.stdout.startswith("OK:"),
+                        "the launcher's uninstall failed: rc=%d %r"
+                        % (_up.returncode,
+                           (_up.stdout + _up.stderr).strip()[:200]))
+                try:
+                    with open(_s2) as _fh5:
+                        _left = ((json.load(_fh5).get("hooks") or {})
+                                 .get("PreToolUse") or [])
+                except Exception:
+                    _left = []
+                _survivors = _entries_by_script(_left)
+                for _script in ("git-guard.py", "delegation-guard.py"):
+                    _static(not _survivors.get(_script),
+                            "uninstall left a PreToolUse entry invoking %s "
+                            "behind: %r" % (_script, _survivors.get(_script)))
+                _static(_mine in _left,
+                        "uninstall removed a PreToolUse entry the user wrote, "
+                        "which it never installed: %r" % (_left,))
 
         jobs = build_matrix(repo, root)
         jobs += [(n, bash_payload(fill_paths(c, repo, root), repo), want,
@@ -3416,7 +3647,12 @@ def main():
             # printing it — a failure path that has never been executed.
             failures.append(("matcher-agreement", "(static check)", BLOCK, ALLOW,
                              _sf, "static"))
-        by_kind = {}
+        # The static checks are CELLS like any other axis. Counting them is what
+        # makes "the block ran" visible on the summary line; when they only ever
+        # appended failures, a block that had stopped executing looked exactly
+        # like a block that passed.
+        by_kind = {"static": static_cells[0]}
+        passed += static_cells[0] - len(static_failures)
         for (name, payload, want, kind), (got, stderr) in zip(jobs, results):
             by_kind[kind] = by_kind.get(kind, 0) + 1
             if got == want:
