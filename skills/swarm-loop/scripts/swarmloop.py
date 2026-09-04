@@ -87,7 +87,31 @@ MANIFEST_FILE = "manifest.json"
 FREEZE_LOG_FILE = "freeze-log.jsonl"
 ESCALATIONS_FILE = "escalations.jsonl"
 ESCALATIONS_MD = "ESCALATIONS.md"
-LEARNINGS_MD = "learnings.md"      # per-run, project-specific (Phase 8 appends)
+LEARNINGS_MD = "learnings.md"      # LEGACY. Read for migration; never written again.
+
+# THE ONE HARNESS DOCUMENT. Every issue an agent finds with the HARNESS or the
+# SKILL — these scripts, the hooks, the launcher, the prompts, the gates, the
+# task-packet protocol, the freeze machinery, the verification ladder, the
+# orchestration itself — goes here and nowhere else, whichever project the agent
+# happens to be standing in. Six scattered stores were drained into it and
+# removed; a per-run copy in a project repo is exactly the drift this closes.
+#
+# It is deliberately NOT under ~/.claude: re-probed on Claude Code 2.1.260, a
+# --restricted session's write there is refused ("...is a sensitive file"), and
+# the watchdog and fixer are both --restricted — so an issue store there could
+# never be written to by the sessions that find the issues.
+#
+# THIS DOES NOT MOVE APP ISSUES. Defects in the product being built stay in that
+# project: backlog.md, findings.jsonl, tickets.json, reports/, and the per-project
+# BUILD observation document. Instrument and specimen do not share a file.
+HARNESS_DOC_ENV = "SWARMLOOP_HARNESS_DOC"
+HARNESS_DOC_DEFAULT = "~/claude-build/observations/swarm-loop-HARNESS-OPEN.md"
+
+
+def _harness_doc():
+    """Absolute path to the one harness document. Env override wins."""
+    return os.path.abspath(os.path.expanduser(
+        os.environ.get(HARNESS_DOC_ENV) or HARNESS_DOC_DEFAULT))
 LEARNED_MD = "LEARNED.md"          # the SKILL's cross-run memory (Termination distils into it)
 HISTORY_FILE = "history.csv"
 ANALYSIS_DIR = "analysis"
@@ -10046,8 +10070,25 @@ def cmd_distil(args):
     """
     root = repo_root()
     d = sd(root)
-    lpath = os.path.join(d, LEARNINGS_MD)
+    # The run tier no longer writes into the project repo. A lesson about how the
+    # SWARM was run is a harness observation, and a harness observation in one
+    # app's repository is invisible to every other run — which is how the same
+    # lesson came to be rediscovered across three projects. It goes to the one
+    # document, tagged with the run it came from so a reader can still tell.
+    lpath = _harness_doc()
+    legacy = os.path.join(d, LEARNINGS_MD)
     learned = _learned_path()
+    # Read once, above the tier branch: BOTH tiers need the project name now —
+    # tier 1 to tag the entry it writes, tier 2 to scope the provenance gate to
+    # this run's own lines in a document that is shared across projects.
+    state = {}
+    _spath = os.path.join(d, STATE_FILE)
+    if os.path.exists(_spath):
+        try:
+            with open(_spath) as _sf:
+                state = json.load(_sf)
+        except (ValueError, OSError):
+            state = {}
 
     if args.do_list:
         for line in _learning_lines(d):
@@ -10076,37 +10117,38 @@ def cmd_distil(args):
 
     # ---------------------------------------------------------------- tier 1
     if not args.to_skill:
-        state = {}
-        spath = os.path.join(d, STATE_FILE)
-        if os.path.exists(spath):
-            try:
-                with open(spath) as f:
-                    state = json.load(f)
-            except (ValueError, OSError):
-                state = {}
         cycle = args.cycle if args.cycle is not None else int(state.get("current_cycle", 0) or 0)
-        entry = _dl_wrap("- (cycle %d) **%s** — %s" % (cycle, lesson, because))
+        # TAG THE RUN. The run tier used to write into one repo's own file, so
+        # "what this run recorded" was the whole file. It now writes to the one
+        # machine-wide document, where an untagged line makes the tier-2
+        # provenance gate below read "recorded by ANY run" — a real weakening of
+        # a gate, introduced by the consolidation and closed here rather than
+        # accepted.
+        _proj = str(state.get("project") or os.path.basename(root) or "run")
+        entry = _dl_wrap("- (cycle %d) [%s] **%s** — %s" % (cycle, _proj, lesson, because))
         if args.dry_run:
-            print("distil --dry-run: would append to %s/%s\n%s" % (STATE_DIR, LEARNINGS_MD, entry))
+            print("distil --dry-run: would append to %s\n%s" % (lpath, entry))
             return
         os.makedirs(d, exist_ok=True)
         try:
             prior = open(lpath, "rb").read() if os.path.exists(lpath) else b""
         except OSError as e:
-            die("cannot read %s/%s (%s) — nothing was written" % (STATE_DIR, LEARNINGS_MD, e))
+            die("cannot read %s (%s) — nothing was written" % (lpath, e))
         lead = "" if not prior else ("\n" if prior.endswith(b"\n") else "\n\n")
         with open(lpath, "a") as f:
             f.write(lead + entry + "\n")
         n = sum(1 for ln in open(lpath) if ln.startswith("- "))
-        print("distil: appended to %s/%s (%d entr(ies))" % (STATE_DIR, LEARNINGS_MD, n))
+        print("distil: appended to %s (%d entr(ies))" % (lpath, n))
         print(entry)
         if n > LEARNINGS_SOFT_CAP:
             # A warning, never a refusal, and the asymmetry with --to-skill is
-            # deliberate: this file is one repo's, it is curated by hand every
-            # epoch, and refusing to record a lesson mid-run loses the lesson.
-            print("distil: %s/%s now holds %d entries, over SKILL.md Phase 8's ~%d — curate it "
-                  "at this epoch boundary (merge duplicates, drop the least useful)."
-                  % (STATE_DIR, LEARNINGS_MD, n, LEARNINGS_SOFT_CAP))
+            # deliberate: refusing to record a lesson mid-run loses the lesson,
+            # and this document is curated by hand rather than by truncation.
+            print("distil: %s now holds %d entries, over the ~%d soft cap — curate it at "
+                  "this epoch boundary (merge duplicates, drop the least useful). It is "
+                  "MACHINE-WIDE now, so it carries other runs' entries too: merge across "
+                  "them rather than adding a near-duplicate under a new run's name."
+                  % (lpath, n, LEARNINGS_SOFT_CAP))
         return
 
     # ---------------------------------------------------------------- tier 2
@@ -10120,20 +10162,36 @@ def cmd_distil(args):
     except OSError:
         run_text = ""
     if not run_text.strip():
-        die("%s/%s is empty or absent — there is nothing to distil FROM, so this entry "
+        die("%s is empty or absent — there is nothing to distil FROM, so this entry "
             "would be invented rather than learned. Record it in the run first:\n"
             "    swarmloop.py distil --lesson \"%s\" --because \"...\""
-            % (STATE_DIR, LEARNINGS_MD, _oneline(lesson, 60)))
+            % (lpath, _oneline(lesson, 60)))
+    # Only THIS run's lines count as provenance. Scoping restored after the
+    # consolidation put every run's lessons in one document; without it a
+    # lesson another project recorded would license promotion here.
+    # EXCLUDE other runs' lines; do not require a tag. Requiring one dropped
+    # every hand-written and pre-consolidation entry, which is most of what a
+    # real document holds — the filter has to remove what is provably someone
+    # else's, not keep only what is provably ours.
+    _proj = str(state.get("project") or os.path.basename(root) or "run")
+    _tagged = re.compile(r"^- \(cycle \d+\) \[([^\]]+)\]")
+    _kept = []
+    for _ln in run_text.split("\n"):
+        _m = _tagged.match(_ln)
+        if _m and _m.group(1) != _proj:
+            continue                      # another run's lesson: not our provenance
+        _kept.append(_ln)
+    run_text = "\n".join(_kept)
     kept, missed = _dl_provenance(run_text, lesson)
     if kept is not None and kept * 2 < kept + len(missed):
-        die("%s/%s does not contain this lesson — %d of its %d distinctive words appear "
+        die("%s does not contain this lesson — %d of its %d distinctive words appear "
             "nowhere in what the run recorded, starting with %s. Distillation compresses "
             "what a run learned; a lesson that shares no vocabulary with the run file was "
             "written at Termination, not learned during it. Record it in the run first:\n"
             "    swarmloop.py distil --lesson \"%s\" --because \"...\"\n"
             "  (This measures textual overlap, which proves the lesson EXISTED as a run "
             "artifact. It cannot prove the run artifact was true — nothing here can.)"
-            % (STATE_DIR, LEARNINGS_MD, len(missed), kept + len(missed),
+            % (lpath, len(missed), kept + len(missed),
                ", ".join(repr(w) for w in missed[:5]), _oneline(lesson, 60)))
 
     if not os.path.exists(learned):

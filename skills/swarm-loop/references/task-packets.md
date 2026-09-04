@@ -60,8 +60,8 @@ background. Read it; never edit it.
   with YOUR worktree as cwd — never a sibling's.
 
   The shared, orchestrator-owned documents in your worktree — decisions.md,
-  public-surface.md, backlog.md, learnings.md, the codebase map — are a
-  SNAPSHOT taken at <sha>. The orchestrator keeps correcting those same files
+  public-surface.md, backlog.md, the codebase map — are a SNAPSHOT taken at
+  <sha>. The orchestrator keeps correcting those same files
   on `main` while you work. So a discrepancy you find in one of them may
   ALREADY BE FIXED on `main`: report it under SHARED-DOC-OBSERVATIONS as an
   observation, not a defect under BUGS-OBSERVED, and do not work around it and
@@ -220,8 +220,10 @@ permission to change its own route has misread this packet.
 conventions in force, the data model pieces involved, how to run the dev
 build/tests locally in this stack>
 
-<relevant entries from learnings.md, verbatim — e.g. "Learned cycle 2: the
-config loader caches by absolute path; construct it once in tests">
+<the harness document's entries that bear on THIS ticket's area, verbatim —
+never the whole file: it is machine-wide, so most of what it holds belongs to
+other projects' runs — e.g. "Learned cycle 2: the config loader caches by
+absolute path; construct it once in tests">
 
 <if this task was previously attempted and failed: what was tried, why it
 failed, and what to do differently. Do not repeat the failed approach.>
@@ -380,8 +382,8 @@ PREMISES-FALSIFIED: <every factual claim in this packet you found to be false �
   because nothing else in this loop ever checks the orchestrator's own text.
   Write "none" if none.>
 SHARED-DOC-OBSERVATIONS: <anything in an orchestrator-owned SHARED document
-  that looks wrong or stale — decisions.md, public-surface.md, backlog.md,
-  learnings.md, the codebase map. These go here and NOT in BUGS-OBSERVED,
+  that looks wrong or stale — decisions.md, public-surface.md, backlog.md, the
+  codebase map. These go here and NOT in BUGS-OBSERVED,
   because your copy is a snapshot at your branch point and the orchestrator may
   already have fixed it on `main`. Quote the line and say what you expected.
   Write "none" if none.>
@@ -415,7 +417,7 @@ CONCERNS: <anything smelling wrong, including tests you believe are incorrect.
 - **The report is a claim.** Phase 5 checks it against the diff and Phase 7 checks it against the metrics. Treat `DECISIONS`, `NEEDS`, `CONFIG-TOUCHED`, `BUGS-OBSERVED` and `PREMISES-FALSIFIED` as the valuable part — they feed the codebase map, the ticket backlog, and the scheduler's next dispatch decisions.
 - **A worker's frozen-test objection is yours to carry, not to file away.** The worker's wall has exactly one door in it and you are it. When a report's CONCERNS names a frozen acceptance test as *wrong* with the four-part evidence — not merely hard — you neither edit it nor bury it: `swarmloop.py escalate --kind frozen-test --subject <test path> --reason "<the worker's evidence>" --proposed "<the change being asked for>" --cycle <N>`, then keep dispatching everything the disputed test does not judge. Judge the evidence before forwarding it: "this test is hard" is the job, and passing that up as an escalation trains the one human in the loop to stop reading escalations. Until the user amends it, the test stands — the retry packet carries it as an unchanged constraint, and the worker's branch still may not touch it. Reply to the worker's objection in the retry packet either way, so the same objection is not re-litigated from scratch by the next agent.
 - **Every SHARED-DOC-OBSERVATION gets a `main`-side check before it becomes an action.** A long-running worker's copy of every orchestrator-owned document is pinned at its branch point while you keep correcting those documents mid-wave, so its findings are *time-shifted*, not wrong. Observed: both `T-010` and `T-011` reported that `public-surface.md` still said "the five trust dimensions" **after** an amendment had made it six and `main` already read six. Cheap per item, but it is a per-finding tax and a false alarm is one careless step from a re-fix of something already fixed — or from telling the next wave something false. Read the line on `main` first; then either answer the worker in its retry packet or fix `main` once. The separate report field exists so the whole class triages in one pass instead of one finding at a time.
-- **Inject learnings selectively.** Only entries relevant to the task's area; a packet stuffed with every lesson ever learned buries the two that matter.
+- **Inject learnings selectively — the source is machine-wide, so this is mandatory, not economy.** Only the harness document's entries relevant to the task's area; it carries other projects' runs as well as this one's, and a packet stuffed with every lesson ever learned on this machine buries the two that matter.
 - **State the CURRENT baseline, never a remembered one.** Every packet carries the suite's pass count as measured at dispatch time, plus the line "other agents are in flight; prove any failure is yours by reverting YOUR file and re-running." A remembered number goes stale within minutes of other branches landing, and the worker then burns effort explaining a discrepancy that is just drift — the revert-and-rerun check is the one that matters anyway.
 - **Consolidation/dedup packets are non-additive — state done as "the old pattern no longer exists."** Write the done-condition as e.g. "grep shows zero inline occurrences in these files" or "every new accessor has ≥1 caller outside its module", never "the new abstraction exists". Additive-only does NOT apply to these tasks and the packet must say so explicitly — the payoff of a consolidation IS editing the call sites, and a worker given the additive-only default once shipped six accessors with zero callers, leaving more duplication than before with every metric green. At collection, run `swarmloop.py reachable --symbol <each accessor the refactor added>` — an addition with zero callers means the wiring half was skipped, and here the done-condition is the call sites themselves.
 - **Run the wiring check on every PRESERVED commit, whatever its message claims — in EITHER direction.** `python3 <skill>/scripts/swarmloop.py reachable --symbol <what the commit says it added> --from <the real entry point>`, and read the exit code. Measured, on two commits recovered from a killed agent: commit A added a function with **zero call sites**, absent from both `__all__` lists, carrying docstrings that asserted a behaviour existing nowhere — 0% effective, and the suite was GREEN over a fully live HIGH-severity defect. Commit B's function was wired at two independent points on the real path and its claim was exactly accurate. The commit messages did not distinguish them; ten seconds of call-site grep did. The first generalisation drawn from this — that self-assessed progress runs generous — came from n=1 and was falsified by commit B in the opposite direction, so **do not weight the check by how the report reads**: the discriminator was never the prose, which is precisely why it is now a command instead of a habit. Read `NO CALL SITES` as *unfinished*, never as dead code to delete; `TESTS ONLY` as the same defect wearing a green suite; `UNREACHED` as a question to answer rather than a verdict, since the name-keyed call graph is the weakest layer it has. `DECORATOR-REGISTERED` is the one verdict that does NOT fail the run: the definition carries a decorator and nothing else references it, which is how routes, CLI commands, event handlers, plugins and fixtures are wired — measured against a live FastAPI project, that verdict covers 20 of the 31 symbols the tool previously called `NO CALL SITES`, i.e. the application's entire HTTP surface. It is still not an all-clear: the tool did not follow the decorator into the table on the other side, so confirm that table is itself imported and mounted. Every blind spot — getattr, registries, decorator tables, Python source embedded in a string, non-Python callers — prints with the answer, so a clean report is evidence and never proof of wiring. Exit 3 means the tool refused its arguments; it is never a finding about the commit.

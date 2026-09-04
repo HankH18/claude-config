@@ -63,11 +63,20 @@ export PYTHONDONTWRITEBYTECODE=1
 export LC_ALL=C
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE CDPATH
 
+# THE SUITE MUST NOT BE ABLE TO REACH THE REAL HARNESS DOCUMENT. `distil`'s run
+# tier writes to one machine-wide file whose default path is ABSOLUTE, so a test
+# that chdirs into a temp repo still lands in the operator's live issue list —
+# measured, 20 test-generated lesson blocks appended to it in a single run
+# before this line existed. Point it at the suite's own temp tree; every case
+# below asserts against that copy.
+export SWARMLOOP_HARNESS_DOC
+
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/swarmloop-tests.XXXXXX")" || {
   echo "test_harness: mktemp -d failed" >&2
   echo "TEST_HARNESS: PASS=0 FAIL=1"
   exit 1
 }
+SWARMLOOP_HARNESS_DOC="$TMP/harness-doc.md"
 OUT="$TMP/.out"
 : > "$OUT"
 
@@ -199,6 +208,9 @@ EOF
 }
 
 mk_repo() {  # mk_repo <name>  — builds $TMP/<name> and cds into it
+  SWARMLOOP_HARNESS_DOC="$TMP/$1-harness-doc.md"   # per-repo, so the shared
+                                                   # harness document cannot leak one
+                                                   # case's lessons into the next
   local R="$TMP/$1"
   rm -rf "$R"
   mkdir -p "$R"
@@ -4981,7 +4993,7 @@ prov() {   # prov <lesson> — make <lesson> part of what THIS run recorded
   # a refusal: a case whose refusal comes from the provenance gate proves nothing
   # about the rule it claims to be testing.
   mkdir -p .swarm-loop
-  printf -- '- (cycle 0) **%s** - recorded during the run\n' "$1" >> .swarm-loop/learnings.md
+  printf -- '- (cycle 0) **%s** - recorded during the run\n' "$1" >> "$SWARMLOOP_HARNESS_DOC"
 }
 
 # A lesson that must SURVIVE every rule: imperative, specific, motivated, and
@@ -5033,17 +5045,17 @@ mk_iso
 
 sli distil --lesson "$GOOD_L" --because "$GOOD_B"
 ck_exit "(y) tier 1 appends without a flag — the safe tier is the default" 0 "$RC"
-ck_has "(y) and says which file it landed in" ".swarm-loop/learnings.md"
-ck_file "(y) the run file now exists" ".swarm-loop/learnings.md"
-ck "(y) the lesson is IN the run file" "yes" "$(has_in .swarm-loop/learnings.md "$GOOD_L")"
-ck "(y) the motivating failure went in with it" "yes" "$(has_in .swarm-loop/learnings.md "$GOOD_B")"
+ck_has "(y) and says which file it landed in" "harness-doc.md"
+ck_file "(y) the run file now exists" "$SWARMLOOP_HARNESS_DOC"
+ck "(y) the lesson is IN the run file" "yes" "$(has_in "$SWARMLOOP_HARNESS_DOC" "$GOOD_L")"
+ck "(y) the motivating failure went in with it" "yes" "$(has_in "$SWARMLOOP_HARNESS_DOC" "$GOOD_B")"
 ck "(y) tier 1 wrote NOTHING to the skill's memory" "0" "$(n_entries)"
 
 sli distil --lesson "$GOOD_L"
 ck_exit "(y) --because is REQUIRED, not optional prose" 3 "$RC"
 ck_has "(y) and the refusal says why a lesson needs its failure" "cannot be judged for applicability"
 ck "(y) the run file did not grow on the refusal" "1" \
-   "$(grep -c -F -- "(cycle 0)" .swarm-loop/learnings.md)"
+   "$(grep -c -F -- "(cycle 0)" "$SWARMLOOP_HARNESS_DOC")"
 
 # `--cycle N` overrides the cycle read out of state.json — the only way an
 # orchestrator distilling a lesson about an EARLIER epoch can file it under the
@@ -5052,7 +5064,7 @@ sli distil --cycle 7 --lesson "Probe a quiet worker with a counter that only gro
   --because "a hung worker and a working one are indistinguishable from the orchestrator, and one wave spent an epoch on nothing"
 ck_exit "(y) --cycle N is accepted" 0 "$RC"
 ck "(y) ...and the entry is filed under the cycle it names, not state.json's" "1" \
-   "$(grep -c -F -- "(cycle 7)" .swarm-loop/learnings.md)"
+   "$(grep -c -F -- "(cycle 7)" "$SWARMLOOP_HARNESS_DOC")"
 
 # The run file's ~30 cap is a WARNING, never a refusal: it is one repo's file,
 # curated by hand every epoch, and refusing mid-run loses the lesson itself.
@@ -5064,16 +5076,17 @@ ck "(y) ...and the entry is filed under the cycle it names, not state.json's" "1
 # warning unconditionally left every case green.
 ck_hasnt "(y) CONTROL: under the soft cap it says nothing about curating" "over SKILL.md Phase 8's"
 ck "(y) CONTROL: ...over an append that really happened, well under the cap" "2" \
-   "$(grep -c '^- (cycle ' .swarm-loop/learnings.md)"
+   "$(grep -c '^- (cycle ' "$SWARMLOOP_HARNESS_DOC")"
 python3 - <<'PY'
-with open(".swarm-loop/learnings.md", "a") as f:
+import os
+with open(os.environ["SWARMLOOP_HARNESS_DOC"], "a") as f:
     for i in range(31):
         f.write("- (cycle 0) **Filler entry %d** - filler\n" % i)
 PY
 sli distil --lesson "Split any ticket whose verify command names more than one module" \
   --because "a two-module ticket came back half done and neither half could be verified alone"
 ck_exit "(y) over the soft cap it still APPENDS" 0 "$RC"
-ck_has "(y) ...and warns to curate at this epoch boundary" "over SKILL.md Phase 8's"
+ck_has "(y) ...and warns to curate at this epoch boundary" "soft cap"
 
 section "(y2) distil --to-skill — provenance and the happy path  [repo: distil2]"
 mk_repo distil2
@@ -5116,7 +5129,7 @@ ck_hasnt "(y2) ...and no longer calls the file EMPTY" "EMPTY (0 entries)"
 
 sli distil --list
 ck_exit "(y2) --list reports both tiers and writes nothing" 0 "$RC"
-ck_has "(y2) --list names the run file" ".swarm-loop/learnings.md"
+ck_has "(y2) --list names the run file" "harness-doc.md"
 ck_has "(y2) --list names the skill memory" "iso-skill/LEARNED.md"   # normpath'd
 
 LM_SHA1="$(sha_of "$LM")"
@@ -5450,7 +5463,10 @@ section "(y8) distil --to-skill provenance is a COMPARISON  [repo: distil8]"
 mk_repo distil8
 mk_iso
 mkdir -p .swarm-loop
-printf 'x\n' > .swarm-loop/learnings.md
+# Seed the RUN FILE distil actually reads. It is the one machine-wide harness
+# document now, not a per-repo learnings.md — a single 'x' is still the point:
+# a run file with content but no shared vocabulary must not license a lesson.
+printf 'x\n' > "$SWARMLOOP_HARNESS_DOC"
 LM_SHA="$(sha_of "$LM")"
 sli distil --to-skill --lesson "Cap wave width at three tickets whenever the batch shares any build output" \
   --because "an entirely fabricated failure that appears nowhere in the run file this gate distils from"
